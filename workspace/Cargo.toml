@@ -39,6 +39,8 @@ windows = { version = "0.62", features = [
     "Win32_UI_Shell_Common",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Controls",
+    # 属性窗口"自定义"页要用系统打开文件对话框选图片/图标
+    "Win32_UI_Controls_Dialogs",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Accessibility",

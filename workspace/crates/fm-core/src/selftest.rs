@@ -310,12 +310,156 @@ pub fn run() -> i32 {
     );
     let _ = std::fs::remove_dir_all(&idx_root);
 
+    // 16. ACL：读得出来属主与至少一条 ACE，权限名必须能对上资源管理器的那几种
+    let sec = crate::acl::read(&PathBuf::from("C:\\Windows"));
+    let owner_ok = !sec.owner.is_empty();
+    h.check(
+        "acl::read",
+        sec.error.is_none() && owner_ok && !sec.aces.is_empty(),
+        &format!(
+            "属主 {}，{} 条 ACE：{}",
+            sec.owner,
+            sec.aces.len(),
+            sec.aces
+                .iter()
+                .take(3)
+                .map(|a| format!("{}={}{}", a.account, a.right, if a.allow { "" } else { "(拒绝)" }))
+                .collect::<Vec<_>>()
+                .join("  ")
+        ),
+    );
+    // 权限名不能全是"特别"：那说明掩码常量对不上，页上就全是"特别"，等于没做
+    let named = sec
+        .aces
+        .iter()
+        .filter(|a| a.right != "特别")
+        .count();
+    h.check(
+        "acl::rights",
+        named > 0,
+        &format!("{}/{} 条能对上标准权限名", named, sec.aces.len()),
+    );
+    let bad = crate::acl::read(&PathBuf::from("C:\\no_such_dir_9z"));
+    h.check("acl::missing", bad.error.is_some(), "不存在的路径要报错而不是崩");
+
+    // 17. desktop.ini：写了再读回来必须一致，且不能把无关内容冲掉
+    let ini_root = std::env::temp_dir().join("fm-selftest-ini");
+    let _ = std::fs::remove_dir_all(&ini_root);
+    std::fs::create_dir_all(&ini_root).unwrap();
+    // 先放一份"别人的"内容进去：带 LocalizedResourceName 与 ViewState
+    let seed = "[.ShellClassInfo]\r\nLocalizedResourceName=@%SystemRoot%\\system32\\shell32.dll,-21779\r\nInfoTip=hello\r\n[ViewState]\r\nMode=\r\nVid=\r\nFolderType=Music\r\n";
+    std::fs::write(ini_root.join("desktop.ini"), encode_utf16(seed)).unwrap();
+    let got = crate::folder_ini::read(&ini_root);
+    h.check(
+        "folder_ini::read",
+        // FOLDER_TYPES 里 Music 排第 3 位（常规项/文档/图片/音乐/视频）
+        got.folder_type.as_deref() == Some("Music") && got.type_index() == 3 && got.has_other,
+        &format!(
+            "读回 FolderType={:?} 模板下标={} 有其它内容={}",
+            got.folder_type,
+            got.type_index(),
+            got.has_other
+        ),
+    );
+    // 只改模板：IconResource 要写进去，LocalizedResourceName 必须还在
+    let mut next = got.clone();
+    next.folder_type = Some("Pictures".to_string());
+    next.icon_resource = crate::folder_ini::FOLDER_TYPES[2].2.map(|s| s.to_string());
+    let wrote = crate::folder_ini::write(&ini_root, &next).unwrap();
+    let again = crate::folder_ini::read(&ini_root);
+    let text = std::fs::read(ini_root.join("desktop.ini")).map(|b| decode_utf16(&b)).unwrap_or_default();
+    h.check(
+        "folder_ini::write",
+        wrote
+            && again.folder_type.as_deref() == Some("Pictures")
+            && again.icon_resource.as_deref() == crate::folder_ini::FOLDER_TYPES[2].2
+            && text.contains("LocalizedResourceName"),
+        &format!("写回后 FolderType={:?}，LocalizedResourceName 保留={}",
+            again.folder_type, text.contains("LocalizedResourceName")),
+    );
+    // 只有已知键的目录清成空白 -> 文件要被删掉（留个空壳会让 Shell 以为这
+    // 个文件夹被自定义过，从而不再读它的 LocalizedResourceName）。
+    // 上面那个目录里还有 LocalizedResourceName 等未知键，按设计是**不能**删的。
+    let ini2 = std::env::temp_dir().join("fm-selftest-ini2");
+    let _ = std::fs::remove_dir_all(&ini2);
+    std::fs::create_dir_all(&ini2).unwrap();
+    let mut only = crate::folder_ini::FolderIni::default();
+    only.icon_file = Some("C:\\x\\a.ico".to_string());
+    let _ = crate::folder_ini::write(&ini2, &only);
+    let had = ini2.join("desktop.ini").exists();
+    let _ = crate::folder_ini::write(&ini2, &crate::folder_ini::FolderIni::default());
+    h.check(
+        "folder_ini::blank",
+        had && !ini2.join("desktop.ini").exists(),
+        "只剩已知键时清空会删掉 desktop.ini",
+    );
+    // 反过来：带未知键的目录即使"全清"也要留着，不能把别人的内容丢了
+    let _ = crate::folder_ini::write(&ini_root, &crate::folder_ini::FolderIni::default());
+    let kept = std::fs::read(ini_root.join("desktop.ini"))
+        .map(|b| decode_utf16(&b))
+        .unwrap_or_default();
+    h.check(
+        "folder_ini::keep",
+        kept.contains("LocalizedResourceName"),
+        "有未知键时清空只删已知键，保留其余内容",
+    );
+    let _ = std::fs::remove_dir_all(&ini2);
+    // 编码：写出来的必须是 UTF-16LE 带 BOM（与资源管理器一致）
+    let mut one = crate::folder_ini::FolderIni::default();
+    one.icon_file = Some("C:\\x\\a.ico".to_string());
+    one.icon_index = Some(3);
+    let _ = crate::folder_ini::write(&ini_root, &one);
+    let rawb = std::fs::read(ini_root.join("desktop.ini")).unwrap_or_default();
+    let back = crate::folder_ini::read(&ini_root);
+    h.check(
+        "folder_ini::utf16",
+        rawb.len() >= 2 && rawb[0] == 0xFF && rawb[1] == 0xFE
+            && back.icon_file.as_deref() == Some("C:\\x\\a.ico")
+            && back.icon_index == Some(3),
+        &format!("BOM={:02X}{:02X} 读回 IconFile={:?} Index={:?}",
+            rawb[0], rawb[1], back.icon_file, back.icon_index),
+    );
+    h.check(
+        "folder_ini::hidden",
+        is_hidden(&ini_root.join("desktop.ini")),
+        "写出的 desktop.ini 带 HIDDEN|SYSTEM（Shell 才认）",
+    );
+    let _ = crate::folder_ini::write(&ini_root, &crate::folder_ini::FolderIni::default());
+    let _ = std::fs::remove_dir_all(&ini_root);
+
     println!("\n通过 {}/{} 项", h.passed, h.passed + h.failed);
     if h.failed == 0 {
         0
     } else {
         1
     }
+}
+
+/// 自检里手写 `desktop.ini` 要用：编码成 UTF-16LE 带 BOM。
+fn encode_utf16(s: &str) -> Vec<u8> {
+    let mut b = vec![0xFFu8, 0xFE];
+    for u in s.encode_utf16() {
+        b.extend_from_slice(&u.to_le_bytes());
+    }
+    b
+}
+
+fn decode_utf16(raw: &[u8]) -> String {
+    if raw.len() < 2 || raw[0] != 0xFF || raw[1] != 0xFE {
+        return String::from_utf8_lossy(raw).to_string();
+    }
+    let u: Vec<u16> = raw[2..]
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    String::from_utf16_lossy(&u)
+}
+
+fn is_hidden(p: &std::path::Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    std::fs::metadata(p)
+        .map(|m| m.file_attributes() & (0x2 | 0x4) != 0)
+        .unwrap_or(false)
 }
 
 /// 造一棵测试目录树：depth 层，每层 files 个文件。
