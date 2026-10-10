@@ -78,8 +78,18 @@ pub struct ViewConfig {
     /// 显示"受保护的操作系统文件"（FILE_ATTRIBUTE_SYSTEM）。默认关闭，
     /// 与资源管理器"文件夹选项 → 查看"里的同名开关一致。
     pub show_system: bool,
+    /// 是否显示文件扩展名。默认显示（比资源管理器更直白，避免"同名不同后缀"看不出来）。
+    pub show_extensions: bool,
+    /// 大小列的显示单位：`auto`（按最小单位自适应，见 app::human）/ `kb` / `mb` / `gb` / `bytes`。
+    pub size_unit: String,
     pub sort_key: String,
     pub sort_descending: bool,
+}
+
+impl ViewConfig {
+    pub fn size_unit_of(&self) -> crate::SizeUnit {
+        crate::SizeUnit::parse(&self.size_unit)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

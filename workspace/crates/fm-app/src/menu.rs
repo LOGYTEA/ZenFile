@@ -19,7 +19,7 @@ use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
     IntersectClipRect, MonitorFromWindow, SelectObject, SetBkMode, SetTextColor, SetWindowOrgEx,
     DT_CALCRECT, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC,
-    HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, TRANSPARENT,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::Foundation::POINT;
 use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
@@ -84,8 +84,47 @@ pub enum Command {
     ToggleHidden,
     /// 显示/隐藏"受保护的操作系统文件"（FILE_ATTRIBUTE_SYSTEM）
     ToggleSystem,
+    /// 显示/隐藏文件扩展名
+    ToggleExtensions,
+    /// 循环切换"大小"列的默认单位
+    CycleSizeUnit,
+    /// 循环切换明暗主题
+    CycleTheme,
+    /// 循环切换新标签的默认视图模式
+    CycleDefaultView,
+    /// 以标签页形式打开设置
+    OpenSettings,
+    /// 打开回收站视图
+    OpenRecycle,
+    RecycleRestore,
+    RecycleDelete,
+    RecycleEmpty,
+    RecycleSelectAll,
     NewTab,
     About,
+}
+
+/// 去掉菜单文本里的 `&` 加速键标记。
+///
+/// Shell 与系统菜单的字符串惯例是用 `&` 标出助记键（"打开(&O)"、"c&ursor"）。
+/// 自绘菜单用 `DT_NOPREFIX` 画字，`&` 会被原样画出来 —— 于是界面上出现
+/// 莫名其妙的 `&`，文件夹名也变成"c&rsor"。这里统一按 Win32 的助记键规则
+/// 剥掉：单个 `&` 去掉，`&&` 还原成一个 `&`（文件名里真的有 & 的情况）。
+pub fn strip_accel(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '&' {
+            match chars.next() {
+                Some('&') => out.push('&'),
+                Some(_) => {}
+                None => {}
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -238,7 +277,7 @@ fn read_entry(hmenu: HMENU, pos: u32, first_id: u32, depth: usize) -> Option<Men
         if GetMenuItemInfoW(hmenu, pos, true, &mut mii).is_err() {
             return None;
         }
-        let text = crate::icons::from_wide(&buf);
+        let text = strip_accel(&crate::icons::from_wide(&buf));
         if (mii.fType & MFT_SEPARATOR) == MFT_SEPARATOR {
             return Some(MenuEntry::sep());
         }
@@ -350,6 +389,8 @@ struct MenuWindow {
     open_submenu_for: Option<usize>,
     /// 这是作为**另一级菜单的子菜单**弹出的；顶层菜单为 None。
     parent_menu: Option<HWND>,
+    /// 本窗口是被父菜单的第几项展开的（顶层菜单为 None）。
+    opened_by: Option<usize>,
     /// 本窗口里已经有条目被真正执行（用于决定销毁时是否级联关闭父菜单）。
     activated: bool,
 }
@@ -433,6 +474,7 @@ pub fn open_menu(
         submenu: None,
         open_submenu_for: None,
         parent_menu,
+        opened_by: None,
         activated: false,
     }));
 
@@ -537,6 +579,24 @@ fn entry_at(state: &MenuWindow, y: i32) -> Option<usize> {
     None
 }
 
+/// 父菜单在给定**屏幕坐标**下命中的条目下标。
+///
+/// 子菜单要靠它判断"光标是不是移到父菜单的另一项上了"。跨窗口读状态只能走
+/// GWLP_USERDATA 拿裸指针，父子同线程，不存在竞争。
+unsafe fn parent_entry_at(parent: HWND, screen: POINT) -> Option<usize> {
+    let ptr = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut MenuWindow;
+    if ptr.is_null() {
+        return None;
+    }
+    let ps = &*ptr;
+    let mut pt = screen;
+    let _ = ScreenToClient(parent, &mut pt);
+    if pt.x < 0 || pt.x > ps.width || pt.y < 0 || pt.y > ps.view_h {
+        return None;
+    }
+    entry_at(ps, pt.y)
+}
+
 fn row_rect(state: &MenuWindow, index: usize) -> RECT {
     let mut top = 4;
     for e in state.entries.iter().take(index) {
@@ -569,19 +629,30 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             // 子菜单弹出后由**子菜单**持有 capture，本窗口就再也收不到 WM_MOUSEMOVE。
             // 于是鼠标移回父菜单时高亮会一直卡在展开子菜单的那一项上。这里让子菜单在
             // 光标越过自己左边界时把 capture 交还回来，并附带上屏幕坐标重算高亮。
-            // 是否该把鼠标交还给父菜单：光标离开本菜单，且落回父菜单的矩形内。
-            // 只判 x<0 是不够的 —— 子菜单被屏幕边界挤到父菜单**左侧**时，
-            // 光标往右移回父菜单，x 是大于宽度的，条件不成立，父子就此失联。
+            // 是否该把鼠标交还给父菜单：光标离开本菜单，且落回父菜单里**另一项**上。
+            //
+            // 这里曾经写成"光标离开本菜单 且 (x<0 或 落在父菜单矩形内)"。问题是子菜单
+            // 刚弹出时光标还停在父菜单那一行上，x 必然 < 0 —— 子菜单收到的第一个
+            // WM_MOUSEMOVE 就立刻把自己关掉并交还父菜单，于是**悬停永远展开不出来**
+            // （脚本里先把光标挪进子菜单再验证，所以测不出来）。
+            // 现在必须"落在父菜单的另一个条目上"才交还：停在自己那一行时子菜单保持打开。
             let back_to_parent = state.parent_menu.is_some()
                 && !inside_popup(state, x, y)
-                && (x < 0 || {
+                && {
                     let p = state.parent_menu.unwrap();
                     let mut pr = RECT::default();
                     let mut sp = POINT { x, y };
                     let _ = ClientToScreen(hwnd, &mut sp);
                     let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(p, &mut pr);
-                    sp.x >= pr.left - 2 && sp.x <= pr.right + 2 && sp.y >= pr.top && sp.y <= pr.bottom
-                });
+                    let in_parent = sp.x >= pr.left - 2
+                        && sp.x <= pr.right + 2
+                        && sp.y >= pr.top
+                        && sp.y <= pr.bottom;
+                    in_parent && match parent_entry_at(p, sp) {
+                        Some(i) => Some(i) != state.opened_by,
+                        None => false,
+                    }
+                };
             if back_to_parent {
                 let mut pt = POINT { x, y };
                 let _ = ClientToScreen(hwnd, &mut pt);
@@ -796,6 +867,12 @@ fn open_submenu_at(state: &mut MenuWindow, hwnd: HWND, index: usize) {
     );
     match sub {
         Some(s) => {
+            // 告诉子菜单"你是被第 index 项展开的"：它靠这个判断光标是否移到了
+            // 父菜单的**另一项**上，避免刚弹出就被自己关掉。
+            let p = unsafe { GetWindowLongPtrW(s, GWLP_USERDATA) as *mut MenuWindow };
+            if !p.is_null() {
+                unsafe { (*p).opened_by = Some(index) };
+            }
             state.submenu = Some(s);
             state.open_submenu_for = Some(index);
         }

@@ -1,2 +1,17 @@
 workspace/target/
 *.bmp
+
+# 会话级工程数据（记忆、索引），不进版本库
+.workbuddy/
+# 本机构建环境：crates.io 直连不可达，配的是清华 sparse 索引，换机器不该带走
+workspace/.cargo/
+# 一次性排查脚本与截图产物
+probe_*.py
+shot*.png
+analyze.py
+band2.py
+baseline_explorer.py
+bmp2png.py
+dump_rect.py
+inspect.py
+shot.py

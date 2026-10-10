@@ -20,10 +20,12 @@ use windows::Win32::Graphics::Gdi::{
     DeleteObject, FillRect, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, HDC,
 };
 use windows::Win32::Foundation::COLORREF;
-use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+use windows::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+};
 use windows::Win32::UI::Shell::{
-    SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_SMALLICON,
-    SHGFI_USEFILEATTRIBUTES,
+    SHGetFileInfoW, SHFILEINFOW, SHGFI_DISPLAYNAME, SHGFI_ICON, SHGFI_LARGEICON,
+    SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, DrawIconEx, HICON, DI_NORMAL};
 
@@ -102,21 +104,29 @@ impl IconCache {
         let key = if is_dir {
             "dir".to_string()
         } else {
-            extension.to_lowercase()
+            extension.trim_start_matches('.').to_lowercase()
         };
         let map = if large { &mut self.large } else { &mut self.small };
         if let Some(h) = map.get(&key) {
             return *h;
         }
+        // 探测名**必须带点**：`SHGFI_USEFILEATTRIBUTES` 让 Shell 完全不碰磁盘，
+        // 它只按 pszPath 的"扩展名"去查关联图标。早先这里拼成 `probe` + key
+        // （即 "probetxt"），Shell 看到的是一个没有扩展名的文件 —— 于是 txt /
+        // docx / png / 未知类型……全部塌成同一个"通用文件"图标。
         let probe = if is_dir {
             "probe_folder".to_string()
+        } else if key.is_empty() {
+            "probe".to_string()
         } else {
-            format!("probe{key}")
+            format!("probe.{key}")
         };
+        // 文件那一侧必须显式给 FILE_ATTRIBUTE_NORMAL：传 0 时 Shell 的分支
+        // 判定不稳定，取到的不一定是"普通文件"的图标。
         let attrs = if is_dir {
             FILE_ATTRIBUTE_DIRECTORY
         } else {
-            Default::default()
+            FILE_ATTRIBUTE_NORMAL
         };
         let flags = SHGFI_BASE | if large { SHGFI_LARGEICON.0 } else { SHGFI_SMALLICON.0 };
         let mut sfi = SHFILEINFOW::default();
@@ -179,6 +189,38 @@ impl IconCache {
                 self.dir.insert(dkey, h);
                 h
             }
+        }
+    }
+
+    /// 目录的本地化显示名（Shell 的 `SHGFI_DISPLAYNAME`）。
+    ///
+    /// 资源管理器里 `C:\Users` 显示成"用户"、用户目录下的 `Desktop` 显示成"桌面"，
+    /// 靠的是 Shell 读 `desktop.ini` 里的 `LocalizedResourceName`。这里走同一条路，
+    /// 不用自己解析 ini（系统那份是 UTF-16LE 带 BOM，自己解必错）。
+    pub fn display_name(path: &Path) -> Option<String> {
+        let s = path.to_string_lossy();
+        if s.is_empty() {
+            return None;
+        }
+        let mut sfi = SHFILEINFOW::default();
+        let res = unsafe {
+            SHGetFileInfoW(
+                &HSTRING::from(s.as_ref()),
+                FILE_ATTRIBUTE_DIRECTORY,
+                Some(&mut sfi),
+                std::mem::size_of::<SHFILEINFOW>() as u32,
+                SHGFI_DISPLAYNAME,
+            )
+        };
+        if res == 0 {
+            return None;
+        }
+        let v: Vec<u16> = sfi.szDisplayName.iter().take_while(|&&c| c != 0).copied().collect();
+        let name = from_wide(&v);
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
         }
     }
 

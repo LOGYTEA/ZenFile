@@ -489,16 +489,93 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             } else {
                 0u8
             };
+            // 设置页的悬停行：点哪一行要高亮，否则不知道自己会改到哪一项
+            let hover_setting = if app.tab().settings {
+                paint::settings_hit(app, &l, x, y)
+            } else {
+                None
+            };
             if in_close != app.hovering_close
                 || chrome != app.hover_chrome
                 || hover_tab != app.hover_tab
                 || hover_view != app.hover_view_btn
+                || hover_setting != app.settings_hover
             {
                 app.hovering_close = in_close;
                 app.hover_chrome = chrome;
                 app.hover_tab = hover_tab;
                 app.hover_view_btn = hover_view;
+                app.settings_hover = hover_setting;
                 let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            LRESULT(0)
+        }
+        // —— 标题栏三大金刚键 ——
+        // 客户区已经扩展到整窗，系统的非客户区默认处理不再可靠（实测三个键点了没
+        // 反应）。这里自己接管：按下记状态、抬起执行、双击最大化等同按下两次。
+        WM_NCMOUSEMOVE => {
+            let app = &mut *app_ptr;
+            let (x, y) = screen_xy(hwnd, lparam);
+            let l = paint::compute_layout(
+                app.last_size.0,
+                app.last_size.1,
+                &app.metrics,
+                app.cfg.ui.sidebar_visible,
+                app.cfg.ui.statusbar_visible,
+            );
+            let h = caption_hit(&l, x, y);
+            if h != app.hover_caption {
+                app.hover_caption = h;
+                app.hovering_close = h == 3;
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            LRESULT(0)
+        }
+        WM_NCLBUTTONDOWN => {
+            let app = &mut *app_ptr;
+            let (x, y) = screen_xy(hwnd, lparam);
+            let l = paint::compute_layout(
+                app.last_size.0,
+                app.last_size.1,
+                &app.metrics,
+                app.cfg.ui.sidebar_visible,
+                app.cfg.ui.statusbar_visible,
+            );
+            app.pressed_caption = caption_hit(&l, x, y);
+            let _ = InvalidateRect(Some(hwnd), None, false);
+            LRESULT(0)
+        }
+        WM_NCLBUTTONUP => {
+            let app = &mut *app_ptr;
+            let (x, y) = screen_xy(hwnd, lparam);
+            let l = paint::compute_layout(
+                app.last_size.0,
+                app.last_size.1,
+                &app.metrics,
+                app.cfg.ui.sidebar_visible,
+                app.cfg.ui.statusbar_visible,
+            );
+            let hit = caption_hit(&l, x, y);
+            // 按下和抬起必须在同一个键上，否则拖出去再松手也会触发动作
+            let which = if hit != 0 && hit == app.pressed_caption { hit } else { 0 };
+            app.pressed_caption = 0;
+            if which != 0 {
+                run_caption(hwnd, which);
+            }
+            LRESULT(0)
+        }
+        WM_NCLBUTTONDBLCLK => {
+            let app = &mut *app_ptr;
+            let (x, y) = screen_xy(hwnd, lparam);
+            let l = paint::compute_layout(
+                app.last_size.0,
+                app.last_size.1,
+                &app.metrics,
+                app.cfg.ui.sidebar_visible,
+                app.cfg.ui.statusbar_visible,
+            );
+            if caption_hit(&l, x, y) != 0 {
+                run_caption(hwnd, caption_hit(&l, x, y));
             }
             LRESULT(0)
         }
@@ -512,6 +589,43 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 app.cfg.ui.sidebar_visible,
                 app.cfg.ui.statusbar_visible,
             );
+            // 设置页：点一行就切换/循环对应开关
+            if app.tab().settings {
+                if let Some(action) = paint::settings_hit(app, &l, x, y) {
+                    if let Some(cmd) = settings_command(action) {
+                        app.run_command(cmd);
+                    }
+                }
+                return LRESULT(0);
+            }
+            // 回收站视图：先判顶部三个按钮，再判条目
+            if app.tab().recycle {
+                let btns = paint::recycle_buttons(app, &l);
+                if inside(&btns[0], x, y) {
+                    app.run_command(menu::Command::RecycleRestore);
+                } else if inside(&btns[1], x, y) {
+                    app.run_command(menu::Command::RecycleDelete);
+                } else if inside(&btns[2], x, y) {
+                    app.run_command(menu::Command::RecycleEmpty);
+                } else if let Some(idx) = paint::recycle_hit(app, &l, y) {
+                    let id = app.recycle_items.get(idx).map(|i| i.id.clone());
+                    let ctrl = GetKeyState(0x11) < 0;
+                    if let Some(id) = id {
+                        if ctrl {
+                            if !app.recycle_sel.insert(id.clone()) {
+                                app.recycle_sel.remove(&id);
+                            }
+                        } else {
+                            app.recycle_sel.clear();
+                            app.recycle_sel.insert(id);
+                        }
+                    }
+                } else {
+                    app.recycle_sel.clear();
+                }
+                let _ = InvalidateRect(Some(hwnd), None, true);
+                return LRESULT(0);
+            }
             let ctrl = GetKeyState(0x11) < 0;
             let shift = GetKeyState(0x10) < 0;
             if let Some(i) = hit_tab(app, &l, x, y) {
@@ -562,21 +676,21 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 }
                 return LRESULT(0);
             }
-            let header_h = if app.tab().view_mode == fm_core::ViewMode::Details {
-                (26.0 * app.metrics.scale) as i32
-            } else {
-                0
-            };
+            let header_h = header_height(app);
             let view_top = l.view.top + header_h;
-            if y >= l.view.top && y < header_h + l.view.top && app.tab().view_mode == fm_core::ViewMode::Details {
+            if y >= l.view.top && y < view_top && app.tab().view_mode == fm_core::ViewMode::Details {
                 header_click(app, &l, x);
                 return LRESULT(0);
             }
-            if let Some(row) = app.row_hit(y, view_top, l.view.bottom - view_top) {
+            if let Some(row) = view_row_at(app, &l, x, y, view_top) {
                 app.toggle_select(row, ctrl, shift);
                 let _ = InvalidateRect(Some(hwnd), None, true);
             } else if y >= view_top {
+                // 点空白处：清空选中，并且**把焦点框也收起来**。
+                // 只清 selected 的话，焦点行还留在原地，于是"先前选中的那一项还在，
+                // 只是淡了一点" —— 用户以为没清掉。
                 app.tab_mut().selected.clear();
+                app.focus_visible = false;
                 let _ = InvalidateRect(Some(hwnd), None, true);
             }
             LRESULT(0)
@@ -669,6 +783,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 }
                 return LRESULT(0);
             }
+            // 设置页/回收站没有"双击打开"的语义（回收站里的项双击 = 还原更符合直觉，
+            // 但误触代价太高，这里只做选中，还原走顶部按钮）
+            if app.tab().settings || app.tab().recycle {
+                return LRESULT(0);
+            }
             // 首页：双击磁贴进入对应文件夹
             if app.tab().home {
                 if let Some(idx) = home_entry_at(app, &l, x, y) {
@@ -680,12 +799,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 }
                 return LRESULT(0);
             }
-            let header_h = if app.tab().view_mode == fm_core::ViewMode::Details {
-                (26.0 * app.metrics.scale) as i32
-            } else {
-                0
-            };
-            if let Some(row) = app.row_hit(y, l.view.top + header_h, l.view.bottom - l.view.top - header_h) {
+            let header_h = header_height(app);
+            if let Some(row) = view_row_at(app, &l, x, y, l.view.top + header_h) {
                 app.set_focus_row(row);
                 let tab = app.tab_mut();
                 tab.selected.clear();
@@ -709,33 +824,64 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 app.cfg.ui.sidebar_visible,
                 app.cfg.ui.statusbar_visible,
             );
-            let header_h = if app.tab().view_mode == fm_core::ViewMode::Details {
-                (26.0 * app.metrics.scale) as i32
-            } else {
-                0
-            };
+            let header_h = header_height(app);
             let view_top = l.view.top + header_h;
-            if app.tab().home {
-                // 首页：右键前的选中判定走磁贴几何，菜单才会作用在光标下的那个文件夹上
-                if y >= l.view.top && x >= l.view.left {
-                    home_select(app, &l, x, y);
-                    let _ = InvalidateRect(Some(hwnd), None, true);
-                }
-            } else if x >= l.view.left && y >= view_top && y < l.view.bottom {
-                // 只有落在文件列表区才改选中；命中行按资源管理器语义处理，点空白则清空选中，
-                // 这样右键菜单作用的对象就是"光标下的那个文件夹"而不是上一次遗留的选中项。
-                if let Some(row) = app.row_hit(y, view_top, l.view.bottom - view_top) {
-                    app.context_select_row(row);
+
+            if app.tab().settings {
+                // 设置页没有文件可选，右键不弹菜单
+                app.context_targets = Some(Vec::new());
+                LRESULT(0)
+            } else if app.tab().recycle {
+                if let Some(idx) = paint::recycle_hit(app, &l, y) {
+                    let id = app.recycle_items.get(idx).map(|i| i.id.clone());
+                    if let Some(id) = id {
+                        if !app.recycle_sel.contains(&id) {
+                            app.recycle_sel.clear();
+                            app.recycle_sel.insert(id);
+                        }
+                    }
                 } else {
-                    app.tab_mut().selected.clear();
+                    app.recycle_sel.clear();
                 }
                 let _ = InvalidateRect(Some(hwnd), None, true);
+                let mut pt = POINT { x, y };
+                let _ = ClientToScreen(hwnd, &mut pt);
+                app.show_recycle_menu(pt.x, pt.y);
+                LRESULT(0)
+            } else {
+                // 先把"这一次要作用在哪些条目上"算出来存进 App，
+                // 菜单里绝不能再调 selected_paths() —— 它在选中为空时会退回焦点行，
+                // 那正是"空白处右键却判定到条目上"的根因。
+                let targets: Vec<PathBuf> = if app.tab().home {
+                    if y >= l.view.top && x >= l.view.left {
+                        home_select(app, &l, x, y);
+                        app.tab().selected_paths()
+                    } else {
+                        Vec::new()
+                    }
+                } else if x >= l.view.left && y >= view_top && y < l.view.bottom {
+                    match view_row_at(app, &l, x, y, view_top) {
+                        Some(row) => {
+                            app.context_select_row(row);
+                            app.tab().selected_paths()
+                        }
+                        None => {
+                            app.tab_mut().selected.clear();
+                            app.focus_visible = false;
+                            Vec::new()
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
+                app.context_targets = Some(targets);
+                let _ = InvalidateRect(Some(hwnd), None, true);
+                let mut pt = POINT { x, y };
+                let _ = ClientToScreen(hwnd, &mut pt);
+                let extended = GetKeyState(0x10) < 0; // Shift+右键 → Explorer 原生菜单 §7
+                app.show_context_menu(pt.x, pt.y, extended);
+                LRESULT(0)
             }
-            let mut pt = POINT { x, y };
-            let _ = ClientToScreen(hwnd, &mut pt);
-            let extended = GetKeyState(0x10) < 0; // Shift+右键 → Explorer 原生菜单 §7
-            app.show_context_menu(pt.x, pt.y, extended);
-            LRESULT(0)
         }
         WM_MOUSEWHEEL => {
             let app = &mut *app_ptr;
@@ -747,12 +893,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 app.cfg.ui.sidebar_visible,
                 app.cfg.ui.statusbar_visible,
             );
-            let metrics = app.metrics;
             {
                 let tab = app.tab_mut();
                 tab.scroll -= delta / 2;
-                tab.clamp_scroll(l.view.bottom - l.view.top, &metrics);
             }
+            // 钳制必须知道布局：网格视图的内容高度是"行数 × 行高"，行数取决于列数
+            app.clamp_scroll_to(&l);
             let _ = InvalidateRect(Some(hwnd), None, true);
             LRESULT(0)
         }
@@ -803,6 +949,30 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
     }
 }
 
+/// 列表命中：大图标/中图标走**网格**几何，其余走行几何。
+///
+/// 三个调用点（单击 / 双击 / 右键）必须共用这一个函数。之前大图标视图仍然按
+/// "一行一条"算，画出来是网格、点进去是行，位置完全对不上。
+fn view_row_at(app: &App, l: &paint::Layout, x: i32, y: i32, view_top: i32) -> Option<usize> {
+    let tab = app.tab();
+    let mode = tab.view_mode;
+    if matches!(mode, fm_core::ViewMode::LargeIcons | fm_core::ViewMode::MediumIcons) {
+        let g = paint::icon_grid(l, &app.metrics, mode);
+        paint::grid_hit(&g, l, x, y, view_top, tab.scroll, tab.visible.len())
+    } else {
+        app.row_hit(y, view_top, l.view.bottom - view_top)
+    }
+}
+
+/// 详细信息视图表头的高度；其它视图没有表头。
+fn header_height(app: &App) -> i32 {
+    if app.tab().view_mode == fm_core::ViewMode::Details {
+        (26.0 * app.metrics.scale) as i32
+    } else {
+        0
+    }
+}
+
 /// 首页命中测试：返回光标下的平铺磁贴对应的**条目下标**。
 ///
 /// 几何由 `paint::home_layout` 统一给出，绘制与命中判定共用，不会出现
@@ -834,6 +1004,69 @@ fn home_select(app: &mut App, l: &paint::Layout, x: i32, y: i32) -> bool {
             app.tab_mut().selected.clear();
             false
         }
+    }
+}
+
+/// 非客户区消息的坐标是**屏幕坐标**，只做一次 ScreenToClient。
+/// （`client_xy` 会先 ClientToScreen 再 ScreenToClient，用在屏幕坐标上是错的。）
+fn screen_xy(hwnd: HWND, lparam: LPARAM) -> (i32, i32) {
+    let mut pt = POINT {
+        x: (lparam.0 & 0xFFFF) as i16 as i32,
+        y: (lparam.0 >> 16) as i16 as i32,
+    };
+    unsafe {
+        let _ = ScreenToClient(hwnd, &mut pt);
+    }
+    (pt.x, pt.y)
+}
+
+/// 标题栏三大金刚键的命中编号：0=无，1=最小化，2=最大化，3=关闭。
+fn caption_hit(l: &paint::Layout, x: i32, y: i32) -> u8 {
+    if inside(&l.min_btn, x, y) {
+        1
+    } else if inside(&l.max_btn, x, y) {
+        2
+    } else if inside(&l.close_btn, x, y) {
+        3
+    } else {
+        0
+    }
+}
+
+/// 执行标题栏按钮的动作。
+///
+/// 这里**不依赖 DefWindowProc**：客户区早已扩展到整窗（WM_NCCALCSIZE 返回 0），
+/// 系统那套非客户区默认处理在这种情况下并不可靠 —— 表现就是"三个键点不动"。
+unsafe fn run_caption(hwnd: HWND, which: u8) {
+    match which {
+        1 => {
+            let _ = ShowWindow(hwnd, SW_MINIMIZE);
+        }
+        2 => {
+            let _ = ShowWindow(hwnd, if IsZoomed(hwnd).0 != 0 { SW_RESTORE } else { SW_MAXIMIZE });
+        }
+        3 => {
+            let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+        _ => {}
+    }
+}
+
+/// 设置页里某一行的点击翻译成命令。
+fn settings_command(action: u32) -> Option<menu::Command> {
+    use paint::{
+        SET_EXT, SET_HIDDEN, SET_SIDEBAR, SET_STATUS, SET_SYSTEM, SET_THEME, SET_UNIT, SET_VIEW,
+    };
+    match action {
+        SET_HIDDEN => Some(menu::Command::ToggleHidden),
+        SET_SYSTEM => Some(menu::Command::ToggleSystem),
+        SET_EXT => Some(menu::Command::ToggleExtensions),
+        SET_UNIT => Some(menu::Command::CycleSizeUnit),
+        SET_THEME => Some(menu::Command::CycleTheme),
+        SET_VIEW => Some(menu::Command::CycleDefaultView),
+        SET_SIDEBAR => Some(menu::Command::ToggleSidebar),
+        SET_STATUS => Some(menu::Command::ToggleStatusbar),
+        _ => None,
     }
 }
 

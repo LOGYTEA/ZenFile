@@ -43,6 +43,7 @@ windows = { version = "0.62", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Accessibility",
     "Win32_Security",
+    "Win32_Security_Authorization",
 ] }
 
 # 面向 §12 内存/体积预算的发布配置

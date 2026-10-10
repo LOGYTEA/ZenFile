@@ -46,6 +46,8 @@
       "default_mode": "details",
       "show_hidden": false,
       "show_system": false,
+      "show_extensions": true,
+      "size_unit": "auto",
       "sort_key": "name",
       "sort_descending": false
     },

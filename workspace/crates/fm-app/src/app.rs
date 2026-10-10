@@ -27,9 +27,26 @@ use crate::theme::{self, Metrics, Theme};
 
 /// 主页（快速访问）的哨兵路径。它不是真实目录，由 App 合成条目。
 pub const HOME_PATH: &str = "shell:Home";
+/// 回收站哨兵路径。同样是虚拟视图，条目来自 `$Recycle.Bin` 直读。
+pub const RECYCLE_PATH: &str = "shell:RecycleBin";
+/// 设置页哨兵路径。以标签页形式打开，不参与目录枚举。
+pub const SETTINGS_PATH: &str = "shell:Settings";
 
 pub fn is_home_path(p: &Path) -> bool {
     p.to_string_lossy().eq_ignore_ascii_case(HOME_PATH)
+}
+
+pub fn is_recycle_path(p: &Path) -> bool {
+    p.to_string_lossy().eq_ignore_ascii_case(RECYCLE_PATH)
+}
+
+pub fn is_settings_path(p: &Path) -> bool {
+    p.to_string_lossy().eq_ignore_ascii_case(SETTINGS_PATH)
+}
+
+/// 非真实目录的虚拟视图：不枚举、不监听、不走目录操作。
+pub fn is_virtual(p: &Path) -> bool {
+    is_home_path(p) || is_recycle_path(p) || is_settings_path(p)
 }
 
 /// 合成主页条目：**先**常用文件夹（8 个），**后**本机驱动器。
@@ -84,6 +101,10 @@ pub struct Tab {
     pub title: String,
     /// 主页（快速访问）虚拟目录，不参与真实枚举
     pub home: bool,
+    /// 回收站虚拟视图
+    pub recycle: bool,
+    /// 设置页（以标签页形式打开）
+    pub settings: bool,
     pub entries: Vec<FileEntry>,
     /// 通过即时筛选的行索引
     pub visible: Vec<usize>,
@@ -105,6 +126,10 @@ impl Tab {
     pub fn new(path: PathBuf) -> Self {
         let title = if is_home_path(&path) {
             "主页".to_string()
+        } else if is_recycle_path(&path) {
+            "回收站".to_string()
+        } else if is_settings_path(&path) {
+            "设置".to_string()
         } else {
             display_title(&path)
         };
@@ -112,6 +137,8 @@ impl Tab {
             path: path.clone(),
             title,
             home: is_home_path(&path),
+            recycle: is_recycle_path(&path),
+            settings: is_settings_path(&path),
             entries: Vec::new(),
             visible: Vec::new(),
             selected: HashSet::new(),
@@ -160,14 +187,6 @@ impl Tab {
             .sum()
     }
 
-    pub fn content_height(&self, mode: ViewMode, view_h: i32, metrics: &Metrics) -> i32 {
-        self.visible.len() as i32 * metrics.row_height_for(mode) - view_h
-    }
-
-    pub fn clamp_scroll(&mut self, view_h: i32, metrics: &Metrics) {
-        let max = self.content_height(self.view_mode, view_h, metrics).max(0);
-        self.scroll = self.scroll.min(max).max(0);
-    }
 }
 
 pub fn key_of(e: &FileEntry) -> String {
@@ -222,6 +241,8 @@ pub struct App {
     /// 是否显示"受保护的操作系统文件"（带 FILE_ATTRIBUTE_SYSTEM 的项）。
     /// 与 show_hidden 相互独立 —— 资源管理器也是两道分开的开关。
     pub show_system: bool,
+    /// 目录的本地化显示名缓存（"Users"→"用户"、"Desktop"→"桌面"）。
+    pub display_names: HashMap<PathBuf, String>,
     /// 主页"设备和驱动器"的容量缓存：`盘符 -> (总容量, 可用)`。
     /// 只在进入主页时刷新一次，避免每帧都做磁盘 IO。
     pub drive_space: HashMap<String, (u64, u64)>,
@@ -240,6 +261,27 @@ pub struct App {
     /// 目录枚举是异步的：go_up 的瞬间目标目录一行都没有，直接查找必然落空。
     /// 所以先把"要选中的路径"记下来，等枚举批次到达（drain）后再落地。
     pub pending_select: Option<PathBuf>,
+    /// 本次右键菜单要作用在哪些条目上。
+    ///
+    /// `Some(vec![])` 表示右键点在了空白处；`None` 表示不是从右键进来的。
+    /// 之前直接调 `selected_paths()`，而它在选中为空时会**退回焦点行** ——
+    /// 于是"空白处右键"拿到的还是上一次那个条目，菜单判定的就是错的。
+    pub context_targets: Option<Vec<PathBuf>>,
+    /// 回收站条目（进入回收站视图时刷新一次）。
+    pub recycle_items: Vec<fm_core::recycle::Item>,
+    /// 回收站里被选中的项（按 `$R` 实体名索引）。
+    pub recycle_sel: HashSet<String>,
+    /// 设置页里鼠标悬停的行（存的是该行的动作编号，行位置会随开关文案变化）。
+    pub settings_hover: Option<u32>,
+    /// 标题栏三大金刚键的悬停位：0=无，1=最小化，2=最大化，3=关闭。
+    pub hover_caption: u8,
+    /// 按下未抬起的那一个（0=无，1/2/3 同上）。
+    pub pressed_caption: u8,
+}
+
+/// 向 Shell 问目录的本地化显示名（见 `App::display_name`）。
+fn shell_display_name(path: &Path) -> Option<String> {
+    crate::icons::IconCache::display_name(path)
 }
 
 /// 取某个驱动器的容量`(总容量, 可用)`，供首页渲染容量条。
@@ -285,10 +327,17 @@ impl App {
             hovering_close: false,
             hover_chrome: 0,
             drive_space: HashMap::new(),
+            display_names: HashMap::new(),
             focus_visible: false,
             hover_tab: None,
             hover_view_btn: 0,
             pending_select: None,
+            context_targets: None,
+            recycle_items: Vec::new(),
+            recycle_sel: HashSet::new(),
+            settings_hover: None,
+            hover_caption: 0,
+            pressed_caption: 0,
         }
     }
 
@@ -342,11 +391,26 @@ impl App {
         // （带 `\\?\`），那个前缀会让目录枚举返回空列表。
         let path = fm_core::paths::strip_verbatim(&path);
         let depth = self.cfg.files.navigation.history_depth;
+        // 标签标题也走本地化显示名：资源管理器里 `C:\Users` 的标签写的是"用户"，
+        // 直接显示盘上真名会让人对不上号。
+        let title = if is_home_path(&path) {
+            "主页".to_string()
+        } else if is_recycle_path(&path) {
+            "回收站".to_string()
+        } else if is_settings_path(&path) {
+            "设置".to_string()
+        } else if path.is_dir() {
+            self.display_name(&path, &display_title(&path))
+        } else {
+            display_title(&path)
+        };
         {
             let tab = self.tab_mut();
             tab.home = is_home_path(&path);
+            tab.recycle = is_recycle_path(&path);
+            tab.settings = is_settings_path(&path);
             tab.path = path.clone();
-            tab.title = if tab.home { "主页".to_string() } else { display_title(&path) };
+            tab.title = title;
             tab.selected.clear();
             tab.scroll = 0;
             tab.focus_row = 0;
@@ -419,8 +483,9 @@ impl App {
     }
 
     pub fn go_up(&mut self) {
-        // 主页已经是顶层，没有上级
-        if self.tab().home {
+        // 虚拟视图（主页/回收站/设置）没有"上一级"，一律退回主页
+        if is_virtual(&self.tab().path) {
+            self.navigate(PathBuf::from(HOME_PATH));
             return;
         }
         if let Some(parent) = paths::parent_of(&self.tab().path) {
@@ -488,6 +553,27 @@ impl App {
             tab.entries = entries;
             tab.loading = false;
             tab.recompute_filter(show_hidden, show_system);
+            return;
+        }
+
+        // 回收站/设置同样是虚拟视图：合成显示数据即可，绝不走目录枚举。
+        // 回收站直读 $Recycle.Bin（不走 Shell 的 IShellFolder），几千项也是几十毫秒。
+        if self.tab().recycle {
+            self.recycle_items = fm_core::recycle::list();
+            self.recycle_sel.clear();
+            let tab = self.tab_mut();
+            tab.generation += 1;
+            tab.entries.clear();
+            tab.visible.clear();
+            tab.loading = false;
+            return;
+        }
+        if self.tab().settings {
+            let tab = self.tab_mut();
+            tab.generation += 1;
+            tab.entries.clear();
+            tab.visible.clear();
+            tab.loading = false;
             return;
         }
 
@@ -666,6 +752,25 @@ impl App {
             tab.selected.clear();
             tab.selected.insert(k);
         }
+    }
+
+    /// 滚动钳制。网格视图的内容高度是"行数 × 行高"，而行数由**列数**决定、
+    /// 列数又来自布局宽度 —— 所以只看 metrics 算出来的高度是错的，必须拿 Layout。
+    pub fn clamp_scroll_to(&mut self, l: &crate::paint::Layout) {
+        let view_h = l.view.bottom - l.view.top;
+        let metrics = self.metrics;
+        let mode = self.tab().view_mode;
+        let count = self.tab().visible.len();
+        let content = match mode {
+            fm_core::ViewMode::LargeIcons | fm_core::ViewMode::MediumIcons => {
+                let g = crate::paint::icon_grid(l, &metrics, mode);
+                crate::paint::grid_content_h(&g, count)
+            }
+            _ => count as i32 * metrics.row_height_for(mode),
+        };
+        let max = (content - view_h).max(0);
+        let tab = self.tab_mut();
+        tab.scroll = tab.scroll.min(max).max(0);
     }
 
     pub fn select_all(&mut self) {
@@ -888,7 +993,10 @@ impl App {
     // ------------------------------------------------------------ 右键菜单
 
     pub fn show_context_menu(&mut self, x: i32, y: i32, extended: bool) {
-        let items = self.tab().selected_paths();
+        // 右键菜单的作用对象**必须**来自右键那一刻的命中判定，不能用
+        // `selected_paths()`：它在选中为空时会退回焦点行，于是在空白处右键
+        // 仍然会拿到上一次那个条目（右键菜单"判定到条目上"的根因）。
+        let items = self.context_targets.clone().unwrap_or_default();
         let cwd = self.tab().path.clone();
         let parent = items
             .first()
@@ -910,7 +1018,11 @@ impl App {
 
         let mut entries = own_menu_rows(self, &items);
         if let Some(bridge) = &self.bridge {
-            let system = menu::entries_from_bridge(bridge);
+            let mut system = menu::entries_from_bridge(bridge);
+            // 去掉与自有条目重名的一级项：Shell 菜单里也有"打开/剪切/复制/重命名/
+            // 删除/属性"，全列出来就是两个"打开"，看着像 bug。
+            let owned: Vec<String> = entries.iter().map(|e| menu::strip_accel(&e.text)).collect();
+            system.retain(|e| !owned.iter().any(|o| *o == menu::strip_accel(&e.text)));
             if !system.is_empty() {
                 entries.push(menu::MenuEntry::sep());
                 entries.extend(system);
@@ -931,6 +1043,33 @@ impl App {
             None, // 顶层菜单：没有父级菜单窗口
         ) {
             self.menu_hwnd = Some(hwnd_menu);
+        }
+    }
+
+    /// 回收站视图里的右键菜单。
+    pub fn show_recycle_menu(&mut self, x: i32, y: i32) {
+        let entries = vec![
+            shell_row("还原", Some("\u{E7A7}"), Command::RecycleRestore),
+            shell_row("彻底删除", Some("\u{E74D}"), Command::RecycleDelete),
+            menu::MenuEntry::sep(),
+            shell_row("全选", Some("\u{E762}"), Command::RecycleSelectAll),
+            menu::MenuEntry::sep(),
+            shell_row("清空回收站", Some("\u{E74D}"), Command::RecycleEmpty),
+            menu::MenuEntry::sep(),
+            shell_row("刷新", Some("\u{E72C}"), Command::Refresh),
+        ];
+        let app_ptr = self as *mut App;
+        if let Some(h) = menu::open_menu(
+            app_ptr,
+            self.hwnd,
+            entries,
+            x,
+            y,
+            self.metrics.scale,
+            self.theme,
+            None,
+        ) {
+            self.menu_hwnd = Some(h);
         }
     }
 
@@ -982,13 +1121,15 @@ impl App {
             }
             Command::Properties => {
                 // 无选中项时打开"当前文件夹"的属性，与资源管理器空白处右键一致。
-                // 只有目标本身是"主页"这个虚拟视图时才无属性可开 —— 主页里选中
-                // 的条目（桌面/下载/…）是真实目录，必须能正常打开属性。
+                // 目标取自右键那一刻的命中结果（没有则退回当前选中/焦点行），
+                // 否则空白处右键会把属性开在别的条目上。
                 let target = self
-                    .tab()
-                    .selected_paths()
+                    .context_targets
+                    .clone()
+                    .unwrap_or_default()
                     .first()
                     .cloned()
+                    .or_else(|| self.tab().selected_paths().first().cloned())
                     .unwrap_or_else(|| self.tab().path.clone());
                 if crate::app::is_home_path(&target) {
                     report(self.hwnd, "“主页”是虚拟视图，没有对应的文件夹属性");
@@ -1009,6 +1150,16 @@ impl App {
             Command::ToggleStatusbar => self.toggle_statusbar(),
             Command::ToggleHidden => self.toggle_hidden(),
             Command::ToggleSystem => self.toggle_system(),
+            Command::ToggleExtensions => self.toggle_extensions(),
+            Command::CycleSizeUnit => self.cycle_size_unit(),
+            Command::CycleTheme => self.cycle_theme(),
+            Command::CycleDefaultView => self.cycle_default_view(),
+            Command::OpenSettings => self.open_settings(),
+            Command::OpenRecycle => self.open_recycle(),
+            Command::RecycleRestore => self.restore_recycle(),
+            Command::RecycleDelete => self.purge_recycle(),
+            Command::RecycleEmpty => self.empty_recycle(),
+            Command::RecycleSelectAll => self.recycle_select_all(),
             Command::NewTab => self.new_tab(),
             Command::About => report(self.hwnd, "NexFile 轻量资源管理器\nWin32 + GDI 自绘，无 WebView2 依赖"),
         }
@@ -1055,11 +1206,129 @@ impl App {
                 "view": {
                     "show_hidden": self.cfg.files.view.show_hidden,
                     "show_system": self.cfg.files.view.show_system,
+                    "show_extensions": self.cfg.files.view.show_extensions,
+                    "size_unit": self.cfg.files.view.size_unit,
+                    "default_mode": self.cfg.files.view.default_mode,
                 }
             }
         })) {
             eprintln!("保存视图偏好失败: {e}");
         }
+    }
+
+    /// 显示/隐藏文件扩展名。资源管理器在"查看 → 显示/隐藏"里也给了这一项。
+    pub fn toggle_extensions(&mut self) {
+        self.cfg.files.view.show_extensions = !self.cfg.files.view.show_extensions;
+        self.persist_view_pref();
+        self.invalidate();
+    }
+
+    /// 切换"大小"列的默认单位（自动 / 字节 / KB / MB / GB 循环）。
+    pub fn cycle_size_unit(&mut self) {
+        let next = match fm_core::SizeUnit::parse(&self.cfg.files.view.size_unit) {
+            fm_core::SizeUnit::Auto => "bytes",
+            fm_core::SizeUnit::Bytes => "kb",
+            fm_core::SizeUnit::KB => "mb",
+            fm_core::SizeUnit::MB => "gb",
+            fm_core::SizeUnit::GB => "auto",
+        };
+        self.cfg.files.view.size_unit = next.to_string();
+        self.persist_view_pref();
+        self.invalidate();
+    }
+
+    /// 切换明暗主题。
+    pub fn cycle_theme(&mut self) {
+        let next = if self.cfg.core.theme == "light" { "dark" } else { "light" };
+        self.cfg.core.theme = next.to_string();
+        self.theme = if next == "light" { theme::light() } else { theme::dark() };
+        let _ = fm_core::config::Config::save_user_patch(&serde_json::json!({
+            "core": { "theme": next }
+        }));
+        self.invalidate();
+    }
+
+    /// 切换默认视图模式（设置页用）。
+    pub fn cycle_default_view(&mut self) {
+        let cur = parse_view(&self.cfg.files.view.default_mode);
+        self.cfg.files.view.default_mode = cur.next().label().to_string();
+        self.persist_view_pref();
+        self.invalidate();
+    }
+
+    // ------------------------------------------------------------ 虚拟视图
+
+    /// 以标签页形式打开设置页。已经开过就直接切过去，避免堆一串重复标签。
+    pub fn open_settings(&mut self) {
+        if let Some(i) = self.tabs.iter().position(|t| t.settings) {
+            self.active = i;
+        } else {
+            self.open_tab(PathBuf::from(SETTINGS_PATH));
+        }
+        self.settings_hover = None;
+        crate::paint::sync_address(self);
+        self.invalidate();
+    }
+
+    /// 打开回收站视图。
+    pub fn open_recycle(&mut self) {
+        if let Some(i) = self.tabs.iter().position(|t| t.recycle) {
+            self.active = i;
+            self.reload();
+        } else {
+            self.open_tab(PathBuf::from(RECYCLE_PATH));
+        }
+        crate::paint::sync_address(self);
+        self.invalidate();
+    }
+
+    /// 还原回收站里选中的项。
+    pub fn restore_recycle(&mut self) {
+        let picked: Vec<fm_core::recycle::Item> = self
+            .recycle_items
+            .iter()
+            .filter(|it| self.recycle_sel.contains(&it.id))
+            .cloned()
+            .collect();
+        if picked.is_empty() {
+            return;
+        }
+        let n = fm_core::recycle::restore(&picked);
+        report(self.hwnd, &format!("已还原 {n} 项"));
+        self.reload();
+    }
+
+    /// 彻底删除回收站里选中的项。
+    pub fn purge_recycle(&mut self) {
+        let picked: Vec<fm_core::recycle::Item> = self
+            .recycle_items
+            .iter()
+            .filter(|it| self.recycle_sel.contains(&it.id))
+            .cloned()
+            .collect();
+        if picked.is_empty() {
+            return;
+        }
+        if !confirm(self.hwnd, &format!("彻底删除这 {} 项？此操作不可撤销。", picked.len())) {
+            return;
+        }
+        let n = fm_core::recycle::remove(&picked);
+        report(self.hwnd, &format!("已彻底删除 {n} 项"));
+        self.reload();
+    }
+
+    /// 清空回收站。
+    pub fn empty_recycle(&mut self) {
+        if !confirm(self.hwnd, "清空回收站？此操作不可撤销。") {
+            return;
+        }
+        let _ = fm_core::recycle::empty();
+        self.reload();
+    }
+
+    pub fn recycle_select_all(&mut self) {
+        self.recycle_sel = self.recycle_items.iter().map(|i| i.id.clone()).collect();
+        self.invalidate();
     }
 
     pub fn toggle_statusbar(&mut self) {
@@ -1119,6 +1388,11 @@ impl App {
         view_row
             .submenu
             .push(check_row("受保护的系统文件", Command::ToggleSystem, self.show_system));
+        view_row.submenu.push(check_row(
+            "文件扩展名",
+            Command::ToggleExtensions,
+            self.cfg.files.view.show_extensions,
+        ));
         entries.push(view_row);
 
         let mut sort_row = menu::MenuEntry {
@@ -1152,6 +1426,10 @@ impl App {
             Some("\u{E75B}"),
             Command::ToggleStatusbar,
         ));
+        entries.push(menu::MenuEntry::sep());
+        entries.push(shell_row("打开回收站", Some("\u{E74D}"), Command::OpenRecycle));
+        // 设置：以标签页形式打开，所有开关都收在里面（§10 三层配置的用户层）
+        entries.push(shell_row("设置", Some("\u{E713}"), Command::OpenSettings));
         entries.push(menu::MenuEntry::sep());
         entries.push(shell_row("关于 NexFile", Some("\u{E946}"), Command::About));
 
@@ -1201,6 +1479,33 @@ impl App {
 
     pub fn status_text(&self) -> String {
         let tab = self.tab();
+        if tab.recycle {
+            let bytes: u64 = self.recycle_items.iter().map(|i| i.size).sum();
+            let unit = self.cfg.files.view.size_unit_of();
+            return if self.recycle_sel.is_empty() {
+                format!(
+                    "回收站 · {} 项 · 共 {}",
+                    self.recycle_items.len(),
+                    human_unit(bytes, unit)
+                )
+            } else {
+                let sel_bytes: u64 = self
+                    .recycle_items
+                    .iter()
+                    .filter(|i| self.recycle_sel.contains(&i.id))
+                    .map(|i| i.size)
+                    .sum();
+                format!(
+                    "回收站 · {} 项 · 已选 {} 项 {}",
+                    self.recycle_items.len(),
+                    self.recycle_sel.len(),
+                    human_unit(sel_bytes, unit)
+                )
+            };
+        }
+        if tab.settings {
+            return "设置 · 改动即时写入 %APPDATA%\\NexFile\\settings.user.json".to_string();
+        }
         let total = tab.entries.len();
         let visible = tab.visible.len();
         let sel = tab.selected.len();
@@ -1211,11 +1516,39 @@ impl App {
         } else {
             tab.path.display().to_string()
         };
-        if sel > 0 {
-            format!("{visible} / {total} 个项目 · 已选 {sel} 项 {bytes} · 视图 {view} · {path}", bytes = human(bytes), path = path)
-        } else {
-            format!("{visible} / {total} 个项目 · 视图 {view} · {path}", path = path)
+        let unit = self.cfg.files.view.size_unit_of();
+        // 被两道开关过滤掉的项要显式说一声：不然用户会以为文件真的没了
+        let mut hidden_note = String::new();
+        if total > visible {
+            hidden_note = format!(" · 已隐藏 {} 项", total - visible);
         }
+        if sel > 0 {
+            format!(
+                "{visible} / {total} 个项目{hidden_note} · 已选 {sel} 项 {bytes} · 视图 {view} · {path}",
+                bytes = human_unit(bytes, unit),
+                path = path
+            )
+        } else {
+            format!("{visible} / {total} 个项目{hidden_note} · 视图 {view} · {path}", path = path)
+        }
+    }
+
+    /// 目录的**本地化显示名**（资源管理器里"Users"显示为"用户"、"Desktop"显示为
+    /// "桌面"）。取自 Shell 的 `SHGFI_DISPLAYNAME`，它会读 `desktop.ini` 的
+    /// `LocalizedResourceName`，与资源管理器完全一致。
+    ///
+    /// 只对目录查询（文件一律用真实文件名），结果按路径缓存 ——
+    /// 每个目录都问一次 Shell 会把大目录的枚举拖慢。
+    pub fn display_name(&mut self, path: &Path, fallback: &str) -> String {
+        if let Some(v) = self.display_names.get(path) {
+            return v.clone();
+        }
+        let v = shell_display_name(path).unwrap_or_else(|| fallback.to_string());
+        // 上界保护：极端情况下（同一个视图里几万个目录）不至于无限增长
+        if self.display_names.len() < 4096 {
+            self.display_names.insert(path.to_path_buf(), v.clone());
+        }
+        v
     }
 }
 
@@ -1285,9 +1618,11 @@ fn own_menu_rows(app: &App, items: &[PathBuf]) -> Vec<menu::MenuEntry> {
             shell_row("列表", None, Command::ViewList),
             shell_row("详细信息", None, Command::ViewDetails),
             menu::MenuEntry::sep(),
-            // 两道开关分开列：隐藏项是用户自己设的，系统项是系统保护的
+            // 三道开关分开列：隐藏项是用户自己设的，系统项是系统保护的，
+            // 扩展名是纯显示开关 —— 混成一个开关没法单独控制。
             check_row("隐藏的项目", Command::ToggleHidden, app.show_hidden),
             check_row("受保护的系统文件", Command::ToggleSystem, app.show_system),
+            check_row("文件扩展名", Command::ToggleExtensions, app.cfg.files.view.show_extensions),
         ],
     ));
     rows.push(submenu_row(
@@ -1305,6 +1640,8 @@ fn own_menu_rows(app: &App, items: &[PathBuf]) -> Vec<menu::MenuEntry> {
         Some("\u{E946}"),
         Command::Properties,
     ));
+    rows.push(menu::MenuEntry::sep());
+    rows.push(shell_row("设置", Some("\u{E713}"), Command::OpenSettings));
     // 无选中项时给出背景菜单语义说明
     if items.is_empty() {
         rows.push(menu::MenuEntry::sep());
@@ -1316,21 +1653,14 @@ fn own_menu_rows(app: &App, items: &[PathBuf]) -> Vec<menu::MenuEntry> {
 }
 
 pub fn human(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.0} KB", bytes as f64 / KB as f64)
-    } else if bytes > 0 {
-        format!("{bytes} 字节")
-    } else {
-        "0 字节".to_string()
-    }
+    fm_core::SizeUnit::Auto.format(bytes)
 }
+
+/// 按用户选定的单位格式化（设置页里的"大小单位"）。
+pub fn human_unit(bytes: u64, unit: fm_core::SizeUnit) -> String {
+    unit.format(bytes)
+}
+
 
 pub fn confirm(hwnd: HWND, text: &str) -> bool {
     use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OKCANCEL, IDOK};

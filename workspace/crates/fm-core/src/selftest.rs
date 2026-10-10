@@ -181,6 +181,37 @@ pub fn run() -> i32 {
         "剪切/复制语义可区分",
     );
 
+    // 12. 大小单位：默认规则是"最小单位"，同一列里不允许出现有的 KB 有的字节
+    let kb = crate::SizeUnit::Auto.format(512);
+    let mb = crate::SizeUnit::Auto.format(2 * 1024 * 1024);
+    let gb = crate::SizeUnit::Auto.format(3 * 1024 * 1024 * 1024);
+    h.check(
+        "size::auto_smallest",
+        kb.ends_with("KB") && mb.ends_with("MB") && gb.ends_with("GB"),
+        &format!("512B->{kb}, 2MB->{mb}, 3GB->{gb}"),
+    );
+    h.check(
+        "size::fixed",
+        crate::SizeUnit::KB.format(2048) == "2 KB"
+            && crate::SizeUnit::Bytes.format(2048) == "2048 字节",
+        "固定单位换算",
+    );
+    h.check(
+        "size::parse_roundtrip",
+        crate::SizeUnit::parse("mb") == crate::SizeUnit::MB
+            && crate::SizeUnit::parse("auto") == crate::SizeUnit::Auto,
+        "配置字符串往返",
+    );
+
+    // 13. 回收站：能枚举到条目就至少要保证条目自身可解析（$I/$R 成对）
+    let items = crate::recycle::list();
+    let paired = items.iter().all(|i| i.r_path.exists() && i.i_path.exists());
+    h.check(
+        "recycle::list",
+        items.iter().all(|i| !i.name.is_empty()) && paired,
+        &format!("{} 项，$I/$R 均成对", items.len()),
+    );
+
     println!("\n通过 {}/{} 项", h.passed, h.passed + h.failed);
     if h.failed == 0 {
         0

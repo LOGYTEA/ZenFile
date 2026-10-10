@@ -210,7 +210,24 @@ def diff_ratio(a, b):
 print("=" * 70)
 print("第九轮验证")
 print(f"素材目录: {BASE}")
-shutil.rmtree(BASE, ignore_errors=True)
+# 上一轮可能给素材加了只读/系统属性（属性对话框那一项会真的改写磁盘属性），
+# 带这些属性的文件 os.remove 会直接 PermissionError —— 先清属性再删。
+# 注意：本机 attrib 对 "-s -h -r /S /D" 这种写法报“参数格式不正确”，
+# 所以一律用 Python 的 os.chmod 逐文件解除只读，再 rmtree。
+def force_rmtree(path: str) -> None:
+    if not os.path.isdir(path):
+        return
+    import stat as _st
+    for root, dirs, files in os.walk(path):
+        for n in dirs + files:
+            try:
+                os.chmod(os.path.join(root, n), _st.S_IWRITE | _st.S_IREAD)
+            except OSError:
+                pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
+force_rmtree(BASE)
 os.makedirs(os.path.join(BASE, "Icons"), exist_ok=True)
 os.makedirs(os.path.join(BASE, "Attr"), exist_ok=True)
 os.makedirs(os.path.join(BASE, "Nav", "Sub1"), exist_ok=True)
@@ -302,16 +319,21 @@ mark(len(menus) == 1, "右键菜单弹出")
 if menus:
     mh, mx, my, mw, mhh = menus[0]
     before = grab(mh)
+    print(f"  菜单窗口 {mw}x{mhh}（扫描 y=6..{min(mhh - 4, 260)}）")
     # 逐行往下扫，直到出现第二个菜单窗口 = 悬停展开了子菜单
     sub = None
     sub_at = None
+    seen = []
     for yy in range(6, min(mhh - 4, 260), 3):
         move(mh, mw // 2, yy)
         ms = windows_of("NexFileMenu")
+        seen.append(len(ms))
         if len(ms) >= 2:
             sub = [m for m in ms if m[0] != mh]
             sub_at = yy
             break
+    if sub is None:
+        print(f"    扫描全程菜单窗口数序列 {seen[:40]}")
     mark(sub is not None, f"悬停可展开子菜单（y={sub_at}）")
     if sub:
         sh, sx, sy, sw, shh = sub[0][0], sub[0][1], sub[0][2], sub[0][3], sub[0][4]
@@ -500,6 +522,9 @@ print("\n===== 7) 自绘属性对话框 =====")
 hwnd = launch(os.path.join(BASE, "Icons"))
 raw, stride, w, h = grab(hwnd)
 bands = row_bands(raw, stride, w, h, 170, 600, 90, h - 40)
+# 表头文字本身也会形成一条 2~3px 的墨迹带，必须滤掉，否则 bands[0] 是表头、
+# bands[1] 其实是第 0 行（app.exe），"选中 note.txt"就成了选中 app.exe。
+bands = [b for b in bands if b[1] - b[0] >= 8]
 # 选中第 2 行（note.txt）后右键：这样菜单是"文件菜单"，行序固定
 sel_y = (bands[1][0] + bands[1][1]) // 2 if len(bands) > 1 else 150
 click(hwnd, 300, sel_y)
@@ -550,21 +575,43 @@ if ok_menu:
         p = os.path.join(BASE, "Icons", "note.txt")
         a0 = k.GetFileAttributesW(p)
         ph = props[0]
-        rp, stp, wp, hp = grab(ph)
-        # 复选框在窗口下部：扫描带边框的小方框（16px 见方的描边框）
-        boxes = []
-        for y in range(int(hp * 0.6), int(hp * 0.85)):
-            row = [x for x in range(10, 40) if sum(px(rp, stp, x, y)) > 200]
-            if len(row) >= 8:
-                boxes.append((y, row[0]))
+        # 窗口刚 ShowWindow 出来时可能还没画第一帧，PrintWindow 抓到的是空板 ——
+        # 于是"复选框一个都扫不到"。重抓几次等到内容出现为止。
+        for attempt in range(8):
+            rp, stp, wp, hp = grab(ph)
+            # 复选框在窗口下部：扫描带边框的小方框（16px 见方的描边框）
+            boxes = []
+            for y in range(int(hp * 0.6), int(hp * 0.85)):
+                bright = lambda yy: [x for x in range(10, 40)
+                                     if sum(px(rp, stp, x, yy)) > 200]
+                row = bright(y)
+                low = bright(y + 15)
+                mid = bright(y + 7)
+                # 复选框是 16px 见方的**描边框**，四个判据缺一不可：
+                #   1. 上边（y）是一条 ≥8px 的横线；
+                #   2. 下边（y+15）也是一条 ≥8px 的横线；
+                #   3. 中间（y+7）只剩左右两根竖边 —— 这是"框"和"文字"的分水岭。
+                #      只判 1、2 会误命中"属性"分组标题的文字行（它上边够亮，
+                #      y+15 又正好压到下一个复选框的上边），而那个位置不在任何
+                #      复选框的命中矩形里，点下去毫无反应。
+                #   4. 三行的左右端点对齐，否则可能是两段不相干的笔画。
+                if len(row) >= 8 and len(low) >= 8 and len(mid) >= 2 \
+                        and mid[0] == row[0] and mid[-1] == row[-1] \
+                        and low[0] == row[0]:
+                    boxes.append((y, row[0]))
+            if boxes:
+                break
+            time.sleep(0.35)
+        print(f"    扫到的复选框候选 {boxes[:5]}（窗口 {wp}x{hp}，重抓 {attempt + 1} 次）")
         if boxes:
             by, bx = boxes[0]
-            click(ph, bx + 8, by)
+            # 点在方框正中心（而不是上边线上），避开 1px 描边的舍入误差
+            click(ph, bx + 8, by + 8)
             time.sleep(0.5)
             a1 = k.GetFileAttributesW(p)
             print(f"    点复选框: 属性 {a0:#x} -> {a1:#x}")
             mark(a1 != a0, "点「只读」复选框真的改写了磁盘属性")
-            click(ph, bx + 8, by)
+            click(ph, bx + 8, by + 8)
             time.sleep(0.4)
         u.PostMessageW(ph, WM_CLOSE, 0, 0)
         time.sleep(0.5)

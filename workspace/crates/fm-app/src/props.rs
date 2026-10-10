@@ -142,15 +142,22 @@ pub fn open(app_ptr: *mut App, path: PathBuf) {
     let scale = app.metrics.scale;
     let theme = app.theme;
 
-    // —— 全部同步 IO 就这三处，全部是单次系统调用 ——
-    // 一次 metadata 就把大小/三个时间戳/属性位全带回来，不需要额外的句柄
-    let attrs = std::fs::metadata(&path).map(|m| m.file_attributes()).unwrap_or(0);
+    // 属性与时间戳一律走 `FindFirstFileW`：
+    // `std::fs::metadata` 对一部分路径会直接失败（超长路径、末尾带空格/点的名字、
+    // 重解析点、回收站里的 `$R` 实体…），一旦失败这里就整片空 —— 表现就是
+    // "有的文件属性是空的"。FindFirstFileW 一次调用就把属性位、大小、三个
+    // FILETIME 全部带回，比 metadata 少一次系统调用，覆盖面也更大。
+    let st = stat_of(&path);
+    let attrs = st.map(|s| s.attrs).unwrap_or_else(|| unsafe {
+        windows::Win32::Storage::FileSystem::GetFileAttributesW(&HSTRING::from(
+            path.to_string_lossy().as_ref(),
+        ))
+    });
     let is_dir = attrs & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
-    let meta = std::fs::metadata(&path).ok();
-    let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-    let created = meta.as_ref().and_then(|m| m.created().ok());
-    let modified = meta.as_ref().and_then(|m| m.modified().ok());
-    let accessed = meta.as_ref().and_then(|m| m.accessed().ok());
+    let size = st.map(|s| s.size).unwrap_or(0);
+    let created = st.map(|s| fmt_filetime(s.created)).unwrap_or_else(unavailable);
+    let modified = st.map(|s| fmt_filetime(s.modified)).unwrap_or_else(unavailable);
+    let accessed = st.map(|s| fmt_filetime(s.accessed)).unwrap_or_else(unavailable);
 
     let type_name = type_name_of(&path, is_dir);
     let location = path
@@ -185,9 +192,9 @@ pub fn open(app_ptr: *mut App, path: PathBuf) {
         location,
         size,
         alloc: alloc_size_of(&path, size, is_dir),
-        created: fmt_time(created),
-        modified: fmt_time(modified),
-        accessed: fmt_time(accessed),
+        created,
+        modified,
+        accessed,
         attrs,
         is_dir,
         icon,
@@ -368,6 +375,98 @@ fn alloc_size_of(path: &Path, size: u64, is_dir: bool) -> u64 {
         4096
     };
     ((size + cluster - 1) / cluster) * cluster
+}
+
+/// 一次 `FindFirstFileW` 取回的全部静态信息。
+#[derive(Clone, Copy)]
+struct Stat {
+    attrs: u32,
+    size: u64,
+    created: i64,
+    modified: i64,
+    accessed: i64,
+}
+
+fn ft_i64(ft: FILETIME) -> i64 {
+    ((ft.dwHighDateTime as i64) << 32) | ft.dwLowDateTime as i64
+}
+
+/// 读不到时不要显示空白 —— 空白会被当成"这个字段本来就没值"。
+fn unavailable() -> String {
+    "（无法读取）".to_string()
+}
+
+fn stat_of(path: &Path) -> Option<Stat> {
+    use windows::Win32::Storage::FileSystem::{
+        FindClose, FindFirstFileW, WIN32_FIND_DATAW,
+    };
+    unsafe {
+        let raw = path.to_string_lossy().to_string();
+        // 先按原样试；失败再补 `\\?\` 前缀（Win32 长路径约定）重试一次 ——
+        // 超过 MAX_PATH 的路径不加前缀是打不开的。
+        let candidates: Vec<String> = if raw.starts_with("\\\\?\\") {
+            vec![raw.clone()]
+        } else {
+            let abs = std::fs::canonicalize(path)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let verbatim = if abs.is_empty() {
+                format!("\\\\?\\{raw}")
+            } else {
+                format!("\\\\?\\{}", abs.trim_start_matches("\\\\?\\"))
+            };
+            vec![raw.clone(), verbatim]
+        };
+        for c in candidates {
+            let mut fd = WIN32_FIND_DATAW::default();
+            let h = FindFirstFileW(&HSTRING::from(c.as_str()), &mut fd);
+            let Ok(h) = h else { continue };
+            let _ = FindClose(h);
+            return Some(Stat {
+                attrs: fd.dwFileAttributes,
+                size: ((fd.nFileSizeHigh as u64) << 32) | fd.nFileSizeLow as u64,
+                created: ft_i64(fd.ftCreationTime),
+                modified: ft_i64(fd.ftLastWriteTime),
+                accessed: ft_i64(fd.ftLastAccessTime),
+            });
+        }
+        // FindFirstFile 也不行：退回 std::fs::metadata，最后一道兜底
+        let m = std::fs::metadata(path).ok()?;
+        let to_ft = |t: Option<SystemTime>| -> i64 {
+            t.and_then(to_filetime).map(ft_i64).unwrap_or(0)
+        };
+        Some(Stat {
+            attrs: m.file_attributes(),
+            size: m.len(),
+            created: to_ft(m.created().ok()),
+            modified: to_ft(m.modified().ok()),
+            accessed: to_ft(m.accessed().ok()),
+        })
+    }
+}
+
+fn fmt_filetime(ft: i64) -> String {
+    if ft <= 0 {
+        return "—".to_string();
+    }
+    let ft = FILETIME {
+        dwLowDateTime: ft as u32,
+        dwHighDateTime: (ft >> 32) as u32,
+    };
+    unsafe {
+        let mut local = FILETIME::default();
+        if FileTimeToLocalFileTime(&ft, &mut local).is_err() {
+            return "—".to_string();
+        }
+        let mut st = SYSTEMTIME::default();
+        if FileTimeToSystemTime(&local, &mut st).is_err() {
+            return "—".to_string();
+        }
+        format!(
+            "{:04}/{:02}/{:02} {:02}:{:02}:{:02}",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
+        )
+    }
 }
 
 fn to_filetime(t: SystemTime) -> Option<FILETIME> {
