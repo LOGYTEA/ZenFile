@@ -324,7 +324,81 @@ pub struct App {
     pub addr_editing: bool,
     /// 鼠标悬停的面包屑下标（hover 反馈）。
     pub addr_hover: Option<usize>,
+    /// 左键拖拽（拖条目 / 空白处框选）。松手或取消后置回 None。
+    pub drag: Option<Drag>,
+    /// 拖拽当前悬着的可投放目标。
+    pub drop_target: Option<DropTarget>,
+    /// 正在拖哪一条分隔线（导航窗格宽度 / 详细信息表头的某一列）。
+    ///
+    /// `None` 之外还要记住"按下时 cursor 在分隔线上的偏移"，否则拖动一开始
+    /// 分隔线会直接跳到光标正下方（看着像被瞬移了一下）。
+    pub drag_split: Option<SplitDrag>,
+    /// 鼠标正悬停在哪条分隔线上（只为了把光标换成左右箭头）。
+    pub hover_split: Option<Split>,
 }
+
+/// 哪一条分隔线。
+#[derive(Clone, Copy, PartialEq)]
+pub enum Split {
+    /// 导航窗格与内容区之间（改导航窗格宽度）
+    Sidebar,
+    /// 详细信息表头第 n 列的右边线（改该列宽度）
+    Column(usize),
+}
+
+pub struct SplitDrag {
+    pub which: Split,
+    /// 按下时光标的 x：拖动量一律按"相对按下点"算，
+    /// 否则一按下分隔线就会瞬移到光标正下方。
+    pub start_x: i32,
+    /// 拖动开始时的宽度（DIP）
+    pub start_w: i32,
+}
+
+/// 左键拖拽的当前状态（拖条目 或 空白处框选）。
+pub struct Drag {
+    pub origin: (i32, i32),
+    pub cur: (i32, i32),
+    pub kind: DragKind,
+    /// 越过阈值之后才算真的在拖：普通单击也会产生几像素的移动，
+    /// 不给阈值的话每次点一下都会闪一下框选矩形。
+    pub active: bool,
+    /// Items 拖拽时按下那一刻就定下来的清单 —— 拖的过程中选中集不该再变。
+    pub items: Vec<PathBuf>,
+    /// 是不是"复制"语义：按住 Ctrl，或者本次拖拽的消息里带了 MK_CONTROL。
+    pub copy: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum DragKind {
+    /// 拖着选中的条目去别处
+    Items,
+    /// 在空白处拉框选
+    Marquee,
+}
+
+/// 拖拽此刻悬在哪一个可投放目标上（画高亮 + 松手时落地用）。
+#[derive(Clone)]
+pub struct DropTarget {
+    pub path: PathBuf,
+    pub kind: DropKind,
+}
+
+#[derive(Clone, Copy)]
+pub enum DropKind {
+    /// 内容区第 n 行（一个文件夹）
+    Row(usize),
+    /// 地址栏第 n 节面包屑（#12：拖到哪一级就进哪一级）
+    Crumb(usize),
+    /// 导航窗格第 n 行
+    Sidebar(usize),
+}
+
+/// 导航窗格宽度与列宽的取值/夹取范围（DIP）。太窄图标都画不下，太宽占满窗口。
+pub const SIDEBAR_W_MIN: i32 = 110;
+pub const SIDEBAR_W_MAX: i32 = 600;
+pub const COL_W_MIN: i32 = 40;
+pub const COL_W_MAX: i32 = 900;
 
 /// 文件名索引在后台的进度状态。
 #[derive(Clone, PartialEq)]
@@ -546,6 +620,44 @@ impl App {
             index_pending: false,
             index_rx: None,
             index_cancel: None,
+            drag_split: None,
+            hover_split: None,
+            drag: None,
+            drop_target: None,
+        }
+    }
+
+    /// 把配置里的"导航窗格宽度"落到实际量度上。
+    ///
+    /// `Metrics` 是按 DPI 算出来的一份量度，导航窗格宽度却是用户能拖的东西，
+    /// 所以两者必须分开：DPI 一变宽度要跟着重新乘一次（否则 150% 缩放下
+    /// 拖好的宽度会被 96 DPI 的默认值顶掉）。
+    pub fn sync_metrics(&mut self) {
+        let s = self.metrics.scale;
+        let dip = self.cfg.ui.sidebar_width.max(SIDEBAR_W_MIN as u32) as f32;
+        self.metrics.sidebar_w =
+            ((dip * s).round() as i32).min((SIDEBAR_W_MAX as f32 * s).round() as i32);
+    }
+
+    /// 详细信息各列的当前宽度（DIP）。拖表头时直接改这里。
+    pub fn col_widths(&self) -> [i32; 4] {
+        let v = &self.cfg.files.view;
+        [
+            v.col_name_w as i32,
+            v.col_date_w as i32,
+            v.col_kind_w as i32,
+            v.col_size_w as i32,
+        ]
+    }
+
+    pub fn set_col_width(&mut self, index: usize, w: i32) {
+        let w = (w.max(COL_W_MIN).min(COL_W_MAX)) as u32;
+        let v = &mut self.cfg.files.view;
+        match index {
+            0 => v.col_name_w = w,
+            1 => v.col_date_w = w,
+            2 => v.col_kind_w = w,
+            _ => v.col_size_w = w,
         }
     }
 
@@ -1221,6 +1333,53 @@ impl App {
         self.invalidate();
     }
 
+    /// 只改排序方向，排序列保持不变。
+    pub fn set_sort_direction(&mut self, descending: bool) {
+        let (show_hidden, show_system) = (self.show_hidden, self.show_system);
+        let tab = self.tab_mut();
+        if tab.sort.descending == descending {
+            return;
+        }
+        tab.sort.descending = descending;
+        tab.sort.sort(&mut tab.entries);
+        tab.recompute_filter(show_hidden, show_system);
+        self.invalidate();
+    }
+
+    /// 左键按下：记下拖拽起点。此刻还不确定是不是真的要拖 —— 手抖几像素不算。
+    pub fn begin_drag(&mut self, x: i32, y: i32, kind: DragKind, ctrl: bool) {
+        let items = if kind == DragKind::Items {
+            self.tab().selected_paths()
+        } else {
+            Vec::new()
+        };
+        self.drag = Some(Drag { origin: (x, y), cur: (x, y), kind, active: false, items, copy: ctrl });
+        self.drop_target = None;
+    }
+
+    /// 鼠标移动：更新当前点，越过 4px 阈值才真正进入拖拽态。
+    pub fn update_drag(&mut self, x: i32, y: i32, ctrl: bool) {
+        // 两个来源都要认：真实键盘状态（人手按住 Ctrl）和消息里的 MK_CONTROL
+        // （自动化测试 / 某些输入堆栈只带标志位不带按键状态）。
+        let live = ctrl || self.drag_copy();
+        if let Some(d) = self.drag.as_mut() {
+            d.cur = (x, y);
+            d.copy = d.copy || live;
+            if !d.active {
+                let dx = x - d.origin.0;
+                let dy = y - d.origin.1;
+                if dx * dx + dy * dy > 16 {
+                    d.active = true;
+                }
+            }
+        }
+    }
+
+    /// 拖拽时按住 Ctrl = 复制（与资源管理器一致）；不按就是移动。
+    pub fn drag_copy(&self) -> bool {
+        unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x11) < 0 }
+    }
+
     pub fn cycle_view(&mut self) {
         let tab = self.tab_mut();
         tab.view_mode = tab.view_mode.next();
@@ -1416,6 +1575,48 @@ impl App {
         }
     }
 
+    /// 拖拽落地：把 `items` 放进 `dest`。
+    ///
+    /// `copy` 为假时是移动，跨卷自动退化成复制（与资源管理器一致：不同盘之间
+    /// 默认是复制而不是移动）。
+    pub fn drop_items(&mut self, dest: PathBuf, items: Vec<PathBuf>, copy: bool) {
+        if items.is_empty() || dest.as_os_str().is_empty() {
+            return;
+        }
+        // 拖到自己所在的目录 = 什么都没发生；拖到自己身上更是无意义
+        let cur = self.tab().path.clone();
+        if dest == cur {
+            return;
+        }
+        let items: Vec<PathBuf> = items
+            .into_iter()
+            .filter(|p| p.parent().map(|q| q != dest).unwrap_or(true))
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        let cross = !same_volume(&items[0], &dest);
+        let mode = if copy || cross { ClipMode::Copy } else { ClipMode::Move };
+        let owner = self.hwnd.0 as isize;
+        let result = if self.fast_mode || self.cfg.files.operations.fast_mode {
+            self.transfer = Some(transfer_async(
+                if mode == ClipMode::Move { TransferKind::Move } else { TransferKind::Copy },
+                &dest,
+                items,
+                self.cfg.files.operations.worker_threads,
+            ));
+            Ok(())
+        } else if mode == ClipMode::Move {
+            move_items(owner, &dest, &items)
+        } else {
+            copy_items(owner, &dest, &items)
+        };
+        if let Err(e) = result {
+            report(self.hwnd, &format!("{}失败：{e}", if mode == ClipMode::Move { "移动" } else { "复制" }));
+        }
+        self.reload();
+    }
+
     /// 拖拽到另一个标签页不适用时的替代：粘贴到指定目录（供外部调用）。
     pub fn paste_into(&mut self, dest: &Path, files: Vec<PathBuf>, mode: ClipMode) {
         let owner = self.hwnd.0 as isize;
@@ -1599,6 +1800,9 @@ impl App {
             Command::SortByModified => self.sort_column(fm_core::SortKey::Modified),
             Command::SortByType => self.sort_column(fm_core::SortKey::Type),
             Command::SortBySize => self.sort_column(fm_core::SortKey::Size),
+            // 只改方向：点"递减顺序"时不该把列也一起换掉（资源管理器同理）
+            Command::SortAscending => self.set_sort_direction(false),
+            Command::SortDescending => self.set_sort_direction(true),
             Command::ToggleSidebar => self.toggle_sidebar(),
             Command::ToggleStatusbar => self.toggle_statusbar(),
             Command::ToggleFollowCurrent => self.toggle_follow_current(),
@@ -1616,7 +1820,7 @@ impl App {
             Command::RecycleEmpty => self.empty_recycle(),
             Command::RecycleSelectAll => self.recycle_select_all(),
             Command::NewTab => self.new_tab(),
-            Command::About => report(self.hwnd, "NexFile 轻量资源管理器\nWin32 + GDI 自绘，无 WebView2 依赖"),
+            Command::About => report(self.hwnd, "ZenFile 轻量资源管理器\nWin32 + GDI 自绘，无 WebView2 依赖"),
         }
     }
 
@@ -1655,7 +1859,7 @@ impl App {
         let _ = unsafe { InvalidateRect(Some(self.hwnd), None, true) };
     }
 
-    fn persist_view_pref(&self) {
+    pub fn persist_view_pref(&self) {
         if let Err(e) = fm_core::config::Config::save_user_patch(&serde_json::json!({
             "files": {
                 "view": {
@@ -1664,10 +1868,24 @@ impl App {
                     "show_extensions": self.cfg.files.view.show_extensions,
                     "size_unit": self.cfg.files.view.size_unit,
                     "default_mode": self.cfg.files.view.default_mode,
+                    // 拖过的列宽也要存：不存的话下次打开又回到默认，等于白拖
+                    "col_name_w": self.cfg.files.view.col_name_w,
+                    "col_date_w": self.cfg.files.view.col_date_w,
+                    "col_kind_w": self.cfg.files.view.col_kind_w,
+                    "col_size_w": self.cfg.files.view.col_size_w,
                 }
             }
         })) {
             eprintln!("保存视图偏好失败: {e}");
+        }
+    }
+
+    /// 拖过导航窗格分隔线之后把宽度记下来。
+    pub fn persist_sidebar_width(&self) {
+        if let Err(e) = fm_core::config::Config::save_user_patch(&serde_json::json!({
+            "ui": { "sidebar_width": self.cfg.ui.sidebar_width }
+        })) {
+            eprintln!("保存导航窗格宽度失败: {e}");
         }
     }
 
@@ -1678,16 +1896,12 @@ impl App {
         self.invalidate();
     }
 
-    /// 切换"大小"列的默认单位（自动 / 字节 / KB / MB / GB 循环）。
+    /// 切换"大小"列的默认单位：自动 → B → KB → MB → GB → TB → PB 循环。
     pub fn cycle_size_unit(&mut self) {
-        let next = match fm_core::SizeUnit::parse(&self.cfg.files.view.size_unit) {
-            fm_core::SizeUnit::Auto => "bytes",
-            fm_core::SizeUnit::Bytes => "kb",
-            fm_core::SizeUnit::KB => "mb",
-            fm_core::SizeUnit::MB => "gb",
-            fm_core::SizeUnit::GB => "auto",
-        };
-        self.cfg.files.view.size_unit = next.to_string();
+        let cur = fm_core::SizeUnit::parse(&self.cfg.files.view.size_unit);
+        let i = fm_core::SizeUnit::ALL.iter().position(|u| *u == cur).unwrap_or(0);
+        let next = fm_core::SizeUnit::ALL[(i + 1) % fm_core::SizeUnit::ALL.len()];
+        self.cfg.files.view.size_unit = next.name().to_string();
         self.persist_view_pref();
         self.invalidate();
     }
@@ -1886,14 +2100,7 @@ impl App {
             submenu: Vec::new(),
             action: MenuAction::None,
         };
-        for (label, cmd) in [
-            ("名称", Command::SortByName),
-            ("修改日期", Command::SortByModified),
-            ("类型", Command::SortByType),
-            ("大小", Command::SortBySize),
-        ] {
-            sort_row.submenu.push(shell_row(label, None, cmd));
-        }
+        sort_row.submenu = sort_rows(self);
         entries.push(sort_row);
         entries.push(menu::MenuEntry::sep());
 
@@ -1912,7 +2119,7 @@ impl App {
         // 设置：以标签页形式打开，所有开关都收在里面（§10 三层配置的用户层）
         entries.push(shell_row("设置", Some("\u{E713}"), Command::OpenSettings));
         entries.push(menu::MenuEntry::sep());
-        entries.push(shell_row("关于 NexFile", Some("\u{E946}"), Command::About));
+        entries.push(shell_row("关于 ZenFile", Some("\u{E946}"), Command::About));
 
         let app_ptr = self as *mut App;
         if let Some(hwnd_menu) = menu::open_menu(
@@ -1958,6 +2165,42 @@ impl App {
         self.tree = Some(tree);
     }
 
+    /// 搜索框空态的提示文字：跟资源管理器一样带上当前位置（"搜索 桌面"）。
+    pub fn search_hint(&self) -> String {
+        let tab = self.tab();
+        if tab.home {
+            return "搜索 此电脑".to_string();
+        }
+        if tab.recycle {
+            return "搜索 回收站".to_string();
+        }
+        if tab.settings {
+            return "搜索设置".to_string();
+        }
+        let name = tab
+            .path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                // 盘符根目录 C:\ 没有 file_name，退回 "C:"
+                tab.path
+                    .to_string_lossy()
+                    .trim_end_matches('\\')
+                    .to_string()
+            });
+        format!("搜索 {name}")
+    }
+
+    /// 现在是不是"有事在跑"：正在列目录、正在搜索、正在建索引。
+    /// 目录栏下沿的进度条只看这一个开关。
+    pub fn busy(&self) -> bool {
+        if self.tab().loading || self.index_pending {
+            return true;
+        }
+        matches!(self.index_state, IndexState::Loading | IndexState::Building(_))
+    }
+
     pub fn status_text(&self) -> String {
         let tab = self.tab();
         if tab.recycle {
@@ -1985,7 +2228,7 @@ impl App {
             };
         }
         if tab.settings {
-            return "设置 · 改动即时写入 %APPDATA%\\NexFile\\settings.user.json".to_string();
+            return "设置 · 改动即时写入 %APPDATA%\\ZenFile\\settings.user.json".to_string();
         }
         // 索引在建/在载入时给一句可见的话：整卷第一次搜索会花几秒，
         // 界面上什么都不说，用户只会以为"搜索框坏了"。
@@ -2000,11 +2243,6 @@ impl App {
         let sel = tab.selected.len();
         let bytes = tab.selected_bytes();
         let view = tab.view_mode.label();
-        let path = if tab.home {
-            "主页".to_string()
-        } else {
-            tab.path.display().to_string()
-        };
         let unit = self.cfg.files.view.size_unit_of();
         // 被两道开关过滤掉的项要显式说一声：不然用户会以为文件真的没了
         let mut hidden_note = String::new();
@@ -2024,14 +2262,15 @@ impl App {
                 }
             }
         };
+        // 状态栏**不显示目录**：路径已经在地址栏里了，再写一遍只会把状态文本
+        // 挤得老长，还容易和右侧的视图切换按钮打架。
         if sel > 0 {
             format!(
-                "{visible} / {total} 个项目{hidden_note}{index_note}{scope_note} · 已选 {sel} 项 {bytes} · 视图 {view} · {path}",
+                "{visible} / {total} 个项目{hidden_note}{index_note}{scope_note} · 已选 {sel} 项 {bytes} · 视图 {view}",
                 bytes = human_unit(bytes, unit),
-                path = path
             )
         } else {
-            format!("{visible} / {total} 个项目{hidden_note}{index_note}{scope_note} · 视图 {view} · {path}", path = path)
+            format!("{visible} / {total} 个项目{hidden_note}{index_note}{scope_note} · 视图 {view}")
         }
     }
 
@@ -2342,6 +2581,24 @@ fn check_row(text: &str, cmd: Command, on: bool) -> menu::MenuEntry {
     r
 }
 
+/// 「排序方式」下拉的内容：四个排序列（当前列打点）+ 方向二选一。
+///
+/// 右键菜单和标题栏「更多」菜单共用这一份，避免两边顺序/文案对不上
+/// （改一边忘另一边是必然的，不如只有一份）。
+fn sort_rows(app: &App) -> Vec<menu::MenuEntry> {
+    let key = app.tab().sort.key;
+    let desc = app.tab().sort.descending;
+    vec![
+        check_row("名称", Command::SortByName, key == fm_core::SortKey::Name),
+        check_row("修改日期", Command::SortByModified, key == fm_core::SortKey::Modified),
+        check_row("类型", Command::SortByType, key == fm_core::SortKey::Type),
+        check_row("大小", Command::SortBySize, key == fm_core::SortKey::Size),
+        menu::MenuEntry::sep(),
+        check_row("递增顺序", Command::SortAscending, !desc),
+        check_row("递减顺序", Command::SortDescending, desc),
+    ]
+}
+
 /// 带下级菜单的条目。资源管理器的右键菜单本来就是分层的（新建/查看/排序方式都有
 /// 下拉），做成平铺会把"悬停展开"这条交互整个丢掉。
 fn submenu_row(text: &str, glyph: Option<&'static str>, children: Vec<menu::MenuEntry>) -> menu::MenuEntry {
@@ -2410,16 +2667,7 @@ fn own_menu_rows(app: &App, items: &[PathBuf]) -> Vec<menu::MenuEntry> {
             check_row("文件扩展名", Command::ToggleExtensions, app.cfg.files.view.show_extensions),
         ],
     ));
-    rows.push(submenu_row(
-        "排序方式",
-        Some("\u{E8CB}"),
-        vec![
-            shell_row("名称", None, Command::SortByName),
-            shell_row("修改日期", None, Command::SortByModified),
-            shell_row("类型", None, Command::SortByType),
-            shell_row("大小", None, Command::SortBySize),
-        ],
-    ));
+    rows.push(submenu_row("排序方式", Some("\u{E8CB}"), sort_rows(app)));
     rows.push(shell_row(
         if items.is_empty() { "属性（当前文件夹）" } else { "属性" },
         Some("\u{E946}"),
@@ -2435,6 +2683,21 @@ fn own_menu_rows(app: &App, items: &[PathBuf]) -> Vec<menu::MenuEntry> {
         rows.push(note);
     }
     rows
+}
+
+
+/// 两个路径是不是同一个卷（只看盘符）。跨卷拖拽按 Windows 惯例走复制。
+pub fn same_volume(a: &Path, b: &Path) -> bool {
+    let vol = |p: &Path| -> String {
+        let s = p.to_string_lossy();
+        // "C:\a\b" -> "C:\"；UNC 路径取 "\\server\share"
+        if s.starts_with("\\\\") {
+            s.split('\\').take(5).collect::<Vec<_>>().join("\\")
+        } else {
+            s.chars().take(3).collect()
+        }
+    };
+    vol(a) == vol(b)
 }
 
 pub fn human(bytes: u64) -> String {
@@ -2465,7 +2728,7 @@ pub fn confirm(hwnd: HWND, text: &str) -> bool {
 pub fn report(hwnd: HWND, text: &str) {
     use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
     let mut t: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut title: Vec<u16> = "NexFile".encode_utf16().chain(std::iter::once(0)).collect();
+    let mut title: Vec<u16> = "ZenFile".encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
         let _ = MessageBoxW(
             Some(hwnd),

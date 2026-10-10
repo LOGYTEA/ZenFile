@@ -181,26 +181,38 @@ pub fn run() -> i32 {
         "剪切/复制语义可区分",
     );
 
-    // 12. 大小单位：默认规则是"最小单位"，同一列里不允许出现有的 KB 有的字节
-    let kb = crate::SizeUnit::Auto.format(512);
+    // 12. 大小单位：自动档按"能表达这个大小的最小单位"走，且 <1KB 要写"字节"
+    let b = crate::SizeUnit::Auto.format(512);
+    let kb = crate::SizeUnit::Auto.format(2 * 1024);
     let mb = crate::SizeUnit::Auto.format(2 * 1024 * 1024);
     let gb = crate::SizeUnit::Auto.format(3 * 1024 * 1024 * 1024);
+    let tb = crate::SizeUnit::Auto.format(3u64 * 1024 * 1024 * 1024 * 1024);
+    let pb = crate::SizeUnit::Auto.format(3u64 * 1024 * 1024 * 1024 * 1024 * 1024);
     h.check(
         "size::auto_smallest",
-        kb.ends_with("KB") && mb.ends_with("MB") && gb.ends_with("GB"),
-        &format!("512B->{kb}, 2MB->{mb}, 3GB->{gb}"),
+        b == "512 字节"
+            && kb.ends_with("KB")
+            && mb.ends_with("MB")
+            && gb.ends_with("GB")
+            && tb.ends_with("TB")
+            && pb.ends_with("PB"),
+        &format!("512B->{b}, 2K->{kb}, 2M->{mb}, 3G->{gb}, 3T->{tb}, 3P->{pb}"),
     );
     h.check(
         "size::fixed",
         crate::SizeUnit::KB.format(2048) == "2 KB"
-            && crate::SizeUnit::Bytes.format(2048) == "2048 字节",
-        "固定单位换算",
+            && crate::SizeUnit::Bytes.format(2048) == "2048 字节"
+            && crate::SizeUnit::TB.format(2 * 1024 * 1024 * 1024 * 1024) == "2 TB"
+            && crate::SizeUnit::PB.format(2 * 1024 * 1024 * 1024 * 1024 * 1024) == "2 PB",
+        "固定单位换算（含 TB / PB）",
     );
     h.check(
         "size::parse_roundtrip",
         crate::SizeUnit::parse("mb") == crate::SizeUnit::MB
-            && crate::SizeUnit::parse("auto") == crate::SizeUnit::Auto,
-        "配置字符串往返",
+            && crate::SizeUnit::parse("auto") == crate::SizeUnit::Auto
+            && crate::SizeUnit::parse("pb") == crate::SizeUnit::PB
+            && crate::SizeUnit::ALL.len() == 7,
+        "配置字符串往返 + 七档齐全",
     );
 
     // 13. 回收站：能枚举到条目就至少要保证条目自身可解析（$I/$R 成对）
@@ -247,7 +259,7 @@ pub fn run() -> i32 {
 
     // 15. 文件名索引：建索引 → 查询 → 序列化往返
     // 刻意建在 %TEMP% 下的子树上，且**不调 save()**（save 会按盘符写进
-    // %LOCALAPPDATA%\NexFile\index\C.bin，把真实缓存冲掉）。
+    // %LOCALAPPDATA%\ZenFile\index\C.bin，把真实缓存冲掉）。
     let idx_root = std::env::temp_dir().join("fm-selftest-index");
     prepare_tree(&idx_root, 12, 3);
     let cancel = std::sync::atomic::AtomicBool::new(false);
@@ -298,7 +310,7 @@ pub fn run() -> i32 {
     let cp = crate::index::Index::cache_path("C:\\");
     let cp_ok = cp
         .as_ref()
-        .map(|p| p.to_string_lossy().contains("NexFile") && p.to_string_lossy().ends_with("C.bin"))
+        .map(|p| p.to_string_lossy().contains("ZenFile") && p.to_string_lossy().ends_with("C.bin"))
         .unwrap_or(false);
     h.check("index::cache_path", cp_ok, &format!("{:?}", cp));
     // 卷根解析：C:\Users\a -> C:\，UNC 不给建索引

@@ -16,7 +16,7 @@ use serde_json::Value;
 use crate::error::{Error, Result};
 
 pub const CONFIG_VERSION: u32 = 1;
-pub const APP_ID: &str = "NexFile";
+pub const APP_ID: &str = "ZenFile";
 
 const DEFAULTS: &str = include_str!("defaults.json");
 
@@ -91,6 +91,12 @@ pub struct ViewConfig {
     pub size_unit: String,
     pub sort_key: String,
     pub sort_descending: bool,
+    /// 详细信息视图各列宽度（DIP，96 DPI 下的像素）。拖表头分隔线改的就是它。
+    /// 默认值照资源管理器"详细信息"的默认列宽取：名称最宽、日期次之。
+    pub col_name_w: u32,
+    pub col_date_w: u32,
+    pub col_kind_w: u32,
+    pub col_size_w: u32,
 }
 
 impl ViewConfig {

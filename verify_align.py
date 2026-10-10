@@ -1,4 +1,4 @@
-"""把 NexFile 的渲染结果与本机资源管理器基线逐项对比。
+"""把 ZenFile 的渲染结果与本机资源管理器基线逐项对比。
 
 基线（CabinetWClass, DPI 96）：
   标题栏 #000000 / 命令栏+导航窗格 #191919 / 内容区 #202020 / 状态栏 #333333
@@ -20,14 +20,14 @@ import verify_env
 
 verify_env.isolate()
 
-EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\fm-app.exe"
+EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\ZenFile.exe"
 # 素材一律落在 %TEMP%（用户明确要求：别往桌面写东西），且要够多才撑得出行距样本。
 BASE = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), "NexAlign")
 shutil.rmtree(BASE, ignore_errors=True)
 os.makedirs(BASE, exist_ok=True)
 for i in range(30):
     open(os.path.join(BASE, f"sample{i}.txt"), "w").write("x" * (i + 1) * 11)
-subprocess.run(["taskkill", "/F", "/IM", "fm-app.exe"], capture_output=True)
+subprocess.run(["taskkill", "/F", "/IM", "ZenFile.exe"], capture_output=True)
 time.sleep(0.6)
 subprocess.Popen([EXE, BASE])
 
@@ -55,11 +55,11 @@ g.GetDIBits.argtypes = [wt.HDC, wt.HBITMAP, ctypes.c_uint, ctypes.c_uint,
 hwnd = None
 for _ in range(80):
     time.sleep(0.25)
-    hwnd = u.FindWindowW("NexFileMainWindow", None)
+    hwnd = u.FindWindowW("ZenFileMainWindow", None)
     if hwnd:
         break
 if not hwnd:
-    print("FAIL 找不到 NexFile 窗口")
+    print("FAIL 找不到 ZenFile 窗口")
     sys.exit(1)
 time.sleep(2.5)
 r = wt.RECT()
@@ -85,7 +85,7 @@ def hx(c):
     return "#%02X%02X%02X" % (c[2], c[1], c[0])
 
 
-print(f"NexFile 窗口 {w}x{h}\n")
+print(f"ZenFile 窗口 {w}x{h}\n")
 print("=== 区域底色对比 ===")
 checks = [
     ("标题栏", int(w * 0.5), 16, "#000000"),

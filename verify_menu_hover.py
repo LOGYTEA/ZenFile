@@ -49,7 +49,7 @@ g.GetDIBits.restype = ctypes.c_int
 g.GetDIBits.argtypes = [wt.HDC, wt.HBITMAP, ctypes.c_uint, ctypes.c_uint,
                         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
 
-EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\fm-app.exe"
+EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\ZenFile.exe"
 WM_MOUSEMOVE = 0x0200
 WM_RBUTTONUP = 0x0205
 
@@ -124,13 +124,13 @@ ok_all = True
 
 def run_case(tag, cur):
     global ok_all
-    subprocess.run(["taskkill", "/F", "/IM", "fm-app.exe"], capture_output=True)
+    subprocess.run(["taskkill", "/F", "/IM", "ZenFile.exe"], capture_output=True)
     time.sleep(0.5)
     subprocess.Popen([EXE, BASE])
     hwnd = None
     for _ in range(60):
         time.sleep(0.25)
-        hwnd = u.FindWindowW("NexFileMainWindow", None)
+        hwnd = u.FindWindowW("ZenFileMainWindow", None)
         if hwnd:
             break
     time.sleep(1.5)
@@ -138,7 +138,7 @@ def run_case(tag, cur):
     time.sleep(0.3)
     u.PostMessageW(hwnd, WM_RBUTTONUP, 0, (152 << 16) | (400 & 0xFFFF))
     time.sleep(1.0)
-    menus = windows_of("NexFileMenu")
+    menus = windows_of("ZenFileMenu")
     mh, ml, mt, mw, mhh = menus[0]
     raw, stride, w, h = grab(mh)
     arrow_ys = [y for y in range(4, h - 4)
@@ -154,7 +154,7 @@ def run_case(tag, cur):
         time.sleep(0.5)
         r2, s2, w2, h2 = grab(mh)
         bg = hx(px(r2, s2, 200, y))
-        subs = [x for x in windows_of("NexFileMenu") if x[0] != mh]
+        subs = [x for x in windows_of("ZenFileMenu") if x[0] != mh]
         good = bool(subs) and bg == "#3D3D3D"
         ok_all = ok_all and good
         print(f"    悬停 y={y:3d}: 该行底色 {bg}  子菜单 {len(subs)} 个"
@@ -169,4 +169,4 @@ run_case("光标落在菜单内部某行", (600, 500))
 run_case("光标在菜单左侧不远处", (300, 400))
 
 print("\n总判定:", "PASS 悬停展开在所有光标位置都成立" if ok_all else "FAIL 仍有位置展开不出来")
-subprocess.run(["taskkill", "/F", "/IM", "fm-app.exe"], capture_output=True)
+subprocess.run(["taskkill", "/F", "/IM", "ZenFile.exe"], capture_output=True)

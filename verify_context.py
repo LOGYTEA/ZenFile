@@ -40,7 +40,7 @@ VK_ESCAPE = 0x1B
 SELECTION_BG = (0x47, 0x47, 0x47)  # theme.rs dark(): selection_bg 0x474747
 # （注意：焦点行是 hover_bg #3D3D3D，比选中色暗一档，两者不是一回事）
 
-EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\fm-app.exe"
+EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\ZenFile.exe"
 
 
 def grab(hwnd):
@@ -88,7 +88,7 @@ subprocess.Popen([EXE, os.path.join(os.environ["USERPROFILE"], "Desktop")])
 hwnd = None
 for _ in range(60):
     time.sleep(0.25)
-    hwnd = u.FindWindowW("NexFileMainWindow", None)
+    hwnd = u.FindWindowW("ZenFileMainWindow", None)
     if hwnd:
         break
 assert hwnd, "找不到主窗口"
@@ -119,7 +119,7 @@ b0 = selected_bands(raw, stride, w, h)
 print(f"  左键点第 0 行(y={ROW0_TOP+8}) -> 选中条 {b0}")
 
 rclick(400, ROW0_TOP + 8 + PITCH * 2)
-menu = u.FindWindowW("NexFileMenu", None)
+menu = u.FindWindowW("ZenFileMenu", None)
 print(f"  右键第 2 行(y={ROW0_TOP+8+PITCH*2}) -> 菜单弹出 {bool(menu)}")
 if menu:
     u.PostMessageW(menu, WM_KEYDOWN, VK_ESCAPE, 0)
@@ -141,7 +141,7 @@ else:
 # ---------- A) 菜单点击热区 ----------
 print("\n=== A) 菜单点击热区（菜单外点击不得触发条目）===")
 rclick(400, ROW0_TOP + 8 + PITCH * 2)
-menu = u.FindWindowW("NexFileMenu", None)
+menu = u.FindWindowW("ZenFileMenu", None)
 if not menu:
     print("  FAIL 菜单没弹出")
     ok = False
@@ -156,7 +156,7 @@ else:
     print(f"  在 x={outer_x}（菜单外）、y={inner_y} 处点击…")
     u.PostMessageW(menu, 0x0202, 0, (inner_y << 16) | (outer_x & 0xFFFF))
     time.sleep(0.8)
-    still = u.FindWindowW("NexFileMenu", None)
+    still = u.FindWindowW("ZenFileMenu", None)
     print(f"  菜单是否已关闭: {not still}")
     # 若修复不当，"删除/剪切"等会被触发；这里用"菜单消失且无残留"作为不触发的判据
     if still:
@@ -171,11 +171,11 @@ else:
 # 回归：菜单内正常点击仍应生效（点第 1 行 → 菜单关闭）
 print("\n=== 回归：菜单内点击仍应可用 ===")
 rclick(400, ROW0_TOP + 8 + PITCH * 2)
-menu = u.FindWindowW("NexFileMenu", None)
+menu = u.FindWindowW("ZenFileMenu", None)
 if menu:
     u.PostMessageW(menu, 0x0202, 0, (20 << 16) | 100)
     time.sleep(0.8)
-    gone = not u.FindWindowW("NexFileMenu", None)
+    gone = not u.FindWindowW("ZenFileMenu", None)
     print(f"  菜单内点击后菜单消失: {gone}  -> {'PASS' if gone else 'FAIL'}")
     ok = ok and gone
 else:

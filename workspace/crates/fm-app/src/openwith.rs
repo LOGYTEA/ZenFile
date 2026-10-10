@@ -124,7 +124,7 @@ impl OpenWith {
 }
 
 pub fn register_class() {
-    let cls = HSTRING::from("NexFileOpenWith");
+    let cls = HSTRING::from("ZenFileOpenWith");
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
         lpfnWndProc: Some(ow_proc),
@@ -176,7 +176,7 @@ pub fn open(app_ptr: *mut App, path: PathBuf) {
         w,
         h,
     }));
-    let cls = HSTRING::from("NexFileOpenWith");
+    let cls = HSTRING::from("ZenFileOpenWith");
     let hwnd = unsafe {
         CreateWindowExW(
             windows::Win32::UI::WindowsAndMessaging::WS_EX_WINDOWEDGE,

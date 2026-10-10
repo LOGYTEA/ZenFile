@@ -36,7 +36,9 @@ use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, NOTIFY_ICON_DATA_FLAGS,
 };
 use windows::Win32::Graphics::Gdi::{ClientToScreen, HBRUSH, HDC, ScreenToClient};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, RegisterHotKey, UnregisterHotKey};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, RegisterHotKey, ReleaseCapture, SetCapture, UnregisterHotKey,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 
@@ -51,6 +53,8 @@ static mut APP: *mut App = std::ptr::null_mut();
 
 const WM_TRAY: u32 = WM_APP + 1;
 const TIMER_DRAIN: usize = 1;
+/// 目录栏下沿进度条的动画节拍。一直挂着，但只有 busy() 时才真的重画。
+const TIMER_BUSY: usize = 2;
 const HOTKEY_MAIN: i32 = 1;
 
 fn main() {
@@ -71,7 +75,7 @@ fn main() {
 
     // 单实例锁 §3.1（第 4 条）
     let mutex = unsafe {
-        windows::Win32::System::Threading::CreateMutexW(None, false, &HSTRING::from("NexFile.SingleInstance"))
+        windows::Win32::System::Threading::CreateMutexW(None, false, &HSTRING::from("ZenFile.SingleInstance"))
     };
     if let Err(e) = &mutex {
         if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
@@ -109,7 +113,7 @@ fn main() {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             PCWSTR(MAIN_CLASS.as_ptr()),
-            PCWSTR(HSTRING::from("NexFile").as_ptr()),
+            PCWSTR(HSTRING::from("ZenFile").as_ptr()),
             WS_OVERLAPPEDWINDOW, // 含 WS_THICKFRAME：保留贴靠与最大化动画的前提 §4
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -147,6 +151,8 @@ fn main() {
 
     let mut boxed = Box::new(App::new(hwnd, cfg));
     boxed.metrics = theme::Metrics::new(unsafe { GetDpiForWindow(hwnd) });
+    // 量度按 DPI 算完之后，再把"用户拖过的导航窗格宽度"盖回去
+    boxed.sync_metrics();
     boxed.open_tab(start_path);
     let app = Box::into_raw(boxed);
     unsafe {
@@ -173,6 +179,7 @@ fn main() {
 
     unsafe {
         let _ = SetTimer(Some(hwnd), TIMER_DRAIN, 100, None);
+        let _ = SetTimer(Some(hwnd), TIMER_BUSY, 50, None);
         if tray_mode {
             let _ = ShowWindow(hwnd, SW_HIDE);
         } else {
@@ -196,6 +203,7 @@ fn main() {
     // 退出顺序 §3.6：先终止子进程再让宿主退出
     unsafe {
         let _ = KillTimer(Some(hwnd), TIMER_DRAIN);
+        let _ = KillTimer(Some(hwnd), TIMER_BUSY);
         let _ = UnregisterHotKey(Some(hwnd), HOTKEY_MAIN);
         remove_tray(hwnd);
         let app = &mut *APP;
@@ -214,7 +222,7 @@ static mut MAIN_CLASS: HSTRING = HSTRING::new();
 
 fn register_classes(instance: Option<windows::Win32::Foundation::HINSTANCE>) {
     unsafe {
-        MAIN_CLASS = HSTRING::from("NexFileMainWindow");
+        MAIN_CLASS = HSTRING::from("ZenFileMainWindow");
         let hinstance = instance.unwrap_or_default();
         println!("instance handle present: {}", hinstance.0 as usize != 0);
         let wc = WNDCLASSEXW {
@@ -242,6 +250,17 @@ unsafe fn drop_app() {
 
 fn app_ref() -> &'static mut App {
     unsafe { &mut *APP }
+}
+
+/// 拿不到 App 就返回 None（窗口还没建好 / 已经销毁），不能 panic ——
+/// 子控件的 WM_PAINT 会在这些时刻到达，一 panic 就是进程直接崩。
+pub(crate) fn app_ref_opt() -> Option<&'static mut App> {
+    let p = unsafe { APP };
+    if p.is_null() {
+        None
+    } else {
+        Some(unsafe { &mut *p })
+    }
 }
 
 extern "C" {
@@ -282,7 +301,7 @@ unsafe fn attach_console() {}
 
 fn add_tray(hwnd: HWND) {
     let mut tip: [u16; 128] = [0; 128];
-    for (i, c) in "NexFile 资源管理器".encode_utf16().take(127).enumerate() {
+    for (i, c) in "ZenFile 资源管理器".encode_utf16().take(127).enumerate() {
         tip[i] = c;
     }
     let mut nid = NOTIFYICONDATAW {
@@ -422,6 +441,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         WM_SIZE => {
             let app = &mut *app_ptr;
             app.metrics = theme::Metrics::new(GetDpiForWindow(hwnd));
+            app.sync_metrics();
             app.last_size = ((lparam.0 & 0xFFFF) as i32, (lparam.0 >> 16) as i32);
             paint::reposition(app);
             let _ = InvalidateRect(Some(hwnd), None, true);
@@ -430,12 +450,28 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         WM_DPICHANGED => {
             let app = &mut *app_ptr;
             app.metrics = theme::Metrics::new(GetDpiForWindow(hwnd));
+            app.sync_metrics();
             paint::reposition(app);
             let _ = InvalidateRect(Some(hwnd), None, true);
             LRESULT(0)
         }
+        // 分隔线上换 ↔ 光标。WM_SETCURSOR 不带坐标（lparam 低位是命中码），
+        // 所以直接复用 WM_MOUSEMOVE 记下的悬停位 —— 反正它也是同一个来源。
+        WM_SETCURSOR => {
+            let app = &*app_ptr;
+            if app.drag_split.is_some() || app.hover_split.is_some() {
+                if let Ok(c) = LoadCursorW(None, IDC_SIZEWE) {
+                    SetCursor(Some(c));
+                    return LRESULT(1);
+                }
+            }
+            LRESULT(0)
+        }
         WM_TIMER => {
-            if wparam.0 == TIMER_DRAIN {
+            if wparam.0 == TIMER_BUSY {
+                let app = &mut *app_ptr;
+                paint::tick_busy_strip(hwnd, app);
+            } else if wparam.0 == TIMER_DRAIN {
                 let app = &mut *app_ptr;
                 app.drain();
                 // 首页是虚拟视图，拿不到目录变更通知 —— 拷完一个大文件之后
@@ -488,6 +524,35 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 app.cfg.ui.sidebar_visible,
                 app.cfg.ui.statusbar_visible,
             );
+            // 正在拖条目 / 拉框选：更新当前点、重算投放目标并重画。
+            // 必须排在别的命中之前 —— 拖拽期间不该改变选中集。
+            if app.drag.is_some() {
+                let ctrl_now = (wparam.0 & 0x0008) != 0 || GetKeyState(0x11) < 0;
+                app.update_drag(x, y, ctrl_now);
+                let target = drop_target_at(app, &l, x, y);
+                app.drop_target = target;
+                let _ = InvalidateRect(Some(hwnd), None, true);
+                return LRESULT(0);
+            }
+            // 正在拖分隔线：只改宽度并重画，别的命中一概不理
+            if let Some(drag) = app.drag_split.take() {
+                let delta = ((x - drag.start_x) as f32 / app.metrics.scale).round() as i32;
+                let want = drag.start_w + delta;
+                match drag.which {
+                    app::Split::Sidebar => {
+                        app.cfg.ui.sidebar_width =
+                            (want.max(app::SIDEBAR_W_MIN).min(app::SIDEBAR_W_MAX)) as u32;
+                        app.sync_metrics();
+                    }
+                    app::Split::Column(i) => app.set_col_width(i.min(3), want),
+                }
+                app.drag_split = Some(drag);
+                paint::reposition(app);
+                let _ = InvalidateRect(Some(hwnd), None, true);
+                return LRESULT(0);
+            }
+            // 分隔线悬停（只为了把光标换成 ↔）
+            let hover_split = paint::split_hit(app, &l, x, y);
             let in_close = inside(&l.close_btn, x, y);
             let mut chrome = 0u8;
             if inside(&l.sidebar_toggle, x, y) {
@@ -534,7 +599,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 || hover_setting != app.settings_hover
                 || hover_sidebar != app.sidebar_hover
                 || hover_addr != app.addr_hover
+                || hover_split != app.hover_split
             {
+                app.hover_split = hover_split;
                 app.hovering_close = in_close;
                 app.hover_chrome = chrome;
                 app.hover_tab = hover_tab;
@@ -625,6 +692,32 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 app.cfg.ui.sidebar_visible,
                 app.cfg.ui.statusbar_visible,
             );
+            // 分隔线（导航窗格宽度 / 表头列宽）：排在虚拟视图分支之前，
+            // 否则打开设置页之后整条消息在设置分支里就 return 了。
+            if let Some(which) = paint::split_hit(app, &l, x, y) {
+                let start_w = match which {
+                    app::Split::Sidebar => app.cfg.ui.sidebar_width as i32,
+                    app::Split::Column(i) => app.col_widths()[i.min(3)],
+                };
+                app.drag_split = Some(app::SplitDrag { which, start_x: x, start_w });
+                SetCapture(hwnd);
+                return LRESULT(0);
+            }
+            // 标签栏的命中**必须排在设置页/回收站之前**：那两个分支处理完就
+            // 直接 return 了，放在前面的话一打开设置整个标题栏就点不动
+            // （表现：打开设置后切不了标签、也关不掉标签）。
+            if let Some(i) = hit_tab(app, &l, x, y) {
+                // 关闭按钮压在标签右上角，命中优先级必须高于"切换标签"，
+                // 否则每次点 × 都会先切一次标签（然后才关掉别的）。
+                if inside(&l.tab_close_rect(i, app.tabs.len(), &app.metrics), x, y) {
+                    app.close_tab(i);
+                } else {
+                    app.active = i;
+                }
+                paint::sync_address(app);
+                let _ = InvalidateRect(Some(hwnd), None, true);
+                return LRESULT(0);
+            }
             // 设置页：点一行就切换/循环对应开关
             if app.tab().settings {
                 if let Some(action) = paint::settings_hit(app, &l, x, y) {
@@ -664,18 +757,6 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             }
             let ctrl = GetKeyState(0x11) < 0;
             let shift = GetKeyState(0x10) < 0;
-            if let Some(i) = hit_tab(app, &l, x, y) {
-                // 关闭按钮压在标签右上角，命中优先级必须高于"切换标签"，
-                // 否则每次点 × 都会先切一次标签（然后才关掉别的）。
-                if inside(&l.tab_close_rect(i, app.tabs.len(), &app.metrics), x, y) {
-                    app.close_tab(i);
-                } else {
-                    app.active = i;
-                }
-                paint::sync_address(app);
-                let _ = InvalidateRect(Some(hwnd), None, true);
-                return LRESULT(0);
-            }
             // 状态栏右下角：资源管理器同款的"大图标 / 详细信息"快速切换
             if app.cfg.ui.statusbar_visible {
                 if let Some(mode) = paint::status_view_hit(&l, &app.metrics, x, y) {
@@ -742,19 +823,58 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             }
             if let Some(row) = view_row_at(app, &l, x, y, view_top) {
                 app.toggle_select(row, ctrl, shift);
+                // 左键拖拽的起点：按下先记账，超过阈值才真的开始（见 WM_MOUSEMOVE）
+                app.begin_drag(x, y, app::DragKind::Items, ctrl);
+                SetCapture(hwnd);
                 let _ = InvalidateRect(Some(hwnd), None, true);
             } else if y >= view_top {
                 // 点空白处：清空选中，并且**把焦点框也收起来**。
                 // 只清 selected 的话，焦点行还留在原地，于是"先前选中的那一项还在，
                 // 只是淡了一点" —— 用户以为没清掉。
-                app.tab_mut().selected.clear();
+                if !ctrl && !shift {
+                    app.tab_mut().selected.clear();
+                }
                 app.focus_visible = false;
+                // 空白处起手 = 拉框选（资源管理器同款）
+                app.begin_drag(x, y, app::DragKind::Marquee, ctrl);
+                SetCapture(hwnd);
                 let _ = InvalidateRect(Some(hwnd), None, true);
             }
             LRESULT(0)
         }
         WM_LBUTTONUP => {
             let (x, y) = client_xy(hwnd, lparam);
+            // 拖完条目 / 拉完框：落地
+            {
+                let app = &mut *app_ptr;
+                if app.drag.is_some() {
+                    let _ = ReleaseCapture();
+                    let l = paint::compute_layout(
+                        app.last_size.0,
+                        app.last_size.1,
+                        &app.metrics,
+                        app.cfg.ui.sidebar_visible,
+                        app.cfg.ui.statusbar_visible,
+                    );
+                    finish_drag(app, &l, x, y);
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                    return LRESULT(0);
+                }
+            }
+            // 拖完分隔线：松开才落盘（拖动过程中每帧写一次 JSON 太亏）
+            {
+                let app = &mut *app_ptr;
+                if let Some(drag) = app.drag_split.take() {
+                    let _ = ReleaseCapture();
+                    match drag.which {
+                        app::Split::Sidebar => app.persist_sidebar_width(),
+                        app::Split::Column(_) => app.persist_view_pref(),
+                    }
+                    paint::reposition(app);
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                    return LRESULT(0);
+                }
+            }
             let (l, plus) = {
                 let app = &*app_ptr;
                 let l = paint::compute_layout(
@@ -1031,6 +1151,100 @@ fn view_row_at(app: &App, l: &paint::Layout, x: i32, y: i32, view_top: i32) -> O
     } else {
         app.row_hit(y, view_top, l.view.bottom - view_top)
     }
+}
+
+/// 拖拽落点判定：面包屑 → 导航窗格 → 内容区里的文件夹行。
+///
+/// 顺序有意义：地址栏压在工具栏里、导航窗格又压着内容区左边缘，
+/// 从最具体的开始判才不会"想拖到面包屑结果落进了下面的行"。
+fn drop_target_at(app: &mut App, l: &paint::Layout, x: i32, y: i32) -> Option<app::DropTarget> {
+    // 1) 地址栏面包屑（第 12 轮第 12 项：拖到哪一级就进哪一级）
+    if inside(&l.address, x, y) && !app.addr_editing {
+        let bar = paint::address_bar(app, l);
+        if let Some(i) = paint::address_hit(&bar, x, y) {
+            if let Some(p) = bar.crumbs.get(i).and_then(|c| c.target.clone()) {
+                return Some(app::DropTarget { path: p, kind: app::DropKind::Crumb(i) });
+            }
+        }
+    }
+    // 2) 导航窗格（回收站/主页是虚拟目标，不能当落地目录）
+    if app.cfg.ui.sidebar_visible && y >= l.sidebar.top && x < l.sidebar.right {
+        if let Some((i, _)) = paint::sidebar_hit(app, l, x, y, app.metrics.scale) {
+            let rows = app.sidebar_rows();
+            if let Some(row) = rows.get(i) {
+                let t = &row.target;
+                if !t.is_empty()
+                    && !paint::is_home_target(t)
+                    && !paint::is_recycle_target(t)
+                    && t != app::SETTINGS_PATH
+                {
+                    return Some(app::DropTarget {
+                        path: PathBuf::from(t),
+                        kind: app::DropKind::Sidebar(i),
+                    });
+                }
+            }
+        }
+    }
+    // 3) 内容区里的文件夹行
+    let view_top = l.view.top + header_height(app);
+    if y >= view_top && y < l.view.bottom {
+        if let Some(row) = view_row_at(app, l, x, y, view_top) {
+            let idx = app.tab().visible.get(row).copied();
+            let entry = idx.and_then(|i| app.tab().entries.get(i).cloned());
+            if let Some(e) = entry {
+                if e.is_dir() {
+                    return Some(app::DropTarget { path: e.path.clone(), kind: app::DropKind::Row(row) });
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 松手：条目拖拽去落地 / 框选去选中。
+fn finish_drag(app: &mut App, l: &paint::Layout, x: i32, y: i32) {
+    let Some(drag) = app.drag.take() else {
+        return;
+    };
+    app.drop_target = None;
+    if !drag.active {
+        return;
+    }
+    match drag.kind {
+        app::DragKind::Marquee => select_marquee(app, l, &drag),
+        app::DragKind::Items => {
+            if let Some(t) = drop_target_at(app, l, x, y) {
+                let copy = drag.copy || app.drag_copy();
+                app.drop_items(t.path.clone(), drag.items.clone(), copy);
+            }
+        }
+    }
+}
+
+/// 框选：矩形与条目矩形相交的都选中。
+fn select_marquee(app: &mut App, l: &paint::Layout, drag: &app::Drag) {
+    let r = paint::marquee_rect(drag);
+    let view_top = l.view.top + header_height(app);
+    let n = app.tab().visible.len();
+    let mut keys: Vec<String> = Vec::new();
+    for i in 0..n {
+        let ir = paint::item_rect(app, l, i, view_top);
+        if ir.right > r.left && ir.left < r.right && ir.bottom > r.top && ir.top < r.bottom {
+            if let Some(e) = app.tab().visible.get(i).and_then(|k| app.tab().entries.get(*k)) {
+                keys.push(crate::app::key_of(e));
+            }
+        }
+    }
+    if keys.is_empty() {
+        return;
+    }
+    let tab = app.tab_mut();
+    tab.selected.clear();
+    for k in keys {
+        tab.selected.insert(k);
+    }
+    app.focus_visible = true;
 }
 
 /// 详细信息视图表头的高度；其它视图没有表头。

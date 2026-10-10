@@ -82,6 +82,10 @@ pub enum Command {
     SortByModified,
     SortByType,
     SortBySize,
+    /// 只把方向设成升序，不动当前排序列
+    SortAscending,
+    /// 只把方向设成降序，不动当前排序列
+    SortDescending,
     ToggleSidebar,
     ToggleStatusbar,
     /// 导航窗格"跟随展开到当前文件夹"
@@ -414,7 +418,7 @@ struct MenuWindow {
 }
 
 pub fn register_menu_class() {
-    let cls = windows::core::HSTRING::from("NexFileMenu");
+    let cls = windows::core::HSTRING::from("ZenFileMenu");
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
         lpfnWndProc: Some(menu_proc),
@@ -441,7 +445,7 @@ pub fn open_menu(
     theme: Theme,
     parent_menu: Option<HWND>,
 ) -> Option<HWND> {
-    let cls = HSTRING::from("NexFileMenu");
+    let cls = HSTRING::from("ZenFileMenu");
     if entries.is_empty() {
         return None;
     }

@@ -135,7 +135,7 @@ fn to_cmd_line<S: AsRef<OsStr>>(exe: &Path, args: &[S]) -> Vec<u16> {
 pub mod startup {
     use super::*;
 
-    const TASK_NAME: &str = "NexFile.TrayAutostart";
+    const TASK_NAME: &str = "ZenFile.TrayAutostart";
 
     pub fn install(exe: &PathBuf, delay_seconds: u32) -> Result<()> {
         let tr = format!("\"{}\" --tray", exe.display());

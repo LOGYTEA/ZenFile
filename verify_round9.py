@@ -19,7 +19,7 @@ import struct
 import subprocess
 import time
 
-# 脚本会改写 %APPDATA%\NexFile 下的设置来构造场景 —— 必须隔离，否则跑完
+# 脚本会改写 %APPDATA%\ZenFile 下的设置来构造场景 —— 必须隔离，否则跑完
 # 用户自己的软件就带着脚本遗留的状态运行（详见 verify_env.py 的说明）。
 import verify_env
 
@@ -57,9 +57,9 @@ g.GetDIBits.argtypes = [wt.HDC, wt.HBITMAP, ctypes.c_uint, ctypes.c_uint,
 k.GetFileAttributesW.restype = ctypes.c_uint32
 k.GetFileAttributesW.argtypes = [ctypes.c_wchar_p]
 
-EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\fm-app.exe"
+EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\ZenFile.exe"
 APPDATA = os.environ.get("APPDATA", r"C:\Users\Administrator\AppData\Roaming")
-USER_CFG = os.path.join(APPDATA, "NexFile", "settings.user.json")
+USER_CFG = os.path.join(APPDATA, "ZenFile", "settings.user.json")
 
 WM_MOUSEMOVE = 0x0200
 WM_LBUTTONDOWN = 0x0201
@@ -87,7 +87,7 @@ def mark(ok, msg):
 
 
 def kill_all():
-    subprocess.run(["taskkill", "/F", "/IM", "fm-app.exe"], capture_output=True)
+    subprocess.run(["taskkill", "/F", "/IM", "ZenFile.exe"], capture_output=True)
     time.sleep(0.5)
 
 
@@ -110,7 +110,7 @@ def launch(arg=None, wait=2.5):
     hwnd = None
     for _ in range(80):
         time.sleep(0.25)
-        hwnd = u.FindWindowW("NexFileMainWindow", None)
+        hwnd = u.FindWindowW("ZenFileMainWindow", None)
         if hwnd:
             break
     assert hwnd, "主窗口没起来"
@@ -319,7 +319,7 @@ write_cfg({"files": {"view": {"default_mode": "list"}}})
 hwnd = launch(os.path.join(BASE, "Icons"))
 u.PostMessageW(hwnd, WM_RBUTTONUP, 0, (300 << 16) | (400 & 0xFFFF))
 time.sleep(0.6)
-menus = windows_of("NexFileMenu")
+menus = windows_of("ZenFileMenu")
 print(f"  右键后菜单窗口 {len(menus)} 个")
 mark(len(menus) == 1, "右键菜单弹出")
 if menus:
@@ -332,7 +332,7 @@ if menus:
     seen = []
     for yy in range(6, min(mhh - 4, 260), 3):
         move(mh, mw // 2, yy)
-        ms = windows_of("NexFileMenu")
+        ms = windows_of("ZenFileMenu")
         seen.append(len(ms))
         if len(ms) >= 2:
             sub = [m for m in ms if m[0] != mh]
@@ -355,7 +355,7 @@ if menus:
         move(sh, -20, 20)
         move(mh, mw // 2, 10)
         time.sleep(0.3)
-        left = [m for m in windows_of("NexFileMenu") if m[0] != mh]
+        left = [m for m in windows_of("ZenFileMenu") if m[0] != mh]
         mark(len(left) == 0, f"鼠标移回父菜单后子菜单自动收起（残留 {len(left)} 个）")
         # 换到明显不同的另一行再比较（同一行内移动本来就不会有变化）
         a1 = grab(mh)
@@ -369,7 +369,7 @@ if menus:
     # 关键回归点：在外面点一下，整条菜单链必须全关
     click(mh, -300, -300)
     time.sleep(0.5)
-    rest = windows_of("NexFileMenu")
+    rest = windows_of("ZenFileMenu")
     mark(len(rest) == 0, f"点空白处整条菜单链关闭（残留 {len(rest)} 个窗口）")
 drop_cfg()
 
@@ -539,7 +539,7 @@ click(hwnd, 300, sel_y)
 time.sleep(0.4)
 u.PostMessageW(hwnd, WM_RBUTTONUP, 0, (sel_y << 16) | (300 & 0xFFFF))
 time.sleep(0.6)
-menus = windows_of("NexFileMenu")
+menus = windows_of("ZenFileMenu")
 ok_menu = len(menus) == 1
 if ok_menu:
     mh, mx, my, mw, mhh = menus[0]
@@ -567,16 +567,16 @@ if ok_menu:
         u.PostMessageW(mh, WM_LBUTTONUP, 0, (yy << 16) | ((mw // 2) & 0xFFFF))
         for _ in range(200):
             time.sleep(0.005)
-            if windows_of("NexFileProps"):
+            if windows_of("ZenFileProps"):
                 break
-        if windows_of("NexFileProps"):
+        if windows_of("ZenFileProps"):
             target = (yy, time.time() - t0)
             break
     if target:
         print(f"  点中「属性」（菜单内 y={target[0]}），窗口出现耗时 {target[1]*1000:.0f} ms")
-        props = windows_of("NexFileProps")[0]
+        props = windows_of("ZenFileProps")[0]
         print(f"  属性窗口 {props[3]}x{props[4]}")
-        mark(True, "右键「属性」打开的是自绘窗口（NexFileProps），不是原生 #32770")
+        mark(True, "右键「属性」打开的是自绘窗口（ZenFileProps），不是原生 #32770")
         mark(target[1] < 1.0, f"打开耗时 {target[1]*1000:.0f}ms < 1000ms（原生属性页常 1~3s）")
         mark(props[3] > 300 and props[4] > 300, "窗口尺寸正常，不是空壳")
         # 点一下「只读」复选框，磁盘上的属性必须真的变
@@ -623,7 +623,7 @@ if ok_menu:
             time.sleep(0.4)
         u.PostMessageW(ph, WM_CLOSE, 0, 0)
         time.sleep(0.5)
-        mark(len(windows_of("NexFileProps")) == 0, "属性窗口可以关闭")
+        mark(len(windows_of("ZenFileProps")) == 0, "属性窗口可以关闭")
     else:
         mark(False, "没能在右键菜单里点中「属性」")
 else:

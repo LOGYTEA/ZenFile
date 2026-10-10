@@ -41,7 +41,7 @@ g.GetDIBits.restype = ctypes.c_int
 g.GetDIBits.argtypes = [wt.HDC, wt.HBITMAP, ctypes.c_uint, ctypes.c_uint,
                         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
 
-EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\fm-app.exe"
+EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\ZenFile.exe"
 WM_GETTEXT = 0x000D
 WM_LBUTTONDOWN = 0x0201
 WM_LBUTTONUP = 0x0202
@@ -54,7 +54,7 @@ BASE = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), "NexVerify7")
 
 
 def kill_all():
-    subprocess.run(["taskkill", "/F", "/IM", "fm-app.exe"], capture_output=True)
+    subprocess.run(["taskkill", "/F", "/IM", "ZenFile.exe"], capture_output=True)
     time.sleep(0.6)
 
 
@@ -64,7 +64,7 @@ def launch(arg=None):
     hwnd = None
     for _ in range(80):
         time.sleep(0.25)
-        hwnd = u.FindWindowW("NexFileMainWindow", None)
+        hwnd = u.FindWindowW("ZenFileMainWindow", None)
         if hwnd:
             break
     assert hwnd, "窗口没起来"
@@ -136,7 +136,7 @@ def menu_windows():
     def cb(h, _lp):
         cls = ctypes.create_unicode_buffer(64)
         u.GetClassNameW(h, cls, 64)
-        if cls.value == "NexFileMenu":
+        if cls.value == "ZenFileMenu":
             rr = wt.RECT()
             u.GetWindowRect(h, ctypes.byref(rr))
             found.append((int(h), rr.left, rr.top, rr.right - rr.left, rr.bottom - rr.top))

@@ -19,7 +19,7 @@ import shutil
 import struct
 import subprocess
 
-# 脚本会改写 %APPDATA%\NexFile 下的设置来构造场景 —— 必须隔离，否则跑完
+# 脚本会改写 %APPDATA%\ZenFile 下的设置来构造场景 —— 必须隔离，否则跑完
 # 用户自己的软件就带着脚本遗留的状态运行（详见 verify_env.py 的说明）。
 import verify_env
 
@@ -60,9 +60,9 @@ g.GetDIBits.restype = ctypes.c_int
 g.GetDIBits.argtypes = [wt.HDC, wt.HBITMAP, ctypes.c_uint, ctypes.c_uint,
                         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
 
-EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\fm-app.exe"
+EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\ZenFile.exe"
 APPDATA = os.environ.get("APPDATA", r"C:\Users\Administrator\AppData\Roaming")
-CFG_DIR = os.path.join(APPDATA, "NexFile")
+CFG_DIR = os.path.join(APPDATA, "ZenFile")
 # 应用写的是"用户层" settings.json；settings.user.json 是最高优先级覆盖层，
 # 测试如果写它，会把应用的写入整个盖住，读出来永远是初始值。
 USER_CFG = os.path.join(CFG_DIR, "settings.json")
@@ -93,7 +93,7 @@ def mark(ok, msg):
 
 
 def kill_all():
-    subprocess.run(["taskkill", "/F", "/IM", "fm-app.exe"], capture_output=True)
+    subprocess.run(["taskkill", "/F", "/IM", "ZenFile.exe"], capture_output=True)
     time.sleep(0.5)
 
 
@@ -121,7 +121,7 @@ def launch(arg=None, wait=2.5):
     hwnd = None
     for _ in range(80):
         time.sleep(0.25)
-        hwnd = u.FindWindowW("NexFileMainWindow", None)
+        hwnd = u.FindWindowW("ZenFileMainWindow", None)
         if hwnd:
             break
     assert hwnd, "主窗口没起来"
@@ -392,7 +392,7 @@ view_top = G["title_h"] + G["toolbar_h"]
 view_left = G["sidebar_w"]
 # 标题栏「更多」按钮 → 菜单 → 第 10 项"设置"
 click(hwnd, G["w"] - int(G["btn_w"] * 3.5), sc(G["s"], 17))
-menus = windows_of("NexFileMenu")
+menus = windows_of("ZenFileMenu")
 mark(bool(menus), f"「更多」菜单弹出（{len(menus)} 个）")
 if menus:
     mh = menus[0][0]
@@ -505,7 +505,7 @@ view_left = G["sidebar_w"]
 list_top = view_top + G["header_h"]
 click(hwnd, view_left + 250, list_top + G["row_h"] // 2)
 rclick(hwnd, view_left + 250, list_top + G["row_h"] // 2)
-menus = windows_of("NexFileMenu")
+menus = windows_of("ZenFileMenu")
 mark(bool(menus), f"右键菜单弹出（{len(menus)} 个：{[(m[3], m[4]) for m in menus]}）")
 if menus:
     # 顶层菜单永远是"最高"的那一个（子菜单更矮）
@@ -517,12 +517,12 @@ if menus:
     # 从上面扫起会先点到"刷新"，菜单直接关掉，就再也扫不到属性了。
     for y in range(4 + row * 7 + 6 + row * 2 + 6 + row * 4, mhh - 4, max(8, row // 2)):
         click(mh, mw // 2, y)
-        if windows_of("NexFileProps"):
+        if windows_of("ZenFileProps"):
             break
-        if not windows_of("NexFileMenu"):
+        if not windows_of("ZenFileMenu"):
             break
     time.sleep(0.8)
-props = windows_of("NexFileProps")
+props = windows_of("ZenFileProps")
 mark(bool(props), f"属性对话框弹出（{len(props)} 个）")
 if props:
     ph = props[0][0]

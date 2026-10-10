@@ -218,7 +218,7 @@ fn text_of(h: HWND) -> String {
 // ---------------------------------------------------------------- 打开
 
 pub fn register_class() {
-    let cls = HSTRING::from("NexFileRename");
+    let cls = HSTRING::from("ZenFileRename");
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
         lpfnWndProc: Some(br_proc),
@@ -267,7 +267,7 @@ pub fn open(app_ptr: *mut App, items: Vec<PathBuf>, mode: usize) {
     recompute(&mut st);
 
     let state = Box::into_raw(st);
-    let cls = HSTRING::from("NexFileRename");
+    let cls = HSTRING::from("ZenFileRename");
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_WINDOWEDGE,
@@ -946,7 +946,7 @@ struct Combo {
 }
 
 fn register_combo() {
-    let cls = HSTRING::from("NexFileRenameCombo");
+    let cls = HSTRING::from("ZenFileRenameCombo");
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
         lpfnWndProc: Some(combo_proc),
@@ -962,7 +962,7 @@ fn open_combo(owner: HWND, items: Vec<String>, current: usize, x: i32, y: i32, w
     let row_h = (24.0 * scale).round() as i32;
     let h = row_h * items.len() as i32 + (8.0 * scale).round() as i32;
     let state = Box::into_raw(Box::new(Combo { owner, items, current, hover: None, scale, theme }));
-    let cls = HSTRING::from("NexFileRenameCombo");
+    let cls = HSTRING::from("ZenFileRenameCombo");
     let hwnd = unsafe {
         CreateWindowExW(
             windows::Win32::UI::WindowsAndMessaging::WS_EX_TOPMOST,

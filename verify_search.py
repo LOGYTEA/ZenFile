@@ -45,10 +45,10 @@ g.GetDIBits.restype = ctypes.c_int
 g.GetDIBits.argtypes = [wt.HDC, wt.HBITMAP, ctypes.c_uint, ctypes.c_uint,
                         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
 
-EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\fm-app.exe"
+EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\ZenFile.exe"
 WM_SETTEXT = 0x000C
 WM_KEYDOWN = 0x0100
-CACHE = os.path.join(os.environ.get("LOCALAPPDATA", ""), "NexFile", "index", "C.bin")
+CACHE = os.path.join(os.environ.get("LOCALAPPDATA", ""), "ZenFile", "index", "C.bin")
 
 BASE = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), "NexSearch")
 A = os.path.join(BASE, "A")
@@ -74,12 +74,12 @@ def mark(ok, msg):
 
 
 def launch(arg):
-    subprocess.run(["taskkill", "/F", "/IM", "fm-app.exe"], capture_output=True)
+    subprocess.run(["taskkill", "/F", "/IM", "ZenFile.exe"], capture_output=True)
     time.sleep(0.5)
     subprocess.Popen([EXE, arg])
     for _ in range(60):
         time.sleep(0.25)
-        hw = u.FindWindowW("NexFileMainWindow", None)
+        hw = u.FindWindowW("ZenFileMainWindow", None)
         if hw:
             time.sleep(1.8)
             return hw
@@ -274,7 +274,7 @@ print(f"  非搜索态 同一段 x {PX0}..{PX1} 墨迹 {norm_ink}")
 mark(norm_ink * 4 < path_ink, f"普通目录不画位置列（{norm_ink} vs 搜索态 {path_ink}）")
 
 # ---------------------------------------------------------------- 收尾
-subprocess.run(["taskkill", "/F", "/IM", "fm-app.exe"], capture_output=True)
+subprocess.run(["taskkill", "/F", "/IM", "ZenFile.exe"], capture_output=True)
 if backup and os.path.exists(backup):
     if os.path.exists(CACHE):
         os.remove(CACHE)

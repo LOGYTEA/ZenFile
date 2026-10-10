@@ -6,13 +6,14 @@
 use windows::core::HSTRING;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreateSolidBrush, DeleteDC,
-    DeleteObject, DrawTextW, FillRect, GetTextExtentPoint32W, IntersectClipRect, InvalidateRect,
-    ReleaseDC, RestoreDC, SaveDC, SelectObject, SetBkMode, SetTextColor, DT_CENTER,
-    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DRAW_TEXT_FORMAT,
-    FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FONT_QUALITY, HDC, HFONT, SRCCOPY,
-    TRANSPARENT,
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
+    CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, FillRect, GetDC, GetTextExtentPoint32W,
+    IntersectClipRect, InvalidateRect, LineTo, MoveToEx, PS_SOLID, Rectangle, ReleaseDC, RestoreDC,
+    SaveDC, SelectObject, SetBkMode, SetTextColor, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
+    DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DRAW_TEXT_FORMAT, FONT_CHARSET,
+    FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FONT_QUALITY, HDC, HFONT, SRCCOPY, TRANSPARENT,
 };
+use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::UI::Controls::EM_SETSEL;
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -363,6 +364,28 @@ pub fn grid_hit(
     }
 }
 
+/// 第 `index` 个条目在内容区里的矩形（**未裁剪**到可视范围）。
+///
+/// 网格视图和线性视图的几何差别很大，框选命中与绘制必须共用这一个函数 ——
+/// 两边各写一份常量，改一次就错位（这条踩过）。
+pub fn item_rect(app: &App, l: &Layout, index: usize, view_top: i32) -> RECT {
+    let tab = app.tab();
+    let mode = tab.view_mode;
+    if matches!(mode, fm_core::ViewMode::LargeIcons | fm_core::ViewMode::MediumIcons) {
+        let g = icon_grid(l, &app.metrics, mode);
+        let cols = g.cols.max(1);
+        let col = (index as i32) % cols;
+        let line = (index as i32) / cols;
+        let x = l.view.left + g.pad + col * g.tile_w;
+        let y = view_top + line * g.tile_h - tab.scroll;
+        RECT { left: x, top: y, right: x + g.tile_w, bottom: y + g.tile_h }
+    } else {
+        let row_h = app.metrics.row_height_for(mode);
+        let y = view_top + index as i32 * row_h - tab.scroll;
+        RECT { left: l.view.left, top: y, right: l.view.right, bottom: y + row_h }
+    }
+}
+
 /// 网格视图的内容总高度（用于滚动条与 scroll 钳制）。
 pub fn grid_content_h(g: &IconGrid, count: usize) -> i32 {
     let lines = (count as i32 + g.cols - 1) / g.cols.max(1);
@@ -399,10 +422,133 @@ pub fn paint(app: &mut App, hdc: HDC, width: i32, height: i32) {
             paint_status(app, mem, &l);
         }
 
+        paint_drag_overlay(app, mem, &l);
+
         let _ = BitBlt(hdc, 0, 0, width, height, Some(mem), 0, 0, SRCCOPY);
         SelectObject(mem, old_bmp);
         let _ = DeleteObject(bmp.into());
         let _ = DeleteDC(mem);
+    }
+}
+
+/// 拖拽覆盖层：框选矩形 + 投放目标高亮 + 跟着光标的"移动到…"提示。
+///
+/// 必须画在**所有内容之上**（所以放在 paint() 的最后）：框选是从空白处起手的，
+/// 矩形会盖住条目；拖到面包屑上时高亮也要压在地址栏上。
+fn paint_drag_overlay(app: &mut App, hdc: HDC, l: &Layout) {
+    // 先把要用的标量抄出来：下面取面包屑矩形要 &mut app，不能让 &app.drag
+    // 的借用一直挂着。
+    let (kind, cur, items_n, marquee) = match app.drag.as_ref() {
+        Some(d) if d.active => (d.kind, d.cur, d.items.len(), marquee_rect(d)),
+        _ => return,
+    };
+    let t = app.theme;
+    let s = app.metrics.scale;
+    let accent = t.accent;
+    let copy = app.drag_copy();
+    let target_kind = app.drop_target.as_ref().map(|d| d.kind);
+    let target_name = app.drop_target.as_ref().map(|d| {
+        d.path
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| d.path.to_string_lossy().trim_end_matches('\\').to_string())
+    });
+    let ax = (accent.0 & 0xFF) as i32;
+    let ay = ((accent.0 >> 8) & 0xFF) as i32;
+    let az = ((accent.0 >> 16) & 0xFF) as i32;
+    let bx = (t.window_bg.0 & 0xFF) as i32;
+    let by = ((t.window_bg.0 >> 8) & 0xFF) as i32;
+    let bz = ((t.window_bg.0 >> 16) & 0xFF) as i32;
+    // 半透明填充用手动混色省掉一次 AlphaBlend（覆盖层是纯装饰，够用）
+    let blend = COLORREF(((ax + bx) / 2 | (((ay + by) / 2) << 8) | (((az + bz) / 2) << 16)) as u32);
+    unsafe {
+        let pen = CreatePen(PS_SOLID, 1, accent);
+        let old_pen = SelectObject(hdc, pen.into());
+        let brush = CreateSolidBrush(blend);
+        let old_brush = SelectObject(hdc, brush.into());
+
+        // 1) 投放目标：描一圈 accent 边（只描边不填充，里面的内容还得看得见）
+        let target_rect = match target_kind {
+            Some(crate::app::DropKind::Row(i)) => {
+                Some(item_rect(app, l, i, l.view.top + header_height_of(app)))
+            }
+            Some(crate::app::DropKind::Crumb(i)) => address_bar(app, l).rects.get(i).copied(),
+            Some(crate::app::DropKind::Sidebar(i)) => app
+                .sidebar_rows()
+                .get(i)
+                .map(|row| sidebar_row_geoms(l, i, row.depth, s, app.sidebar_scroll).0),
+            None => None,
+        };
+        if let Some(r) = target_rect {
+            let old_b = SelectObject(hdc, brush.into());
+            MoveToEx(hdc, r.left, r.top, None);
+            LineTo(hdc, r.right - 1, r.top);
+            LineTo(hdc, r.right - 1, r.bottom - 1);
+            LineTo(hdc, r.left, r.bottom - 1);
+            LineTo(hdc, r.left, r.top);
+            SelectObject(hdc, old_b);
+        }
+
+        // 2) 框选矩形
+        if kind == crate::app::DragKind::Marquee {
+            let r = marquee;
+            Rectangle(hdc, r.left, r.top, r.right, r.bottom);
+        }
+
+        // 3) 跟着光标的提示牌："移动 3 项到 下载"
+        if kind == crate::app::DragKind::Items {
+            let text = match &target_name {
+                Some(nm) => format!("{} {} 项到 {}", if copy { "复制" } else { "移动" }, items_n, nm),
+                None => format!("{} {} 项", if copy { "复制" } else { "移动" }, items_n),
+            };
+            let font = ui_font(s);
+            let old_font = SelectObject(hdc, font.into());
+            let w = text_width(hdc, font, &text) + (16.0 * s) as i32;
+            let h = (24.0 * s) as i32;
+            let r = RECT {
+                left: cur.0 + (14.0 * s) as i32,
+                top: cur.1 + (14.0 * s) as i32,
+                right: cur.0 + (14.0 * s) as i32 + w,
+                bottom: cur.1 + (14.0 * s) as i32 + h,
+            };
+            let bg = CreateSolidBrush(t.surface);
+            FillRect(hdc, &r, bg);
+            let _ = DeleteObject(bg.into());
+            MoveToEx(hdc, r.left, r.top, None);
+            LineTo(hdc, r.right - 1, r.top);
+            LineTo(hdc, r.right - 1, r.bottom - 1);
+            LineTo(hdc, r.left, r.bottom - 1);
+            LineTo(hdc, r.left, r.top);
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, t.text);
+            draw_text(hdc, &text, r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            SelectObject(hdc, old_font);
+        }
+
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        let _ = DeleteObject(brush.into());
+        let _ = DeleteObject(pen.into());
+    }
+}
+
+/// 框选矩形（把起点/当前点规整成左上-右下）。
+pub fn marquee_rect(drag: &crate::app::Drag) -> RECT {
+    let (x0, y0) = drag.origin;
+    let (x1, y1) = drag.cur;
+    RECT {
+        left: x0.min(x1),
+        top: y0.min(y1),
+        right: x0.max(x1),
+        bottom: y0.max(y1),
+    }
+}
+
+fn header_height_of(app: &App) -> i32 {
+    if app.tab().view_mode == fm_core::ViewMode::Details {
+        (26.0 * app.metrics.scale) as i32
+    } else {
+        0
     }
 }
 
@@ -785,6 +931,69 @@ fn paint_toolbar(app: &mut App, hdc: HDC, l: &Layout) {
         let lb = CreateSolidBrush(t.border);
         FillRect(hdc, &RECT { left: 0, top: l.toolbar.bottom - 1, right: l.toolbar.right, bottom: l.toolbar.bottom }, lb);
         let _ = DeleteObject(lb.into());
+
+        // 加载/搜索进度条画在这一条线上（见 paint_busy_strip）
+        paint_busy_strip(app, hdc, l);
+    }
+}
+
+/// 目录栏下沿的不定量进度条（Win11 资源管理器同款）。
+///
+/// 列目录、整卷搜索、建索引都给不出百分比，只能"有事在跑"这一个布尔量 ——
+/// 所以画的是来回滑动的一小段，而不是假的确定进度。原先在列表区写
+/// "正在列举…" 的纯文字已经去掉了。
+fn paint_busy_strip(app: &App, hdc: HDC, l: &Layout) {
+    if !app.busy() {
+        return;
+    }
+    let scale = app.metrics.scale;
+    let t = app.theme;
+    let h = ((2.0 * scale).round() as i32).max(2);
+    let left = l.toolbar.left;
+    let right = l.toolbar.right;
+    let w = (right - left).max(1);
+    let top = l.toolbar.bottom - h;
+    unsafe {
+        let base = CreateSolidBrush(t.surface);
+        FillRect(hdc, &RECT { left, top, right, bottom: l.toolbar.bottom }, base);
+        let _ = DeleteObject(base.into());
+        // 一段长度约 1/4 宽的亮条，在 [0, w+seg] 上循环滑动。
+        // GetTickCount64 直接取，不额外存状态：反正是纯装饰，掉几帧无所谓。
+        let seg = ((w as f32) * 0.25).round().max(24.0) as i32;
+        let span = w + seg;
+        let phase = (GetTickCount64() % 1100) as f32 / 1100.0;
+        let x0 = left - seg + (span as f32 * phase).round() as i32;
+        let x1 = (x0 + seg).min(right);
+        if x1 > left {
+            let b = CreateSolidBrush(t.accent);
+            FillRect(hdc, &RECT { left: x0.max(left), top, right: x1, bottom: l.toolbar.bottom }, b);
+            let _ = DeleteObject(b.into());
+        }
+    }
+}
+
+/// 进度条在动，得有人周期性地擦它。只重画这一条，别整窗重绘。
+pub fn tick_busy_strip(hwnd: HWND, app: &App) {
+    if !app.busy() {
+        return;
+    }
+    let l = compute_layout(
+        app.last_size.0,
+        app.last_size.1,
+        &app.metrics,
+        app.cfg.ui.sidebar_visible,
+        app.cfg.ui.statusbar_visible,
+    );
+    let scale = app.metrics.scale;
+    let h = ((2.0 * scale).round() as i32).max(2);
+    let r = RECT {
+        left: l.toolbar.left,
+        top: l.toolbar.bottom - h,
+        right: l.toolbar.right,
+        bottom: l.toolbar.bottom,
+    };
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), Some(&r), false);
     }
 }
 
@@ -883,6 +1092,58 @@ fn paint_sidebar(app: &mut App, hdc: HDC, l: &Layout) {
         }
         SelectObject(hdc, old);
     }
+}
+
+/// 导航窗格与内容区之间的分隔线（可拖宽/拖窄导航窗格）。
+///
+/// 命中带 3px 容差：分隔线本身只有 1px，让人去对准 1px 是折磨。
+pub fn sidebar_split_rect(l: &Layout) -> RECT {
+    RECT {
+        left: l.sidebar.right - 3,
+        top: l.sidebar.top,
+        right: l.sidebar.right + 3,
+        bottom: l.sidebar.bottom,
+    }
+}
+
+/// 详细信息表头上可拖的几条竖线：`(列序号, x)`。
+///
+/// 规则是"第 n 列的右边线 = 下一列的起点"，最后一列也一样（资源管理器允许
+/// 拖 大小 的右边线）。列序号固定为 0=名称 1=修改日期 2=类型 3=大小 ——
+/// 搜索态多出来的"位置"列不改序号，否则拖一次就拖错列。
+pub fn header_splits(app: &App, l: &Layout) -> Vec<(usize, i32)> {
+    if app.tab().view_mode != fm_core::ViewMode::Details {
+        return Vec::new();
+    }
+    // 详细信息视图的图标恒为 16（与 paint_view 里同一套取值）
+    let icon_size = (16.0 * app.metrics.scale) as i32;
+    let cols = detail_cols(app, l, icon_size);
+    let next_name = cols.path.unwrap_or(cols.date);
+    vec![
+        (0, next_name),
+        (1, cols.kind),
+        (2, cols.size),
+        (3, cols.size + cols.size_w),
+    ]
+}
+
+/// 光标落在哪条分隔线上（带 4px 容差）。
+pub fn split_hit(app: &App, l: &Layout, x: i32, y: i32) -> Option<crate::app::Split> {
+    if app.cfg.ui.sidebar_visible {
+        let r = sidebar_split_rect(l);
+        if y >= l.sidebar.top && y <= l.sidebar.bottom && x >= r.left && x <= r.right {
+            return Some(crate::app::Split::Sidebar);
+        }
+    }
+    let header_h = (26.0 * app.metrics.scale) as i32;
+    if y >= l.view.top && y <= l.view.top + header_h {
+        for (i, sx) in header_splits(app, l) {
+            if (x - sx).abs() <= 4 {
+                return Some(crate::app::Split::Column(i));
+            }
+        }
+    }
+    None
 }
 
 /// 该导航项是不是虚拟的"主页"（没有真实路径可问 Shell 要图标）。
@@ -1271,17 +1532,20 @@ pub fn detail_cols(app: &App, l: &Layout, icon_size: i32) -> DetailCols {
     let icon_gap = (3.0 * s) as i32;
     let name = l.view.left + text_pad + icon_size + icon_gap;
     let searching = app.tab().search_root.is_some();
+    // 列宽是用户能拖的（存在配置里），这里只是把它按 DPI 放大。
+    // 搜索态多一列"位置"，名称列让出空间（照资源管理器搜索结果的做法）。
+    let w = app.col_widths();
     let (name_w, path_w) = if searching {
-        ((190.0 * s) as i32, (270.0 * s) as i32)
+        ((w[0].min(190) as f32 * s) as i32, (270.0 * s) as i32)
     } else {
-        ((274.0 * s) as i32, 0)
+        ((w[0] as f32 * s) as i32, 0)
     };
     let date = name + name_w + path_w;
-    let date_w = (144.0 * s) as i32;
+    let date_w = (w[1] as f32 * s) as i32;
     let kind = date + date_w;
-    let kind_w = (120.0 * s) as i32;
+    let kind_w = (w[2] as f32 * s) as i32;
     let size = kind + kind_w;
-    let size_w = (80.0 * s) as i32;
+    let size_w = (w[3] as f32 * s) as i32;
     DetailCols {
         name,
         path: if searching { Some(name + name_w) } else { None },
@@ -1550,10 +1814,9 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
             SelectObject(hdc, old);
         }
 
-        if app.tab().loading {
-            SetTextColor(hdc, t.text_dim);
-            draw_text(hdc, "正在列举…", RECT { left: l.view.left + 12, top: list_top + 4, right: l.view.right, bottom: list_top + header_h }, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        } else if visible.is_empty() {
+        // 加载中不给任何文字提示：进度条在目录栏下沿（paint_busy_strip）。
+        // 而且这时候条目表是空的，若照旧判空就会闪一句"此文件夹为空"。
+        if !app.tab().loading && visible.is_empty() {
             SetTextColor(hdc, t.text_dim);
             draw_text(hdc, "此文件夹为空", RECT { left: l.view.left + 12, top: list_top + 4, right: l.view.right, bottom: list_top + header_h }, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         }
@@ -1705,7 +1968,7 @@ pub fn settings_rows(app: &App, l: &Layout) -> Vec<SettingRow> {
     // 提示：所有开关实时写入用户层配置
     out.push(SettingRow {
         rect: RECT { left, top, right, bottom: top + head_h },
-        label: "改动即时生效，并写入 %APPDATA%\\NexFile\\settings.user.json".to_string(),
+        label: "改动即时生效，并写入 %APPDATA%\\ZenFile\\settings.user.json".to_string(),
         value: String::new(),
         action: 0,
         on: false,
@@ -2088,6 +2351,79 @@ const ID_ADDRESS: isize = 101;
 const ID_SEARCH: isize = 102;
 const ID_RENAME: isize = 103;
 
+const EM_SETMARGINS: u32 = 0x00D3;
+const EC_LEFTMARGIN: u32 = 0x0001;
+const EC_RIGHTMARGIN: u32 = 0x0002;
+
+/// 搜索框内边距：左 26（放大镜 + 间隙）、右 8。`EM_SETMARGINS` 的 lparam
+/// 是 **低 16 位左、高 16 位右**，写反了图标和文字就叠在一起。
+fn margins_for(scale: f32) -> isize {
+    let l = (26.0 * scale).round() as i32;
+    let r = (8.0 * scale).round() as i32;
+    ((l & 0xFFFF) | ((r & 0xFFFF) << 16)) as isize
+}
+
+/// 搜索框里的放大镜 + 空态提示文字。
+///
+/// EDIT 自己画完背景和文字之后再补画这两样 —— 画在它上面，而不是画在父窗口上
+/// （父窗口先画，随后被 EDIT 的整块背景盖掉，什么都看不见）。
+fn paint_search_decor(hwnd: HWND, hdc_in: Option<HDC>) {
+    let app = match crate::app_ref_opt() {
+        Some(a) => a,
+        None => return,
+    };
+    let t = app.theme;
+    let scale = app.metrics.scale;
+    let empty = read_window_text(hwnd).is_empty();
+    unsafe {
+        let hdc = match hdc_in {
+            Some(h) => h,
+            None => GetDC(Some(hwnd)),
+        };
+        if hdc.is_invalid() {
+            return;
+        }
+        let mut r = RECT::default();
+        let _ = GetClientRect(hwnd, &mut r);
+        SetBkMode(hdc, TRANSPARENT);
+        // 放大镜：垂直居中，左边距 6
+        let g = glyph_font(scale);
+        let old = SelectObject(hdc, g.into());
+        SetTextColor(hdc, t.text_dim);
+        let side = ((r.bottom - r.top) as f32 * 1.1).round() as i32;
+        let ir = RECT {
+            left: (6.0 * scale).round() as i32,
+            top: (r.top + r.bottom - side) / 2,
+            right: (6.0 * scale).round() as i32 + side,
+            bottom: (r.top + r.bottom + side) / 2,
+        };
+        draw_text(hdc, "\u{E721}", ir, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(hdc, old);
+        if empty {
+            // 提示文字：跟着输入的起点（左边距之后），垂直居中
+            let f = ui_font(scale);
+            let old2 = SelectObject(hdc, f.into());
+            SetTextColor(hdc, t.text_dim);
+            let tr = RECT {
+                left: (26.0 * scale).round() as i32,
+                top: r.top,
+                right: r.right - (8.0 * scale).round() as i32,
+                bottom: r.bottom,
+            };
+            draw_text(
+                hdc,
+                &app.search_hint(),
+                tr,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+            );
+            SelectObject(hdc, old2);
+        }
+        if hdc_in.is_none() {
+            let _ = ReleaseDC(Some(hwnd), hdc);
+        }
+    }
+}
+
 static mut ADDR_OLD: isize = 0;
 static mut SEARCH_OLD: isize = 0;
 static mut RENAME_OLD: isize = 0;
@@ -2134,6 +2470,13 @@ pub fn create_children(app: &mut App, instance: Option<HINSTANCE>) {
         app.hwnd_search = search;
         SEARCH_OLD = SetWindowLongPtrW(search, GWLP_WNDPROC, (search_proc as *const ()) as isize);
         set_edit_font(search, app.metrics.scale);
+        // 左边留出放大镜的位置（EC_LEFTMARGIN），否则输入的文字会压在图标下面
+        let _ = SendMessageW(
+            search,
+            EM_SETMARGINS,
+            Some(WPARAM((EC_LEFTMARGIN | EC_RIGHTMARGIN) as usize)),
+            Some(LPARAM(margins_for(app.metrics.scale))),
+        );
     }
 }
 
@@ -2242,6 +2585,14 @@ unsafe extern "system" fn addr_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
 
 unsafe extern "system" fn search_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let r = call_old(SEARCH_OLD, hwnd, msg, wparam, lparam);
+    // 放大镜和空态提示必须画在 EDIT **自己画完之后**：画在父窗口上会被 EDIT
+    // 的整块背景盖掉。WM_PRINT 那条分支是给 PrintWindow 用的（抓图验证走这条路，
+    // 它给子窗口发的是 WM_PRINT 而不是 WM_PAINT）。
+    if msg == WM_PAINT {
+        paint_search_decor(hwnd, None);
+    } else if msg == WM_PRINT || msg == WM_PRINTCLIENT {
+        paint_search_decor(hwnd, Some(HDC(wparam.0 as *mut core::ffi::c_void)));
+    }
     if msg == WM_KEYDOWN && wparam.0 as i32 == 0x0D {
         crate::on_search_enter();
         return LRESULT(0);

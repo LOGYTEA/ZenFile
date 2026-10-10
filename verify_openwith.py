@@ -2,7 +2,7 @@
 
 判定全用像素 + 窗口事实，不靠肉眼：
 
-  1) 点文件菜单第 1 行（「打开方式」）-> 弹出 `NexFileOpenWith`
+  1) 点文件菜单第 1 行（「打开方式」）-> 弹出 `ZenFileOpenWith`
      点**文件夹**菜单第 1 行（那时是「剪切」）-> 不弹出：说明这一行是文件专属
   2) 弹窗不是空板，标题/文件名都画出来了
   3) 列出 >= 2 个候选程序（列表区逐行墨迹条数）
@@ -63,7 +63,7 @@ g.GetDIBits.restype = ctypes.c_int
 g.GetDIBits.argtypes = [ctypes.c_void_p, wt.HBITMAP, ctypes.c_uint, ctypes.c_uint,
                         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
 
-EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\fm-app.exe"
+EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\ZenFile.exe"
 WM_LBUTTONDOWN, WM_LBUTTONUP = 0x0201, 0x0202
 WM_RBUTTONUP, WM_MOUSEMOVE = 0x0205, 0x0200
 
@@ -88,12 +88,12 @@ def mark(ok, msg):
 
 
 def launch(arg):
-    subprocess.run(["taskkill", "/F", "/IM", "fm-app.exe"], capture_output=True)
+    subprocess.run(["taskkill", "/F", "/IM", "ZenFile.exe"], capture_output=True)
     time.sleep(0.5)
     subprocess.Popen([EXE, arg])
     for _ in range(60):
         time.sleep(0.25)
-        hw = u.FindWindowW("NexFileMainWindow", None)
+        hw = u.FindWindowW("ZenFileMainWindow", None)
         if hw:
             time.sleep(1.5)
             return hw
@@ -264,7 +264,7 @@ def fresh_menu_row1(dir_path):
     time.sleep(0.3)
     u.PostMessageW(hw, WM_RBUTTONUP, 0, (sy << 16) | (300 & 0xFFFF))
     time.sleep(0.8)
-    ms = windows_of("NexFileMenu")
+    ms = windows_of("ZenFileMenu")
     if len(ms) != 1:
         return None
     return ms[0][0]
@@ -283,7 +283,7 @@ def click_menu_row1(dir_path, wait=4.0):
     click(mh, mw // 2, y)
     for _ in range(int(wait / 0.1)):
         time.sleep(0.1)
-        ws = windows_of("NexFileOpenWith")
+        ws = windows_of("ZenFileOpenWith")
         if ws:
             return ws[0][0]
     return None
@@ -292,7 +292,7 @@ def click_menu_row1(dir_path, wait=4.0):
 def wait_ow_class(timeout=1.2):
     t0 = time.time()
     while time.time() - t0 < timeout:
-        if windows_of("NexFileOpenWith"):
+        if windows_of("ZenFileOpenWith"):
             return True
         time.sleep(0.1)
     return False
@@ -304,17 +304,17 @@ print("右键「打开方式」：菜单项 + 自绘选择程序弹窗")
 # ---------------------------------------------------------------- 1. 只文件才有
 print("\n[1] 「打开方式」是文件专属的")
 ow = click_menu_row1(FDIR)
-mark(ow is not None, "点文件菜单第 1 行 -> 弹出 NexFileOpenWith")
+mark(ow is not None, "点文件菜单第 1 行 -> 弹出 ZenFileOpenWith")
 ow_dir = click_menu_row1(DDIR)
 mark(ow_dir is None, "点文件夹菜单第 1 行 -> 不弹出（那行是「剪切」）")
 if ow is None:
-    subprocess.run(["taskkill", "/F", "/IM", "fm-app.exe"], capture_output=True)
+    subprocess.run(["taskkill", "/F", "/IM", "ZenFile.exe"], capture_output=True)
     raise SystemExit(1)
 # 文件夹那次把窗口冲掉了，重新开一次
 ow = click_menu_row1(FDIR)
 mark(ow is not None, "重新弹出（后续检查用它）")
 if ow is None:
-    subprocess.run(["taskkill", "/F", "/IM", "fm-app.exe"], capture_output=True)
+    subprocess.run(["taskkill", "/F", "/IM", "ZenFile.exe"], capture_output=True)
     raise SystemExit(1)
 
 # ---------------------------------------------------------------- 2. 不是空板
@@ -434,6 +434,6 @@ if ow2:
     print(f"  关闭后新增窗口: {[(x[1], x[2][:30]) for x in extra][:4]}")
     mark(not extra, f"「取消」没有拉起任何程序（新增 {len(extra)} 个）")
 
-subprocess.run(["taskkill", "/F", "/IM", "fm-app.exe"], capture_output=True)
+subprocess.run(["taskkill", "/F", "/IM", "ZenFile.exe"], capture_output=True)
 print("\n" + "=" * 70)
 print("打开方式全部通过" if ok_all else "打开方式存在失败项")

@@ -43,8 +43,9 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// 大小列用什么单位显示。
 ///
-/// `Auto` 的规则是"以能表达这个大小的最小单位为准"：不足 1 MB 就一律用 KB
-/// （不再出现"512 字节"这种和 KB 混排的写法），不足 1 GB 用 MB，以此类推。
+/// 七个档位：自动 / B / KB / MB / GB / TB / PB。
+/// `Auto` 与资源管理器一致 —— 不足 1 KB 直接写"N 字节"（这就是"B"那一档），
+/// 之后每上一级换一个单位。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum SizeUnit {
     #[default]
@@ -53,52 +54,93 @@ pub enum SizeUnit {
     KB,
     MB,
     GB,
+    TB,
+    PB,
 }
 
 impl SizeUnit {
+    /// 设置页里循环切换的顺序。自动在最前（也是默认）。
+    pub const ALL: [SizeUnit; 7] = [
+        SizeUnit::Auto,
+        SizeUnit::Bytes,
+        SizeUnit::KB,
+        SizeUnit::MB,
+        SizeUnit::GB,
+        SizeUnit::TB,
+        SizeUnit::PB,
+    ];
+
     pub fn parse(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "bytes" | "b" => SizeUnit::Bytes,
             "kb" | "k" => SizeUnit::KB,
             "mb" | "m" => SizeUnit::MB,
             "gb" | "g" => SizeUnit::GB,
+            "tb" | "t" => SizeUnit::TB,
+            "pb" | "p" => SizeUnit::PB,
             _ => SizeUnit::Auto,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            SizeUnit::Auto => "auto",
+            SizeUnit::Bytes => "bytes",
+            SizeUnit::KB => "kb",
+            SizeUnit::MB => "mb",
+            SizeUnit::GB => "gb",
+            SizeUnit::TB => "tb",
+            SizeUnit::PB => "pb",
         }
     }
 
     pub fn label(&self) -> &'static str {
         match self {
-            SizeUnit::Auto => "自动（最小单位）",
-            SizeUnit::Bytes => "字节",
+            SizeUnit::Auto => "自动（B/KB/MB/GB/TB/PB）",
+            SizeUnit::Bytes => "字节（B）",
             SizeUnit::KB => "KB",
             SizeUnit::MB => "MB",
             SizeUnit::GB => "GB",
+            SizeUnit::TB => "TB",
+            SizeUnit::PB => "PB",
         }
     }
 
     /// 固定单位下的格式化。`Auto` 走自适应，其余一律换算到该单位（不足 1 也显示 0.x）。
     pub fn format(&self, bytes: u64) -> String {
-        const KB: f64 = 1024.0;
-        const MB: f64 = KB * 1024.0;
-        const GB: f64 = MB * 1024.0;
         let v = bytes as f64;
         match self {
             SizeUnit::Bytes => format!("{} 字节", bytes),
-            SizeUnit::KB => format!("{} KB", trim(v / KB)),
-            SizeUnit::MB => format!("{} MB", trim(v / MB)),
-            SizeUnit::GB => format!("{} GB", trim(v / GB)),
+            SizeUnit::KB => format!("{} KB", trim(v / KB_F)),
+            SizeUnit::MB => format!("{} MB", trim(v / MB_F)),
+            SizeUnit::GB => format!("{} GB", trim(v / GB_F)),
+            SizeUnit::TB => format!("{} TB", trim(v / TB_F)),
+            SizeUnit::PB => format!("{} PB", trim(v / PB_F)),
             SizeUnit::Auto => {
-                if v < MB {
-                    format!("{} KB", trim(v / KB))
-                } else if v < GB {
-                    format!("{} MB", trim(v / MB))
+                // 不足 1 KB 就写字节 —— 资源管理器的"912 字节"就是这一档
+                if v < KB_F {
+                    format!("{} 字节", bytes)
+                } else if v < MB_F {
+                    format!("{} KB", trim(v / KB_F))
+                } else if v < GB_F {
+                    format!("{} MB", trim(v / MB_F))
+                } else if v < TB_F {
+                    format!("{} GB", trim(v / GB_F))
+                } else if v < PB_F {
+                    format!("{} TB", trim(v / TB_F))
                 } else {
-                    format!("{} GB", trim(v / GB))
+                    format!("{} PB", trim(v / PB_F))
                 }
             }
         }
     }
 }
+
+pub const KB_F: f64 = 1024.0;
+pub const MB_F: f64 = KB_F * 1024.0;
+pub const GB_F: f64 = MB_F * 1024.0;
+pub const TB_F: f64 = GB_F * 1024.0;
+pub const PB_F: f64 = TB_F * 1024.0;
 
 /// 小数位：小于 10 保留 1 位、小于 100 保留 1 位、再大就取整 —— 与资源管理器一致，
 /// 避免"1.00 KB"这种多余的零。

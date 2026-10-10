@@ -52,7 +52,7 @@ g.GetDIBits.restype = ctypes.c_int
 g.GetDIBits.argtypes = [wt.HDC, wt.HBITMAP, ctypes.c_uint, ctypes.c_uint,
                         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
 
-EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\fm-app.exe"
+EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\ZenFile.exe"
 WM_LBUTTONDOWN, WM_LBUTTONUP = 0x0201, 0x0202
 WM_GETTEXT = 0x000D
 WM_KEYDOWN = 0x0100
@@ -76,12 +76,12 @@ def mark(ok, msg):
 
 
 def launch(arg):
-    subprocess.run(["taskkill", "/F", "/IM", "fm-app.exe"], capture_output=True)
+    subprocess.run(["taskkill", "/F", "/IM", "ZenFile.exe"], capture_output=True)
     time.sleep(0.5)
     subprocess.Popen([EXE, arg])
     for _ in range(60):
         time.sleep(0.25)
-        hw = u.FindWindowW("NexFileMainWindow", None)
+        hw = u.FindWindowW("ZenFileMainWindow", None)
         if hw:
             time.sleep(1.8)
             return hw
@@ -269,6 +269,6 @@ u.PostMessageW(ed, WM_KEYDOWN, 0x0D, 0x000C001)
 time.sleep(0.8)
 mark(not bool(u.IsWindowVisible(ed)), "回车之后收回面包屑（EDIT 重新隐藏）")
 
-subprocess.run(["taskkill", "/F", "/IM", "fm-app.exe"], capture_output=True)
+subprocess.run(["taskkill", "/F", "/IM", "ZenFile.exe"], capture_output=True)
 print("\n" + "=" * 70)
 print("地址栏全部通过" if ok_all else "地址栏存在失败项")

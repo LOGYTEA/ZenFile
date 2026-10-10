@@ -33,14 +33,14 @@ g.GetDIBits.argtypes = [wt.HDC, wt.HBITMAP, ctypes.c_uint, ctypes.c_uint,
 WM_LBUTTONUP = 0x0202
 
 # 自己拉起一个实例再测，别依赖"刚好有人开着一个窗口"
-EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\fm-app.exe"
-subprocess.run(["taskkill", "/F", "/IM", "fm-app.exe"], capture_output=True)
+EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\ZenFile.exe"
+subprocess.run(["taskkill", "/F", "/IM", "ZenFile.exe"], capture_output=True)
 time.sleep(0.6)
 subprocess.Popen([EXE, os.path.join(os.environ["USERPROFILE"], "Desktop")])
 hwnd = None
 for _ in range(80):
     time.sleep(0.25)
-    hwnd = u.FindWindowW("NexFileMainWindow", None)
+    hwnd = u.FindWindowW("ZenFileMainWindow", None)
     if hwnd:
         break
 assert hwnd, "找不到主窗口"
@@ -78,7 +78,7 @@ u.PostMessageW(hwnd, WM_LBUTTONUP, 0, (16 << 16) | (w - 44 * 4 + 20))
 menu = None
 for _ in range(30):
     time.sleep(0.1)
-    menu = u.FindWindowW("NexFileMenu", None)
+    menu = u.FindWindowW("ZenFileMenu", None)
     if menu:
         break
 print("2) 菜单弹出:", bool(menu))
@@ -90,7 +90,7 @@ u.PostMessageW(menu, WM_LBUTTONUP, 0, (142 << 16) | 40)
 time.sleep(0.8)
 after = nav_present()
 print("3) 点击「隐藏导航窗格」后取色:", after)
-print("   菜单已关闭:", not u.FindWindowW("NexFileMenu", None))
+print("   菜单已关闭:", not u.FindWindowW("ZenFileMenu", None))
 
 ok = after != "#191919"
 print("\n判定:", "PASS 侧栏已隐藏" if ok else "FAIL 侧栏仍在")

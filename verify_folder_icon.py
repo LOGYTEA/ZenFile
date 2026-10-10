@@ -54,7 +54,7 @@ sh.ExtractIconExW.restype = ctypes.c_uint
 sh.ExtractIconExW.argtypes = [ctypes.c_wchar_p, ctypes.c_int,
                               ctypes.POINTER(wt.HICON), ctypes.POINTER(wt.HICON), ctypes.c_uint]
 
-EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\fm-app.exe"
+EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\ZenFile.exe"
 WM_GETTEXT = 0x000D
 
 # 素材一律落在 TEMP：测试脚本不许往用户桌面写东西
@@ -227,7 +227,7 @@ def addr_text(hwnd):
 
 
 def kill_all():
-    subprocess.run(["taskkill", "/F", "/IM", "fm-app.exe"], capture_output=True)
+    subprocess.run(["taskkill", "/F", "/IM", "ZenFile.exe"], capture_output=True)
     time.sleep(0.6)
 
 
@@ -238,7 +238,7 @@ def run(base, expect, title):
     hwnd = None
     for _ in range(80):
         time.sleep(0.25)
-        hwnd = u.FindWindowW("NexFileMainWindow", None)
+        hwnd = u.FindWindowW("ZenFileMainWindow", None)
         if hwnd:
             break
     if not hwnd:
@@ -290,7 +290,7 @@ if __name__ == "__main__":
     # 才认 desktop.ini）。第九轮新增的"受保护的系统文件"开关默认关闭，会把它们
     # 全部过滤掉 —— 这个测试要显式打开该开关，否则测不到图标，只测到了过滤器。
     import json as _json
-    _cfg = os.path.join(os.environ.get("APPDATA", ""), "NexFile", "settings.user.json")
+    _cfg = os.path.join(os.environ.get("APPDATA", ""), "ZenFile", "settings.user.json")
     os.makedirs(os.path.dirname(_cfg), exist_ok=True)
     with open(_cfg, "w", encoding="utf-8") as _f:
         _json.dump({"files": {"view": {"show_system": True, "show_hidden": True}}}, _f)

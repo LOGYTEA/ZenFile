@@ -57,7 +57,7 @@ MEM_COMMIT, MEM_RESERVE, MEM_RELEASE = 0x1000, 0x2000, 0x8000
 PAGE_READWRITE = 0x04
 PROCESS_ALL = 0x1F0FFF
 
-EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\fm-app.exe"
+EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\ZenFile.exe"
 
 VIEW_LEFT, VIEW_TOP = 157, 74
 WIN_W = 1180
@@ -118,7 +118,7 @@ subprocess.Popen([EXE])
 hwnd = None
 for _ in range(60):
     time.sleep(0.25)
-    hwnd = u.FindWindowW("NexFileMainWindow", None)
+    hwnd = u.FindWindowW("ZenFileMainWindow", None)
     if hwnd:
         break
 assert hwnd

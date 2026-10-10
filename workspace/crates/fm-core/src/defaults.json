@@ -33,7 +33,7 @@
   "ui": {
     "statusbar_visible": true,
     "sidebar_visible": true,
-    "sidebar_width": 200,
+    "sidebar_width": 157,
     "titlebar_height": 36,
     "sidebar_follow_current": false,
     "sidebar_thispc_expanded": true,
@@ -51,7 +51,11 @@
       "show_extensions": true,
       "size_unit": "auto",
       "sort_key": "name",
-      "sort_descending": false
+      "sort_descending": false,
+      "col_name_w": 274,
+      "col_date_w": 144,
+      "col_kind_w": 120,
+      "col_size_w": 80
     },
     "operations": {
       "mode": "shell",

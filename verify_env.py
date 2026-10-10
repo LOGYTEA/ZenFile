@@ -4,8 +4,8 @@
 
 脚本为了构造场景（比如"隐藏的项目=开"），会直接改写：
 
-    %APPDATA%\\NexFile\\settings.json        <- 应用层（图形设置页写的就是它）
-    %APPDATA%\\NexFile\\settings.user.json   <- 覆盖层（优先级最高）
+    %APPDATA%\\ZenFile\\settings.json        <- 应用层（图形设置页写的就是它）
+    %APPDATA%\\ZenFile\\settings.user.json   <- 覆盖层（优先级最高）
 
 跑完不还原，用户下次打开软件就带着脚本遗留的状态跑。实测后果：verify_round10
 把 `default_mode` 留在了 `list`，于是之后所有文件夹都采用列表视图 —— 列表视图
@@ -22,7 +22,7 @@
 import atexit
 import os
 
-CFG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "NexFile")
+CFG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "ZenFile")
 FILES = ("settings.json", "settings.user.json")
 
 _saved = {}

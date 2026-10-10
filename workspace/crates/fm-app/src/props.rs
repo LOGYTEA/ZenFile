@@ -283,7 +283,7 @@ impl Props {
 }
 
 pub fn register_props_class() {
-    let cls = HSTRING::from("NexFileProps");
+    let cls = HSTRING::from("ZenFileProps");
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
         lpfnWndProc: Some(props_proc),
@@ -387,7 +387,7 @@ pub fn open(app_ptr: *mut App, path: PathBuf) {
         custom_icon: HICON::default(),
     }));
 
-    let cls = HSTRING::from("NexFileProps");
+    let cls = HSTRING::from("ZenFileProps");
     let hwnd = unsafe {
         CreateWindowExW(
             windows::Win32::UI::WindowsAndMessaging::WS_EX_WINDOWEDGE,
@@ -1664,7 +1664,7 @@ static COMBO_CLASS: std::sync::Once = std::sync::Once::new();
 
 fn register_combo_class() {
     COMBO_CLASS.call_once(|| {
-        let cls = HSTRING::from("NexFilePropsCombo");
+        let cls = HSTRING::from("ZenFilePropsCombo");
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(combo_proc),
@@ -1697,7 +1697,7 @@ fn open_combo(
         scale,
         theme,
     }));
-    let cls = HSTRING::from("NexFilePropsCombo");
+    let cls = HSTRING::from("ZenFilePropsCombo");
     let hwnd = unsafe {
         CreateWindowExW(
             windows::Win32::UI::WindowsAndMessaging::WS_EX_TOPMOST,

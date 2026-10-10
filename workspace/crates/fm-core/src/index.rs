@@ -6,7 +6,7 @@
 //!
 //! 这里换一条不需要提权的路，效果接近：
 //!   * 首次搜索时后台把整个卷**遍历一次**，把"文件名 + 父目录 + 大小/时间"写进一个
-//!     紧凑的二进制缓存（`%LOCALAPPDATA%\NexFile\index\C.bin`）；
+//!     紧凑的二进制缓存（`%LOCALAPPDATA%\ZenFile\index\C.bin`）；
 //!   * 之后再搜索就直接在这个缓存里做子串匹配 —— 全卷上百万条也是毫秒级；
 //!   * 缓存只是加速手段：没有它、或它过期/损坏时回退到现地递归搜索，结果一样。
 //!
@@ -257,7 +257,7 @@ impl Index {
         })
     }
 
-    /// 缓存文件路径。`C:\` → `%LOCALAPPDATA%\NexFile\index\C.bin`
+    /// 缓存文件路径。`C:\` → `%LOCALAPPDATA%\ZenFile\index\C.bin`
     pub fn cache_path(root: &str) -> Option<PathBuf> {
         let letter = root
             .trim_end_matches('\\')
@@ -265,7 +265,7 @@ impl Index {
             .next()
             .filter(|c| c.is_ascii_alphabetic())?;
         let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from)?;
-        Some(base.join("NexFile").join("index").join(format!("{}.bin", letter.to_ascii_uppercase())))
+        Some(base.join("ZenFile").join("index").join(format!("{}.bin", letter.to_ascii_uppercase())))
     }
 
     pub fn save(&self) -> std::io::Result<()> {

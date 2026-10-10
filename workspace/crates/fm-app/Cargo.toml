@@ -1,6 +1,6 @@
 [package]
 name = "fm-app"
-description = "NexFile 资源管理器主体进程：自绘外壳 + 文件视图"
+description = "ZenFile 资源管理器主体进程：自绘外壳 + 文件视图"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,7 +8,7 @@ authors.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "fm-app"
+name = "ZenFile"
 path = "src/main.rs"
 
 [dependencies]

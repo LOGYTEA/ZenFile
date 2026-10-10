@@ -46,7 +46,7 @@ g.GetDIBits.restype = ctypes.c_int
 g.GetDIBits.argtypes = [ctypes.c_void_p, wt.HBITMAP, ctypes.c_uint, ctypes.c_uint,
                         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
 
-EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\fm-app.exe"
+EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\ZenFile.exe"
 WM_LBUTTONDOWN, WM_LBUTTONUP = 0x0201, 0x0202
 WM_COMMAND = 0x0111
 READONLY, HIDDEN, ARCHIVE, SYSTEM = 0x1, 0x2, 0x20, 0x4
@@ -75,12 +75,12 @@ def mark(ok, msg):
 
 
 def launch(arg):
-    subprocess.run(["taskkill", "/F", "/IM", "fm-app.exe"], capture_output=True)
+    subprocess.run(["taskkill", "/F", "/IM", "ZenFile.exe"], capture_output=True)
     time.sleep(0.5)
     subprocess.Popen([EXE, arg])
     for _ in range(60):
         time.sleep(0.25)
-        hw = u.FindWindowW("NexFileMainWindow", None)
+        hw = u.FindWindowW("ZenFileMainWindow", None)
         if hw:
             time.sleep(1.8)
             return hw
@@ -90,7 +90,7 @@ def launch(arg):
 def find_props(timeout=8.0):
     t0 = time.time()
     while time.time() - t0 < timeout:
-        hw = u.FindWindowW("NexFileProps", None)
+        hw = u.FindWindowW("ZenFileProps", None)
         if hw:
             return hw
         time.sleep(0.1)
@@ -262,7 +262,7 @@ def open_props(dir_path, row_pref=1, nrow_first=7):
     time.sleep(0.3)
     u.PostMessageW(hw, 0x0205, 0, (sel_y << 16) | (300 & 0xFFFF))  # WM_RBUTTONUP
     time.sleep(0.7)
-    menus = windows_of("NexFileMenu")
+    menus = windows_of("ZenFileMenu")
     if len(menus) != 1:
         return None
     mh, _mx, _my, mw, mhh = menus[0]
@@ -281,7 +281,7 @@ def open_props(dir_path, row_pref=1, nrow_first=7):
         u.PostMessageW(mh, WM_LBUTTONUP, 0, (yy << 16) | ((mw // 2) & 0xFFFF))
         for _ in range(200):
             time.sleep(0.005)
-            p = windows_of("NexFileProps")
+            p = windows_of("ZenFileProps")
             if p:
                 print(f"  点中「属性」（菜单内 y={yy}）")
                 return p[0][0]
@@ -297,7 +297,7 @@ pw = open_props(FDIR, 0)
 mark(pw is not None, "属性窗口能打开")
 if pw is None:
     print("  无法继续")
-    subprocess.run(["taskkill", "/F", "/IM", "fm-app.exe"], capture_output=True)
+    subprocess.run(["taskkill", "/F", "/IM", "ZenFile.exe"], capture_output=True)
     raise SystemExit(1)
 
 # 窗口刚 ShowWindow 出来时第一帧可能还没画：PrintWindow 会抓到空板（踩过）
@@ -348,7 +348,7 @@ print("\n[2] 标签页（文件夹：常规/安全/自定义/详细信息）")
 pw = open_props(CDIR, 0, 6)  # 文件夹：第一组 6 行（没有「打开方式」）
 mark(pw is not None, "文件夹的属性窗口打开")
 if pw is None:
-    subprocess.run(["taskkill", "/F", "/IM", "fm-app.exe"], capture_output=True)
+    subprocess.run(["taskkill", "/F", "/IM", "ZenFile.exe"], capture_output=True)
     raise SystemExit(1)
 for _ in range(8):
     raw0, stride, W, H = grab(pw)
@@ -424,7 +424,7 @@ time.sleep(0.4)
 # 点下拉框 -> 弹出自绘 combo -> 点第 3 项（图片）
 click(pw, 120, CONTENT_TOP + 43)
 time.sleep(0.6)
-combo_hw = u.FindWindowW("NexFilePropsCombo", None)
+combo_hw = u.FindWindowW("ZenFilePropsCombo", None)
 print(f"  下拉弹出窗口: {combo_hw}")
 mark(combo_hw is not None, "点下拉框弹出了选择列表")
 if combo_hw:
@@ -458,7 +458,7 @@ if os.path.exists(ini_path):
 else:
     mark(False, "desktop.ini 没有被创建")
 
-subprocess.run(["taskkill", "/F", "/IM", "fm-app.exe"], capture_output=True)
+subprocess.run(["taskkill", "/F", "/IM", "ZenFile.exe"], capture_output=True)
 # 清理：把 material 上的属性摘掉再删，不然 rmtree 会 PermissionError
 for p in (ini_path, TARGET, os.path.join(DIRT, "inner.txt")):
     if os.path.exists(p):

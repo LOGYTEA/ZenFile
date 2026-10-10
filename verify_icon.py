@@ -1,4 +1,4 @@
-"""把 NexFile 列表里的文件夹图标与真实资源管理器的文件夹图标做 16x16 逐像素对比。"""
+"""把 ZenFile 列表里的文件夹图标与真实资源管理器的文件夹图标做 16x16 逐像素对比。"""
 import ctypes
 import ctypes.wintypes as wt
 import struct
@@ -88,18 +88,18 @@ def shape(at, x, y, bg):
     return out
 
 
-# --- NexFile ---
-hw = u.FindWindowW("NexFileMainWindow", None)
+# --- ZenFile ---
+hw = u.FindWindowW("ZenFileMainWindow", None)
 raw, w, h = grab(hw)
 at = mk(raw, w, h)
 res = find_folder_icon(raw, w, h, 157, 400, 100, 500)
 if not res:
-    print("NexFile 未找到文件夹图标")
+    print("ZenFile 未找到文件夹图标")
     sys.exit(1)
 n, nx, ny = res
 bg_n = at(nx - 6, ny)
 s_n = shape(at, nx, ny, bg_n)
-print(f"NexFile 文件夹图标 @({nx},{ny}) 命中 {n}/256")
+print(f"ZenFile 文件夹图标 @({nx},{ny}) 命中 {n}/256")
 for l in s_n:
     print("  " + l)
 

@@ -4,7 +4,7 @@
 
   1) F2 -> 出现内联编辑框 -> 打新名 -> 回车 -> **磁盘上真的改名了**
   2) 文件右键菜单第 5 行是「批量重命名」，悬停能展开出 5 个模式
-  3) 点「查找并替换」-> 弹出 `NexFileRename`，不是空板，预览区有行
+  3) 点「查找并替换」-> 弹出 `ZenFileRename`，不是空板，预览区有行
   4) 往两个输入框写字 -> 点「重命名」-> **三个文件一起改了名**
   5) 制造重名冲突 -> 「重命名」按钮不可用，点了磁盘不变（不能改一半）
   6) 「取消」不改任何东西
@@ -67,7 +67,7 @@ g.GetDIBits.restype = ctypes.c_int
 g.GetDIBits.argtypes = [ctypes.c_void_p, wt.HBITMAP, ctypes.c_uint, ctypes.c_uint,
                         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
 
-EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\fm-app.exe"
+EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\ZenFile.exe"
 WM_LBUTTONDOWN, WM_LBUTTONUP = 0x0201, 0x0202
 WM_RBUTTONUP, WM_MOUSEMOVE, WM_KEYDOWN = 0x0205, 0x0200, 0x0100
 WM_SETTEXT = 0x000C
@@ -111,12 +111,12 @@ def type_into(hwnd, text):
 
 
 def launch(arg):
-    subprocess.run(["taskkill", "/F", "/IM", "fm-app.exe"], capture_output=True)
+    subprocess.run(["taskkill", "/F", "/IM", "ZenFile.exe"], capture_output=True)
     time.sleep(0.5)
     subprocess.Popen([EXE, arg])
     for _ in range(60):
         time.sleep(0.25)
-        hw = u.FindWindowW("NexFileMainWindow", None)
+        hw = u.FindWindowW("ZenFileMainWindow", None)
         if hw:
             time.sleep(1.5)
             return hw
@@ -287,7 +287,7 @@ def fresh_menu(dir_path, select_all=True):
     sy = (bs[0][0] + bs[0][1]) // 2
     u.PostMessageW(hw, WM_RBUTTONUP, 0, (sy << 16) | (300 & 0xFFFF))
     time.sleep(0.9)
-    ms = windows_of("NexFileMenu")
+    ms = windows_of("ZenFileMenu")
     if len(ms) != 1:
         return hw, None
     return hw, ms[0][0]
@@ -326,13 +326,13 @@ print("\n[2] 右键菜单里的「批量重命名 ▸」下拉")
 hw, mh = fresh_menu(BULK)
 mark(mh is not None, "右键菜单弹出")
 if mh is None:
-    subprocess.run(["taskkill", "/F", "/IM", "fm-app.exe"], capture_output=True)
+    subprocess.run(["taskkill", "/F", "/IM", "ZenFile.exe"], capture_output=True)
     raise SystemExit(1)
 mw, mhh, top0, row_h = menu_geom(mh)
 print(f"  菜单 {mw}x{mhh}，内容顶 {top0}，行高 {row_h}")
 y5 = int(top0 + 5 * row_h + row_h / 2)
 move(mh, mw // 2, y5)
-subs = windows_of("NexFileMenu")
+subs = windows_of("ZenFileMenu")
 print(f"  悬停第 5 行后菜单窗口 {len(subs)} 个")
 mark(len(subs) >= 2, "悬停「批量重命名」展开了下级菜单")
 child = None
@@ -353,13 +353,13 @@ if child:
     click(child, cw // 2, int(ctop + crow / 2))
     for _ in range(40):
         time.sleep(0.1)
-        ws = windows_of("NexFileRename")
+        ws = windows_of("ZenFileRename")
         if ws:
             rn = ws[0][0]
             break
-mark(rn is not None, "弹出 NexFileRename 窗口")
+mark(rn is not None, "弹出 ZenFileRename 窗口")
 if rn is None:
-    subprocess.run(["taskkill", "/F", "/IM", "fm-app.exe"], capture_output=True)
+    subprocess.run(["taskkill", "/F", "/IM", "ZenFile.exe"], capture_output=True)
     raise SystemExit(1)
 for _ in range(8):
     raw, stride, W, H = grab(rn)
@@ -412,7 +412,7 @@ hw, mh = fresh_menu(CONF)
 mw, mhh, top0, row_h = menu_geom(mh)
 move(mh, mw // 2, int(top0 + 5 * row_h + row_h / 2))
 time.sleep(0.6)
-subs = windows_of("NexFileMenu")
+subs = windows_of("ZenFileMenu")
 child = min(subs, key=lambda m: m[4])[0] if len(subs) >= 2 else None
 mark(child is not None, "第二次也展开了下级菜单")
 if child:
@@ -421,7 +421,7 @@ if child:
     rn = None
     for _ in range(40):
         time.sleep(0.1)
-        ws = windows_of("NexFileRename")
+        ws = windows_of("ZenFileRename")
         if ws:
             rn = ws[0][0]
             break
@@ -456,9 +456,9 @@ if child:
         CNC = (Wc - SC(14) - SC(112), Wc - SC(14), Hc - SC(46), Hc - SC(46) + SC(28))
         click(rn, (CNC[0] + CNC[1]) // 2, (CNC[2] + CNC[3]) // 2)
         time.sleep(0.8)
-        mark(not windows_of("NexFileRename"), "点「取消」关掉了窗口")
+        mark(not windows_of("ZenFileRename"), "点「取消」关掉了窗口")
 
-subprocess.run(["taskkill", "/F", "/IM", "fm-app.exe"], capture_output=True)
+subprocess.run(["taskkill", "/F", "/IM", "ZenFile.exe"], capture_output=True)
 shutil.rmtree(BASE, ignore_errors=True)
 print("\n" + "=" * 70)
 print("重命名全部通过" if ok_all else "重命名存在失败项")
