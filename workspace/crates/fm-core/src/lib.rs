@@ -15,6 +15,7 @@
 
 pub mod clipboard;
 pub mod config;
+pub mod drives;
 pub mod engine;
 pub mod error;
 pub mod hotkey;

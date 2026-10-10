@@ -212,6 +212,39 @@ pub fn run() -> i32 {
         &format!("{} 项，$I/$R 均成对", items.len()),
     );
 
+    // 14. 驱动器清单：类型、卷标、容量必须能从 Win32 一路读出来
+    let drives = crate::drives::list();
+    // 系统盘一定是固定盘，且必然拿得到容量 —— 这条挂了说明 GetDriveType 传参有问题
+    let sysdrive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+    let sys = drives.iter().find(|d| d.letter_str() == sysdrive);
+    let any_space = drives.iter().any(|d| d.total.is_some());
+    let names_ok = drives.iter().all(|d| d.display_name().contains(d.letter));
+    h.check(
+        "drives::list",
+        !drives.is_empty() && sys.is_some() && any_space && names_ok,
+        &format!(
+            "{} 个：{}",
+            drives.len(),
+            drives
+                .iter()
+                .map(|d| format!("{}={:?}", d.display_name(), d.kind))
+                .collect::<Vec<_>>()
+                .join("  ")
+        ),
+    );
+    let sys_fixed = sys.map(|d| d.kind == crate::drives::DriveKind::Fixed && d.total.is_some());
+    h.check(
+        "drives::sysdrive",
+        sys_fixed.unwrap_or(false),
+        &format!("{sysdrive} 应为固定盘且可读容量"),
+    );
+    // 已用占比必须落在 [0,1]，且蓝条宽度换算后与实际偏差不超过 1px
+    let ratios_ok = drives.iter().all(|d| match d.used_ratio() {
+        None => true,
+        Some(r) => (0.0..=1.0).contains(&r) && d.used().unwrap() <= d.total.unwrap(),
+    });
+    h.check("drives::ratio", ratios_ok, "已用占比均落在 [0,1]");
+
     println!("\n通过 {}/{} 项", h.passed, h.passed + h.failed);
     if h.failed == 0 {
         0

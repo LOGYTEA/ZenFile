@@ -319,6 +319,34 @@ impl IconCache {
     }
 }
 
+/// 系统库存图标（`SHGetStockIconInfo`），按 SIID 缓存。
+///
+/// 回收站、控制面板这类目标**没有真实路径**，问不到 Shell 关联图标，只能走
+/// 库存图标。句柄由本进程持有，缓存常驻，不销毁（数量个位数，可忽略）。
+static mut STOCK: Option<Vec<(i32, bool, HICON)>> = None;
+
+pub fn stock_icon(siid: i32, large: bool) -> Option<HICON> {
+    unsafe {
+        let cache = STOCK.get_or_insert_with(Vec::new);
+        if let Some((_, _, h)) = cache.iter().find(|(s, l, _)| *s == siid && *l == large) {
+            return Some(*h);
+        }
+        use windows::Win32::UI::Shell::{
+            SHGetStockIconInfo, SHGSI_ICON, SHGSI_LARGEICON, SHGSI_SMALLICON, SHSTOCKICONID,
+            SHSTOCKICONINFO,
+        };
+        let mut sii: SHSTOCKICONINFO = std::mem::zeroed();
+        sii.cbSize = std::mem::size_of::<SHSTOCKICONINFO>() as u32;
+        let flags = SHGSI_ICON | if large { SHGSI_LARGEICON } else { SHGSI_SMALLICON };
+        let ok = SHGetStockIconInfo(SHSTOCKICONID(siid), flags, &mut sii);
+        if ok.is_err() || sii.hIcon.0.is_null() {
+            return None;
+        }
+        cache.push((siid, large, sii.hIcon));
+        Some(sii.hIcon)
+    }
+}
+
 /// 供 C 字符串与 Win32 互操作的小工具。
 pub(crate) fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()

@@ -434,6 +434,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             if wparam.0 == TIMER_DRAIN {
                 let app = &mut *app_ptr;
                 app.drain();
+                // 首页是虚拟视图，拿不到目录变更通知 —— 拷完一个大文件之后
+                // 容量条会一直停在旧数值上（看着就是"条不准"）。这里做兜底刷新。
+                if app.tick_refresh_home() {
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                }
                 if let Some(stats) = &app.transfer {
                     if stats.lock().map(|s| s.finished).unwrap_or(true) {
                         app.transfer = None;
@@ -442,6 +447,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 }
             }
             LRESULT(0)
+        }
+        // U 盘插拔 / 光驱换盘：盘符集合变了，驱动器清单与当前视图都要重取。
+        // 顶部窗口收到的是 WM_DEVICECHANGE 的 DBT_DEVICEARRIVAL/REMOVAL 分支，
+        // 这里不区分具体事件类型 —— 重取一次的代价远低于两边列表不一致。
+        WM_DEVICECHANGE => {
+            let app = &mut *app_ptr;
+            app.refresh_drives();
+            app.reload();
+            let _ = InvalidateRect(Some(hwnd), None, true);
+            LRESULT(1)
         }
         WM_COMMAND => {
             let source = (wparam.0 & 0xFFFF) as i32;
@@ -495,17 +510,25 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             } else {
                 None
             };
+            // 导航窗格悬停行
+            let hover_sidebar = if app.cfg.ui.sidebar_visible {
+                paint::sidebar_hit(app, &l, x, y, app.metrics.scale).map(|(i, _)| i)
+            } else {
+                None
+            };
             if in_close != app.hovering_close
                 || chrome != app.hover_chrome
                 || hover_tab != app.hover_tab
                 || hover_view != app.hover_view_btn
                 || hover_setting != app.settings_hover
+                || hover_sidebar != app.sidebar_hover
             {
                 app.hovering_close = in_close;
                 app.hover_chrome = chrome;
                 app.hover_tab = hover_tab;
                 app.hover_view_btn = hover_view;
                 app.settings_hover = hover_setting;
+                app.sidebar_hover = hover_sidebar;
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
             LRESULT(0)
@@ -664,6 +687,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             }
             if app.cfg.ui.sidebar_visible && x < l.sidebar.right && y > l.sidebar.top {
                 if sidebar_click(app, x, y) {
+                    // 必须重画：点箭头只改树的状态，不像 navigate 那样自己会触发
+                    // 重绘。少了这一句，展开/收起看起来就是"点了没反应"。
+                    let _ = InvalidateRect(Some(hwnd), None, true);
                     return LRESULT(0);
                 }
             }
@@ -893,6 +919,17 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 app.cfg.ui.sidebar_visible,
                 app.cfg.ui.statusbar_visible,
             );
+            // 光标在导航窗格里时滚轮滚的是**树**，不是右边的文件列表 ——
+            // 否则展开几层之后树就再也滚不出来了。
+            let mut pt = windows::Win32::Foundation::POINT {
+                x: (lparam.0 & 0xFFFF) as i16 as i32,
+                y: (lparam.0 >> 16) as i16 as i32,
+            };
+            unsafe { let _ = ScreenToClient(hwnd, &mut pt); }
+            if app.cfg.ui.sidebar_visible && pt.x < l.sidebar.right {
+                app.scroll_sidebar(delta / 2, &l);
+                return LRESULT(0);
+            }
             {
                 let tab = app.tab_mut();
                 tab.scroll -= delta / 2;
@@ -1055,7 +1092,8 @@ unsafe fn run_caption(hwnd: HWND, which: u8) {
 /// 设置页里某一行的点击翻译成命令。
 fn settings_command(action: u32) -> Option<menu::Command> {
     use paint::{
-        SET_EXT, SET_HIDDEN, SET_SIDEBAR, SET_STATUS, SET_SYSTEM, SET_THEME, SET_UNIT, SET_VIEW,
+        SET_EXT, SET_FOLLOW, SET_HIDDEN, SET_SIDEBAR, SET_STATUS, SET_SYSTEM, SET_THEME,
+        SET_THISPC, SET_UNIT, SET_VIEW,
     };
     match action {
         SET_HIDDEN => Some(menu::Command::ToggleHidden),
@@ -1065,6 +1103,8 @@ fn settings_command(action: u32) -> Option<menu::Command> {
         SET_THEME => Some(menu::Command::CycleTheme),
         SET_VIEW => Some(menu::Command::CycleDefaultView),
         SET_SIDEBAR => Some(menu::Command::ToggleSidebar),
+        SET_FOLLOW => Some(menu::Command::ToggleFollowCurrent),
+        SET_THISPC => Some(menu::Command::ToggleThispcExpanded),
         SET_STATUS => Some(menu::Command::ToggleStatusbar),
         _ => None,
     }
@@ -1189,22 +1229,30 @@ fn sidebar_click(app: &mut App, x: i32, y: i32) -> bool {
         app.cfg.ui.sidebar_visible,
         app.cfg.ui.statusbar_visible,
     );
-    // 行高必须与绘制端同一个函数算，否则改了字体/行高后点击就点偏了
-    let row = paint::sidebar_row_h(app.metrics.scale);
-    let mut top = l.sidebar.top + row;
-    for (_, target) in paint::sidebar_entries() {
-        if y >= top && y < top + row && x < l.sidebar.right {
-            if target.is_empty() {
-                app.navigate(PathBuf::from(app::HOME_PATH));
-            } else {
-                app.navigate(PathBuf::from(target));
-            }
-            paint::sync_address(app);
-            return true;
-        }
-        top += row;
+    // 命中判定复用绘制端那一份排列（`App::sidebar_rows`），不在这里重算 ——
+    // 树会展开/收起，本地再算一遍必然和画出来的行错位。
+    let hit = paint::sidebar_hit(app, &l, x, y, app.metrics.scale);
+    let Some((index, on_chevron)) = hit else { return false };
+    let row = app.sidebar_rows().get(index).cloned();
+    let Some(row) = row else { return false };
+    if on_chevron {
+        // 点箭头：只动树，不换目录（资源管理器就是这个语义）
+        app.toggle_sidebar_node(&row.key);
+        // 收起之后整棵树变短了，滚动偏移要跟着收回去，否则会停在空白区
+        app.clamp_sidebar_scroll(&l);
+        return true;
     }
-    false
+    // 点行：导航过去；可展开的节点顺手展开，省一次点击
+    if row.expandable && !row.expanded {
+        app.toggle_sidebar_node(&row.key);
+    }
+    if row.target.is_empty() {
+        app.navigate(PathBuf::from(app::HOME_PATH));
+    } else {
+        app.navigate(PathBuf::from(&row.target));
+    }
+    paint::sync_address(app);
+    true
 }
 
 fn handle_key(app: &mut App, key: i32) {

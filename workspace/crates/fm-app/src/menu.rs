@@ -80,6 +80,10 @@ pub enum Command {
     SortBySize,
     ToggleSidebar,
     ToggleStatusbar,
+    /// 导航窗格"跟随展开到当前文件夹"
+    ToggleFollowCurrent,
+    /// "此电脑"节点是否默认展开到盘符
+    ToggleThispcExpanded,
     /// 显示/隐藏"隐藏的项目"（FILE_ATTRIBUTE_HIDDEN）
     ToggleHidden,
     /// 显示/隐藏"受保护的操作系统文件"（FILE_ATTRIBUTE_SYSTEM）
@@ -391,6 +395,16 @@ struct MenuWindow {
     parent_menu: Option<HWND>,
     /// 本窗口是被父菜单的第几项展开的（顶层菜单为 None）。
     opened_by: Option<usize>,
+    /// 本窗口弹出那一刻光标的**屏幕坐标**。
+    ///
+    /// 菜单一 `SetCapture`，系统会按"光标当前所在位置"补发一条 WM_MOUSEMOVE。
+    /// 那条消息不是用户操作 —— 光标其实还停在原处没动过（通常在父菜单那一行上，
+    /// 或干脆在屏幕别处）。照它处理会有两个后果：
+    ///   1. 子菜单认为"用户把鼠标移回父菜单了" → 刚弹出就把自己关掉，
+    ///      于是"悬停展开"时灵时不灵（灵不灵取决于物理光标当时在哪）；
+    ///   2. 顶层菜单会把完全不相关的某一行点亮。
+    /// 因此：位置与弹出时相同、且不在本菜单内的那条消息一律丢弃。
+    open_pos: Option<(i32, i32)>,
     /// 本窗口里已经有条目被真正执行（用于决定销毁时是否级联关闭父菜单）。
     activated: bool,
 }
@@ -475,6 +489,7 @@ pub fn open_menu(
         open_submenu_for: None,
         parent_menu,
         opened_by: None,
+        open_pos: None,
         activated: false,
     }));
 
@@ -499,6 +514,12 @@ pub fn open_menu(
         let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         let _ = SetCapture(hwnd);
+        // SetCapture 之后系统会按光标当前位置补发一条 WM_MOUSEMOVE —— 记下此刻位置，
+        // 好把那条"不是用户操作"的消息认出来（见 MenuWindow::open_pos 的说明）。
+        let mut cur = POINT::default();
+        if windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut cur).is_ok() {
+            (*state).open_pos = Some((cur.x, cur.y));
+        }
         let _ = InvalidateRect(Some(hwnd), None, true);
     }
     Some(hwnd)
@@ -626,6 +647,14 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         WM_MOUSEMOVE => {
             let y = (lparam.0 >> 16) as i16 as i32;
             let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            // 丢弃"弹出瞬间由系统补发"的那条鼠标移动（位置与弹出时完全相同，且不在本菜单内）
+            if let Some((ox, oy)) = state.open_pos.take() {
+                let mut sp = POINT { x, y };
+                let _ = ClientToScreen(hwnd, &mut sp);
+                if sp.x == ox && sp.y == oy && !inside_popup(state, x, y) {
+                    return LRESULT(0);
+                }
+            }
             // 子菜单弹出后由**子菜单**持有 capture，本窗口就再也收不到 WM_MOUSEMOVE。
             // 于是鼠标移回父菜单时高亮会一直卡在展开子菜单的那一项上。这里让子菜单在
             // 光标越过自己左边界时把 capture 交还回来，并附带上屏幕坐标重算高亮。
@@ -752,7 +781,9 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             }
             if let Some(idx) = entry_at(state, y) {
                 let entry = state.entries[idx].clone();
-                activate(state, hwnd, &entry);
+                // 把命中的下标一起传进去：子菜单定位不能依赖 hover
+                // （hover 可能被"弹出瞬间那条补发消息"左右，也可能还没更新）。
+                activate_at(state, hwnd, idx, &entry);
             }
             LRESULT(0)
         }
@@ -880,7 +911,8 @@ fn open_submenu_at(state: &mut MenuWindow, hwnd: HWND, index: usize) {
     }
 }
 
-fn activate(state: &mut MenuWindow, hwnd: HWND, entry: &MenuEntry) {
+/// 执行第 `index` 项。`index` 由调用方从命中判定直接给出，不再依赖 `hover`。
+fn activate_at(state: &mut MenuWindow, hwnd: HWND, index: usize, entry: &MenuEntry) {
     if entry.disabled {
         return;
     }
@@ -888,6 +920,18 @@ fn activate(state: &mut MenuWindow, hwnd: HWND, entry: &MenuEntry) {
         // 点击带子菜单的项：沿用与悬停展开完全相同的定位逻辑。
         // （原来这里用 `std::ptr::eq` 在 entries 里找自己，而 entry 是 clone 出来的，
         //   地址永远不相等 → 定位恒失败，子菜单总是弹在菜单顶部第一行。）
+        open_submenu_at(state, hwnd, index);
+        return;
+    }
+    activate(state, hwnd, entry)
+}
+
+fn activate(state: &mut MenuWindow, hwnd: HWND, entry: &MenuEntry) {
+    if entry.disabled {
+        return;
+    }
+    if entry.has_submenu && !entry.submenu.is_empty() {
+        // 兜底：拿不到下标时（键盘回车）退回用 hover
         if let Some(i) = state.hover {
             if state.entries[i].has_submenu {
                 open_submenu_at(state, hwnd, i);

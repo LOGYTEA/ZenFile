@@ -200,6 +200,47 @@ pub fn strip_verbatim(p: &Path) -> PathBuf {
     }
 }
 
+/// 查询 Shell 已知文件夹的真实路径（`Desktop` / `Downloads` / …）。
+///
+/// 不要用 `%USERPROFILE%\Desktop` 去拼：用户可以把这些文件夹重定向到别的盘，
+/// 拼出来的路径和实际位置可以完全无关（重定向后 `Desktop` 在注册表里改了、
+/// `desktop.ini` 也随之搬家）。交给 Shell 自己回答最稳。
+pub fn known_folder(name: &str) -> Option<String> {
+    use windows::core::GUID;
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+
+    // windows-core 0.62 的 GUID 只实现了 `From<u128>`，没有 `From<&str>`。
+    // 这里按 GUID 的规范写法自解，解不出来就退回全零 GUID —— 那样
+    // SHGetKnownFolderPath 必然失败，绝不会给出一个错误的路径。
+    fn guid(s: &str) -> GUID {
+        let clean: String = s.chars().filter(|c| !matches!(c, '{' | '}' | '-')).collect();
+        if clean.len() != 32 {
+            return GUID::zeroed();
+        }
+        GUID::from_u128(u128::from_str_radix(&clean, 16).unwrap_or(0))
+    }
+
+    let guid = match name {
+        "Desktop" => guid("B4BFCC3A-DB2C-424C-B029-7FE99A87C641"),
+        "Downloads" => guid("374DE290-123F-4565-9164-39C4925E467B"),
+        "Documents" => guid("FDD39AD0-238F-46AF-ADB4-6C85480369C7"),
+        "Pictures" => guid("33E28130-4E1E-4676-835A-98395C3BC3BB"),
+        "Music" => guid("4BD8D571-6D19-48D3-BE97-422220080E43"),
+        "Videos" => guid("18989B1D-99B5-455B-841C-AB7C74E4DDFC"),
+        _ => return None,
+    };
+    if guid == GUID::zeroed() {
+        return None;
+    }
+    unsafe {
+        let raw = SHGetKnownFolderPath(&guid, KF_FLAG_DEFAULT, None).ok()?;
+        let s = raw.to_string().ok();
+        let _ = CoTaskMemFree(Some(raw.as_ptr() as *const core::ffi::c_void));
+        s
+    }
+}
+
 pub fn logical_drives() -> Vec<String> {
     let mask = unsafe { windows::Win32::Storage::FileSystem::GetLogicalDrives() };
     (0..26u32)

@@ -136,13 +136,29 @@ pub fn sidebar_row_h(scale: f32) -> i32 {
     (34.0 * scale).round() as i32
 }
 
-/// 导航窗格条目几何：返回 `(该行矩形, 图标矩形, 文字矩形)`。
-pub fn sidebar_row_rects(l: &Layout, index: usize, scale: f32) -> (RECT, RECT, RECT) {
+/// 导航窗格条目几何：返回 `(该行矩形, 展开箭头矩形, 图标矩形, 文字矩形)`。
+///
+/// 箭头槽位**每一行都留**（不管有没有子节点），这样不同层级的图标才能竖着对齐 ——
+/// 否则展开过的行缩进、没展开的不缩进，整列图标会歪成锯齿。
+pub fn sidebar_row_geoms(
+    l: &Layout,
+    index: usize,
+    depth: usize,
+    scale: f32,
+    scroll: i32,
+) -> (RECT, RECT, RECT, RECT) {
     let row = sidebar_row_h(scale);
-    let top = l.sidebar.top + row + index as i32 * row;
+    // `scroll` 是像素偏移：树比窗格长的时候靠它上下滚，否则展开几层就只能看见
+    // 前十几行，下面的盘符/回收站永远滚不出来。
+    let top = l.sidebar.top + row + index as i32 * row - scroll;
     let row_r = RECT { left: l.sidebar.left, top, right: l.sidebar.right, bottom: top + row };
+    let indent = (16.0 * scale).round() as i32 * depth as i32;
+    let chev_s = (16.0 * scale).round() as i32;
+    let chev_x = l.sidebar.left + (4.0 * scale).round() as i32 + indent;
+    let chev_y = top + (row - chev_s) / 2;
+    let chev_r = RECT { left: chev_x, top: chev_y, right: chev_x + chev_s, bottom: chev_y + chev_s };
     let icon_s = (20.0 * scale).round() as i32;
-    let icon_x = l.sidebar.left + (14.0 * scale).round() as i32;
+    let icon_x = chev_x + chev_s + (2.0 * scale).round() as i32;
     let icon_y = top + (row - icon_s) / 2;
     let icon_r = RECT { left: icon_x, top: icon_y, right: icon_x + icon_s, bottom: icon_y + icon_s };
     let text_r = RECT {
@@ -151,7 +167,7 @@ pub fn sidebar_row_rects(l: &Layout, index: usize, scale: f32) -> (RECT, RECT, R
         right: l.sidebar.right - (6.0 * scale).round() as i32,
         bottom: top + row,
     };
-    (row_r, icon_r, text_r)
+    (row_r, chev_r, icon_r, text_r)
 }
 
 // ---------------------------------------------------------------- 布局
@@ -607,54 +623,45 @@ fn paint_sidebar(app: &mut App, hdc: HDC, l: &Layout) {
         let old = SelectObject(hdc, font.into());
         SetBkMode(hdc, TRANSPARENT);
 
-        let entries = sidebar_entries();
+        // 导航树：主页 + 常用文件夹 + 此电脑（展开=全部盘符）+ 回收站。
+        // 排列本身由 App 产出，绘制与命中测试共用同一份，不存在"看得见点不到"。
+        let rows = app.sidebar_rows();
         let cur = std::fs::canonicalize(&app.tab().path).unwrap_or_default();
-        // 先把每行的图标句柄取好再画：dir_icon 需要 &mut，不能一边借 entries 一边改缓存
-        let mut icons: Vec<Option<HICON>> = Vec::with_capacity(entries.len());
-        // 侧栏里每个虚拟项对应的 Segoe MDL2 字形（真实目录走 Shell 图标）。
-        // 主页 = Home，回收站 = Delete。
-        let mut glyphs: Vec<Option<&'static str>> = Vec::with_capacity(entries.len());
-        for (_, target) in &entries {
-            let p = std::path::PathBuf::from(target);
-            if is_home_target(target) {
-                icons.push(None);
-                glyphs.push(Some("\u{E80F}"));
-            } else if is_recycle_target(target) {
-                icons.push(None);
-                glyphs.push(Some("\u{E74D}"));
-            } else {
-                let h = app.icons.dir_icon(&p, true);
-                if h.0.is_null() {
-                    icons.push(None);
-                    glyphs.push(None);
-                } else {
-                    icons.push(Some(h));
-                    glyphs.push(None);
+        // 图标句柄先取好再画：dir_icon 需要 &mut，不能一边借 rows 一边改缓存
+        let mut icons: Vec<Option<HICON>> = vec![None; rows.len()];
+        let mut glyphs: Vec<Option<&'static str>> = vec![None; rows.len()];
+        for (i, r) in rows.iter().enumerate() {
+            match &r.icon {
+                crate::app::SidebarIcon::Glyph(g) => glyphs[i] = Some(g),
+                crate::app::SidebarIcon::Path(p) => {
+                    let h = app.icons.dir_icon(p, true);
+                    if !h.0.is_null() {
+                        icons[i] = Some(h);
+                    }
                 }
+                // 回收站这类没有实体路径的目标：走系统库存图标（空/满两态）
+                crate::app::SidebarIcon::Stock(siid) => icons[i] = crate::icons::stock_icon(*siid, true),
             }
         }
 
-        for (i, (label, target)) in entries.iter().enumerate() {
-            let (row_r, icon_r, text_r) = sidebar_row_rects(l, i, scale);
+        for (i, row) in rows.iter().enumerate() {
+            let (row_r, chev_r, icon_r, text_r) =
+                sidebar_row_geoms(l, i, row.depth, scale, app.sidebar_scroll);
             if row_r.top >= l.sidebar.bottom {
                 break;
             }
-            // "主页"是虚拟项（shell:Home），没有真实路径，只能单独判定；
-            // 否则当前停在首页时导航窗格一格都不亮。
-            let active = if app.tab().home {
-                is_home_target(target)
-            } else if app.tab().recycle {
-                is_recycle_target(target)
-            } else {
-                !cur.as_os_str().is_empty()
-                    && std::fs::canonicalize(std::path::PathBuf::from(target))
-                        .map(|p| p == cur)
-                        .unwrap_or(false)
-            };
-            if active {
-                let hb = CreateSolidBrush(t.hover_bg);
+            // 滚到窗格上沿之上的行：整行跳过（不画也不参与命中）
+            if row_r.bottom <= l.sidebar.top {
+                continue;
+            }
+            let active = sidebar_row_active(app, row, &cur);
+            let hovered = app.sidebar_hover == Some(i);
+            if active || hovered {
+                let hb = CreateSolidBrush(if hovered && !active { t.surface } else { t.hover_bg });
                 FillRect(hdc, &row_r, hb);
                 let _ = DeleteObject(hb.into());
+            }
+            if active {
                 // 左侧 3px 强调条：和菜单悬停保持一致的语言，指示"当前位置"
                 let ab = CreateSolidBrush(t.accent);
                 FillRect(hdc, &RECT { left: row_r.left, top: row_r.top, right: row_r.left + (3.0 * scale) as i32, bottom: row_r.bottom }, ab);
@@ -662,27 +669,31 @@ fn paint_sidebar(app: &mut App, hdc: HDC, l: &Layout) {
             }
             SetTextColor(hdc, if active { t.text } else { t.text_dim });
 
+            // 展开箭头：可展开的节点才画，指向随状态变（▶ / ▼）
+            if row.expandable {
+                let g = sidebar_glyph_font(scale);
+                let old2 = SelectObject(hdc, g.into());
+                let mut gbuf: Vec<u16> =
+                    (if row.expanded { "\u{E972}" } else { "\u{E970}" }).encode_utf16().collect();
+                DrawTextW(hdc, &mut gbuf, &mut chev_r.clone(), DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                SelectObject(hdc, old2);
+            }
+
             match icons[i] {
                 Some(h) => {
                     app.icons.draw(hdc, h, icon_r.left, icon_r.top, icon_r.right - icon_r.left);
                 }
                 None => {
-                    // 虚拟项（主页/回收站）没有真实路径，用 Segoe MDL2 字形代替图标
                     if let Some(glyph) = glyphs[i] {
                         let g = sidebar_glyph_font(scale);
                         let old2 = SelectObject(hdc, g.into());
                         let mut gbuf: Vec<u16> = glyph.encode_utf16().collect();
-                        DrawTextW(
-                            hdc,
-                            &mut gbuf,
-                            &mut icon_r.clone(),
-                            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-                        );
+                        DrawTextW(hdc, &mut gbuf, &mut icon_r.clone(), DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
                         SelectObject(hdc, old2);
                     }
                 }
             }
-            draw_text(hdc, label, text_r, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            draw_text(hdc, &row.label, text_r, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
         }
         SelectObject(hdc, old);
     }
@@ -693,24 +704,65 @@ pub fn is_home_target(target: &str) -> bool {
     target == crate::app::HOME_PATH
 }
 
-/// 导航窗格条目。第一项必须是"主页"：与资源管理器一致，点它进首页
-/// （常用文件夹 + 本机驱动器），而不是直接落进 C 盘。
-pub fn sidebar_entries() -> Vec<(&'static str, String)> {
-    let home = std::env::var("USERPROFILE").unwrap_or_default();
-    vec![
-        ("主页", crate::app::HOME_PATH.to_string()),
-        ("桌面", format!("{home}\\Desktop")),
-        ("下载", format!("{home}\\Downloads")),
-        ("文档", format!("{home}\\Documents")),
-        ("图片", format!("{home}\\Pictures")),
-        // 回收站：虚拟视图，条目直读 $Recycle.Bin
-        ("回收站", crate::app::RECYCLE_PATH.to_string()),
-    ]
-}
-
 /// 该导航项是不是虚拟的"回收站"。
 pub fn is_recycle_target(target: &str) -> bool {
     target == crate::app::RECYCLE_PATH
+}
+
+/// 导航窗格条目。第一项必须是"主页"：与资源管理器一致，点它进首页
+/// （常用文件夹 + 本机驱动器），而不是直接落进 C 盘。
+/// 命中测试：光标落在导航窗格的第几行上（超出可见区返回 None）。
+pub fn sidebar_hit(
+    app: &mut crate::app::App,
+    l: &Layout,
+    x: i32,
+    y: i32,
+    scale: f32,
+) -> Option<(usize, bool)> {
+    let scroll = app.sidebar_scroll;
+    let rows = app.sidebar_rows();
+    for (i, r) in rows.iter().enumerate() {
+        let (row_r, chev_r, _, _) = sidebar_row_geoms(l, i, r.depth, scale, scroll);
+        if row_r.top >= l.sidebar.bottom {
+            break;
+        }
+        if y < row_r.top || y >= row_r.bottom || x < row_r.left || x >= row_r.right {
+            continue;
+        }
+        let on_chevron = r.expandable
+            && x >= chev_r.left - 2
+            && x <= chev_r.right + 2
+            && y >= chev_r.top
+            && y <= chev_r.bottom;
+        return Some((i, on_chevron));
+    }
+    None
+}
+
+/// 这一行是不是"当前所在位置"。
+fn sidebar_row_active(
+    app: &crate::app::App,
+    row: &crate::app::SidebarRow,
+    cur: &std::path::Path,
+) -> bool {
+    if app.tab().home {
+        // 主页和"此电脑"都指向首页虚拟视图；只有"主页"那一格该亮
+        return is_home_target(&row.target) && row.depth == 0 && !row.expandable;
+    }
+    if app.tab().recycle {
+        return is_recycle_target(&row.target);
+    }
+    if is_home_target(&row.target) || is_recycle_target(&row.target) {
+        return false;
+    }
+    // "此电脑"这一行自己也指向首页，不该在停在某个盘里时跟着亮
+    if row.key == crate::app::SIDEBAR_THISPC {
+        return false;
+    }
+    !cur.as_os_str().is_empty()
+        && std::fs::canonicalize(std::path::PathBuf::from(&row.target))
+            .map(|p| p == cur)
+            .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------- 首页平铺布局
@@ -939,14 +991,20 @@ fn paint_home(app: &mut App, hdc: HDC, l: &Layout) {
 
             if let Some(bar) = tile.bar {
                 // 驱动磁贴：名称 + 容量条 + 可用/总量
+                let drive = crate::app::drive_of(app, &e.path);
                 let mut name: Vec<u16> = e.name.encode_utf16().collect();
                 let mut nr = tile.label;
                 nr.bottom = nr.top + (20.0 * scale) as i32;
                 DrawTextW(hdc, &mut name, &mut nr, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
 
-                let text = match crate::app::drive_space_of(app, &e.path) {
+                let text = match drive.and_then(|d| Some((d.total?, d.available?))) {
+                    // 资源管理器的措辞就是"可用/共"，口径保持一致
                     Some((total, free)) => format!("{} 可用，共 {}", human(free), human(total)),
-                    None => "容量未知".to_string(),
+                    // 空读卡器、没放盘的光驱：不是"未知"，是"还没就绪"
+                    None => match drive {
+                        Some(d) if !d.ready => "未就绪".to_string(),
+                        _ => "".to_string(),
+                    },
                 };
                 let mut sub: Vec<u16> = text.encode_utf16().collect();
                 SetTextColor(hdc, if sel { t.selection_text } else { t.text_dim });
@@ -955,22 +1013,44 @@ fn paint_home(app: &mut App, hdc: HDC, l: &Layout) {
                 sr.bottom = bar.top - 2;
                 DrawTextW(hdc, &mut sub, &mut sr, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
 
-                // 容量条：底色 + 已用占比
+                // 容量条：轨道 + 已用占比。
+                //
+                // 两点精度要求：
+                // 1) 宽度一律走**整数四舍五入**（`(used*w + total/2)/total`）。
+                //    之前用 f64 乘完直接 `as i32` 截断，最多差 1px；条本身不长，
+                //    一眼能看出条和数字对不上。
+                // 2) 轨道画一圈 1px 描边。没有描边时，填充比例为 0 的盘看着像
+                //    "条没画出来"，很难判断是真的没空间还是渲染没生效。
                 let bg = CreateSolidBrush(t.surface_alt);
                 FillRect(hdc, &bar, bg);
                 let _ = DeleteObject(bg.into());
-                if let Some((total, free)) = crate::app::drive_space_of(app, &e.path) {
-                    if total > 0 {
-                        let used = total.saturating_sub(free);
-                        let w = ((bar.right - bar.left) as f64 * (used as f64 / total as f64)) as i32;
-                        if w > 0 {
-                            let fill = RECT { right: bar.left + w, ..bar };
-                            let fb = CreateSolidBrush(t.accent);
-                            FillRect(hdc, &fill, fb);
-                            let _ = DeleteObject(fb.into());
+                if let Some(d) = drive {
+                    if let (Some(total), Some(free)) = (d.total, d.available) {
+                        if total > 0 {
+                            let used = total.saturating_sub(free);
+                            let full = bar.right - bar.left;
+                            let w = ((used as u128 * full as u128 + (total as u128) / 2)
+                                / total as u128) as i32;
+                            if w > 0 && w <= full {
+                                let fill = RECT { right: bar.left + w, ..bar };
+                                let color = if d.critical() { t.danger } else { t.accent };
+                                let fb = CreateSolidBrush(color);
+                                FillRect(hdc, &fill, fb);
+                                let _ = DeleteObject(fb.into());
+                            }
                         }
                     }
                 }
+                let edge = CreateSolidBrush(t.border);
+                for r in [
+                    RECT { bottom: bar.top + 1, ..bar },
+                    RECT { top: bar.bottom - 1, ..bar },
+                    RECT { right: bar.left + 1, ..bar },
+                    RECT { left: bar.right - 1, ..bar },
+                ] {
+                    FillRect(hdc, &r, edge);
+                }
+                let _ = DeleteObject(edge.into());
             } else {
                 let mut name: Vec<u16> = e.name.encode_utf16().collect();
                 let mut lr = tile.label;
@@ -1252,6 +1332,10 @@ pub const SET_THEME: u32 = 5;
 pub const SET_VIEW: u32 = 6;
 pub const SET_SIDEBAR: u32 = 7;
 pub const SET_STATUS: u32 = 8;
+/// 导航窗格"跟随展开到当前文件夹"。默认关闭（默认配置里就是 false）。
+pub const SET_FOLLOW: u32 = 9;
+/// "此电脑"节点默认展开（展开后才看得见盘符）
+pub const SET_THISPC: u32 = 10;
 
 /// 设置页的一行。绘制与命中测试**共用**这份几何（同一条纪律：两边各写一份常量，
 /// 改一次就错位）。`action == 0` 是分组标题，不可点。
@@ -1303,6 +1387,18 @@ pub fn settings_rows(app: &App, l: &Layout) -> Vec<SettingRow> {
             vec![
                 ("主题".to_string(), if dark { "暗色".to_string() } else { "亮色".to_string() }, SET_THEME, dark),
                 ("显示导航窗格".to_string(), on_off(app.cfg.ui.sidebar_visible), SET_SIDEBAR, app.cfg.ui.sidebar_visible),
+                (
+                    "导航窗格跟随当前文件夹展开".to_string(),
+                    on_off(app.cfg.ui.sidebar_follow_current),
+                    SET_FOLLOW,
+                    app.cfg.ui.sidebar_follow_current,
+                ),
+                (
+                    "「此电脑」默认展开到盘符".to_string(),
+                    on_off(app.cfg.ui.sidebar_thispc_expanded),
+                    SET_THISPC,
+                    app.cfg.ui.sidebar_thispc_expanded,
+                ),
                 ("显示状态栏".to_string(), on_off(app.cfg.ui.statusbar_visible), SET_STATUS, app.cfg.ui.statusbar_visible),
             ],
         ),
@@ -1610,6 +1706,11 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 ///
 /// 返回 (大图标, 详细信息)。**绘制和命中测试必须共用这一个函数**：两边各写一份
 /// 常量，改一次尺寸就错位（这条纪律是踩过坑才立的）。
+/// 状态栏右下角两个布局切换按钮的几何：`(大图标, 详细信息)`。
+///
+/// **顺序**刻意做成"详细信息在左、大图标在最右"：资源管理器右下角那对按钮
+/// 就是这个次序（左边是列表、右边是磁贴），两条挨着的最右边那个才和窗口右下
+/// 角对齐。之前做反了，点"最右边"出来的是详细信息，和资源管理器对不上。
 pub fn status_view_rects(l: &Layout, m: &Metrics) -> (RECT, RECT) {
     let btn_w = (30.0 * m.scale).round() as i32;
     let btn_h = (20.0 * m.scale).round() as i32;
@@ -1617,9 +1718,16 @@ pub fn status_view_rects(l: &Layout, m: &Metrics) -> (RECT, RECT) {
     let cy = (l.status.top + l.status.bottom) / 2;
     let top = cy - btn_h / 2;
     let right = l.status.right - (6.0 * m.scale).round() as i32;
-    let details = RECT { left: right - btn_w, top, right, bottom: top + btn_h };
-    let icons = RECT { left: right - btn_w * 2 - gap, top, right: right - btn_w - gap, bottom: top + btn_h };
+    // 从最右端往左排：大图标贴着右下角，详细信息在它左边一个按钮位
+    let icons = RECT { left: right - btn_w, top, right, bottom: top + btn_h };
+    let details = RECT { left: right - btn_w * 2 - gap, top, right: right - btn_w - gap, bottom: top + btn_h };
     (icons, details)
+}
+
+/// 两个按钮一起算出来的最左边界：状态栏左侧文字要避开整块按钮区。
+pub fn status_view_left(l: &Layout, m: &Metrics) -> i32 {
+    let (icons, details) = status_view_rects(l, m);
+    icons.left.min(details.left)
 }
 
 /// 命中状态栏的布局切换按钮，返回被点到的按钮对应的视图模式。
@@ -1696,11 +1804,11 @@ fn paint_status(app: &App, hdc: HDC, l: &Layout) {
         SetTextColor(hdc, t.text_dim);
         let text = app.status_text();
         // 左侧文字要给右下角的两个按钮让出位置，否则长状态文本会压在按钮上
-        let (icons, _) = status_view_rects(l, &app.metrics);
+        let view_left = status_view_left(l, &app.metrics);
         draw_text(
             hdc,
             &text,
-            RECT { left: l.status.left + 10, top: l.status.top, right: icons.left - 8, bottom: l.status.bottom },
+            RECT { left: l.status.left + 10, top: l.status.top, right: view_left - 8, bottom: l.status.bottom },
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
         );
         SelectObject(hdc, old);

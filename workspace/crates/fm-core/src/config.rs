@@ -53,6 +53,13 @@ pub struct UiConfig {
     pub sidebar_visible: bool,
     pub sidebar_width: u32,
     pub titlebar_height: u32,
+    /// 导航窗格是否**跟着当前文件夹自动展开并定位**。
+    ///
+    /// 默认 false：资源管理器默认也是不跟随的（展开过的地方才保持展开），
+    /// 一路自动展开会瞬间把树撑得很长、还会顺带读很多层目录。
+    pub sidebar_follow_current: bool,
+    /// "此电脑"这个节点默认是否展开（展开后才看得到具体盘符）。
+    pub sidebar_thispc_expanded: bool,
     pub tabs: TabsConfig,
 }
 

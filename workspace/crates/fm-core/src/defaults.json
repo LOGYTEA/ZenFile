@@ -35,6 +35,8 @@
     "sidebar_visible": true,
     "sidebar_width": 200,
     "titlebar_height": 36,
+    "sidebar_follow_current": false,
+    "sidebar_thispc_expanded": true,
     "tabs": {
       "show_close_button": true,
       "max_tabs": 16,
@@ -68,11 +70,29 @@
     }
   },
   "modules": {
-    "clipboard": { "enabled": false, "autostart": true },
-    "screenshot": { "enabled": false, "autostart": false },
-    "taskmgr": { "enabled": true, "autostart": false },
-    "terminal": { "enabled": false, "autostart": false },
-    "preview": { "enabled": false, "autostart": false },
-    "widget": { "enabled": false, "autostart": false }
+    "clipboard": {
+      "enabled": false,
+      "autostart": true
+    },
+    "screenshot": {
+      "enabled": false,
+      "autostart": false
+    },
+    "taskmgr": {
+      "enabled": true,
+      "autostart": false
+    },
+    "terminal": {
+      "enabled": false,
+      "autostart": false
+    },
+    "preview": {
+      "enabled": false,
+      "autostart": false
+    },
+    "widget": {
+      "enabled": false,
+      "autostart": false
+    }
   }
 }

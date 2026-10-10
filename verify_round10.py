@@ -18,6 +18,12 @@ import os
 import shutil
 import struct
 import subprocess
+
+# 脚本会改写 %APPDATA%\NexFile 下的设置来构造场景 —— 必须隔离，否则跑完
+# 用户自己的软件就带着脚本遗留的状态运行（详见 verify_env.py 的说明）。
+import verify_env
+
+verify_env.isolate()
 import time
 
 u = ctypes.WinDLL("user32", use_last_error=True)
@@ -167,9 +173,21 @@ def nc_click(hwnd, hit, sx, sy):
     time.sleep(0.5)
 
 
-def wheel(hwnd, ticks, delta=-120):
+def wheel(hwnd, ticks, delta=-120, cx=None, cy=None):
+    """滚轮必须带**真实的屏幕坐标**：lParam=0 意味着光标在屏幕左上角，
+    而左上角的 x 小于导航窗格右缘 —— 现在滚轮在侧栏上是滚树的，
+    于是列表一动不动，脚本会误报"滚动无效"。"""
+    r = wt.RECT()
+    u.GetWindowRect(hwnd, ctypes.byref(r))
+    w = r.right - r.left
+    hh = r.bottom - r.top
+    if cx is None:
+        cx = w - 120  # 明确落在内容区（远在侧栏右边）
+    if cy is None:
+        cy = hh // 2
+    lp = (((r.top + cy) & 0xFFFF) << 16) | ((r.left + cx) & 0xFFFF)
     for _ in range(ticks):
-        u.PostMessageW(hwnd, WM_MOUSEWHEEL, (delta & 0xFFFF) << 16, 0)
+        u.PostMessageW(hwnd, WM_MOUSEWHEEL, (delta & 0xFFFF) << 16, lp)
         time.sleep(0.2)
     time.sleep(0.5)
 
@@ -404,11 +422,38 @@ mark(unit is not None, f"「大小单位」可切换并落盘（当前 {unit}）
 
 # ---------------------------------------------------------------- 5 回收站
 print("\n[5] 侧栏回收站")
+
+
+def sidebar_live_rows(hwnd, G):
+    """侧栏里"有字"的行，返回 [(y_top, 墨迹像素数)]。
+
+    不能按行号写死：侧栏现在是 主页 + 常用文件夹 + 此电脑 + 盘符 + 回收站 的树，
+    盘符个数随机器的盘而变，写死第 6 行会点到"图片"上去。
+    """
+    raw, stride, w, h = grab(hwnd)
+    s = G["s"]
+    row = sc(s, 34)
+    view_top = G["title_h"] + G["toolbar_h"]
+    out = []
+    y = view_top
+    while y + row < h - sc(s, 40):
+        ink = max(
+            sum(1 for x in range(20, G["sidebar_w"] - 4)
+                if sum(px(raw, stride, x, yy)) > 210)
+            for yy in range(y + 2, y + row - 2)
+        )
+        if ink > 12:
+            out.append((y, ink))
+        y += row
+    return out
+
+
 hwnd = launch(None)
 G = geom(hwnd)
-view_top = G["title_h"] + G["toolbar_h"]
-row = sc(G["s"], 34)
-click(hwnd, 30, view_top + row * 6 + row // 2)
+rows_live = sidebar_live_rows(hwnd, G)
+mark(len(rows_live) >= 10, f"侧栏可见 {len(rows_live)} 行（主页+常用文件夹+此电脑+盘符+回收站 ≥10）")
+y_bin = rows_live[-1][0] + sc(G["s"], 34) // 2
+click(hwnd, 90, y_bin)
 time.sleep(1.2)
 mark(addr_text(hwnd) == "回收站", f"侧栏回收站可打开（地址栏=「{addr_text(hwnd)}」）")
 raw, stride, w, h = grab(hwnd)

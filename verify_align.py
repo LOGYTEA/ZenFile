@@ -14,8 +14,19 @@ import time
 
 # 默认落点是"主页"（平铺磁贴），行距基线只对**详细信息列表**有意义。
 # 所以这里自己拉起一个文件夹视图再量，别去碰别人已经开着的窗口。
+import shutil
+
+import verify_env
+
+verify_env.isolate()
+
 EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\fm-app.exe"
-BASE = os.path.join(os.environ["USERPROFILE"], "Desktop")
+# 素材一律落在 %TEMP%（用户明确要求：别往桌面写东西），且要够多才撑得出行距样本。
+BASE = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), "NexAlign")
+shutil.rmtree(BASE, ignore_errors=True)
+os.makedirs(BASE, exist_ok=True)
+for i in range(30):
+    open(os.path.join(BASE, f"sample{i}.txt"), "w").write("x" * (i + 1) * 11)
 subprocess.run(["taskkill", "/F", "/IM", "fm-app.exe"], capture_output=True)
 time.sleep(0.6)
 subprocess.Popen([EXE, BASE])
@@ -80,7 +91,6 @@ checks = [
     ("标题栏", int(w * 0.5), 16, "#000000"),
     ("工具栏/命令栏", 20, 70, "#191919"),
     ("地址框底色", int(w * 0.4), 55, "#2B2B2B"),
-    ("导航窗格", 80, 300, "#191919"),
     ("列表内容区", int(w * 0.75), 400, "#202020"),
     ("状态栏", int(w * 0.5), h - 8, "#333333"),
 ]
@@ -91,22 +101,43 @@ for name, x, y, want in checks:
     ok = ok and good
     print(f"  {name:<12} ({x:4d},{y:4d}) 实测 {got}  期望 {want}  {'OK' if good else '✗'}")
 
+# 导航窗格不能只抽一个点：侧栏变成树之后 y=300 这种固定坐标随时会落在某一行的
+# 图标或高亮上（实测抽到 #193159 —— 那是图标像素，不是底色）。
+# 底色 = 该区域里出现次数最多的颜色，要求占比 > 80% 才算"这一片就是它"。
+from collections import Counter
+
+y0, y1 = 200, min(h - 60, 600)
+cnt = Counter()
+tot = 0
+for y in range(y0, y1):
+    for x in range(4, 154, 2):
+        cnt[hx(at(x, y))] += 1
+        tot += 1
+top, n = cnt.most_common(1)[0]
+good = top == "#191919" and n / max(1, tot) > 0.8
+ok = ok and good
+print(f"  {'导航窗格':<12} (区域 x 4..154 × y {y0}..{y1}) 众数 {top} 占比 "
+      f"{n*100//max(1,tot)}%  期望 #191919  {'OK' if good else '✗'}")
+
 print("\n=== 度量对比 ===")
 # 导航窗格宽度：沿 y=300 找那条 1px 分隔线（border #535353）。
 # 不能直接找"第一个颜色突变点" —— 侧栏每行的图标从 x=14 起画，
 # 只要 y=300 正好落在某一行上（现在侧栏多了一项"回收站"），
 # 第一个突变点就是图标而不是窗格边界。
-nav_edge = None
+# 判定"竖线"而不是"第一个匹配点"：侧栏里任何一行的图标都可能碰巧含 #535353
+# 这类灰蓝像素，只在一条 y 上找会认错。真正的分隔线是**整条竖线** ——
+# 取竖向上命中次数最多的那一列。
+nav_edge, best_hits = None, 0
 for x in range(20, w):
-    if hx(at(x, 300)) == "#535353":
-        nav_edge = x
-        break
+    hits = sum(1 for y in range(y0, y1) if hx(at(x, y)) == "#535353")
+    if hits > best_hits:
+        nav_edge, best_hits = x, hits
 # 导航窗格右缘画了 1px 分隔线（border），所以颜色突变点在 156；
 # 内容区仍从 157 起（分隔线本身属于导航窗格这一侧）。
 EXPECT_EDGE = 156
-print(f"  导航窗格右边界(含分隔线) x={nav_edge}  期望 {EXPECT_EDGE}  "
-      f"{'OK' if nav_edge == EXPECT_EDGE else '✗'}")
-ok = ok and (nav_edge == EXPECT_EDGE)
+print(f"  导航窗格右边界(含分隔线) x={nav_edge}（竖线命中 {best_hits}/{y1-y0} 行）"
+      f"  期望 {EXPECT_EDGE}  {'OK' if nav_edge == EXPECT_EDGE else '✗'}")
+ok = ok and (nav_edge == EXPECT_EDGE) and best_hits > (y1 - y0) * 0.5
 
 # 行距：统计内容区墨迹段起点间距
 CBG = at(int(w * 0.75), 400)

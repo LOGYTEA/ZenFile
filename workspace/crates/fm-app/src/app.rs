@@ -89,9 +89,10 @@ pub fn home_entries() -> Vec<FileEntry> {
         }
     }
 
-    for d in paths::logical_drives() {
-        let letter = d.trim_end_matches('\\').to_string();
-        out.push(mk(&format!("本地磁盘 ({letter})"), d));
+    for d in fm_core::drives::list() {
+        // 名字跟着资源管理器走：有卷标用卷标，没有就用类型名。
+        // 之前这里写死成"本地磁盘"，于是 U 盘、光驱、网络盘全叫本地磁盘。
+        out.push(mk(&d.display_name(), d.root.clone()));
     }
     out
 }
@@ -243,9 +244,25 @@ pub struct App {
     pub show_system: bool,
     /// 目录的本地化显示名缓存（"Users"→"用户"、"Desktop"→"桌面"）。
     pub display_names: HashMap<PathBuf, String>,
-    /// 主页"设备和驱动器"的容量缓存：`盘符 -> (总容量, 可用)`。
-    /// 只在进入主页时刷新一次，避免每帧都做磁盘 IO。
-    pub drive_space: HashMap<String, (u64, u64)>,
+    /// 本机驱动器清单：`形如 "C:\" 的大写路径 -> 驱动器信息`。
+    ///
+    /// 主页容量条 / 导航窗格树 / 属性窗口共用这一份，避免各处各自猜类型。
+    /// 只在"进入主页 + 定时兜底 + 设备插拔"三种时机重取，避免每帧做磁盘 IO。
+    pub drives: HashMap<String, fm_core::drives::DriveInfo>,
+    /// 上一次刷新驱动器清单的时刻（用于 WM_TIMER 里的节流）。
+    pub drives_stamp: Option<std::time::Instant>,
+    /// 导航窗格里**处于展开状态**的节点 key。
+    ///
+    /// key 的约定：目录节点用大写的绝对路径；虚拟节点用固定串（`thispc`）。
+    /// 目录节点展开时的子目录清单另存在 `sidebar_children` 里 —— 每帧都去
+    /// `read_dir` 会把 UI 的响应速度按挂在树的深度上。
+    pub sidebar_expanded: HashSet<String>,
+    /// 已展开节点的子目录清单。`None` 表示还没取过。
+    pub sidebar_children: HashMap<String, Vec<PathBuf>>,
+    /// 鼠标悬停的导航行下标（用于 hover 反馈）。
+    pub sidebar_hover: Option<usize>,
+    /// 导航窗格的滚动偏移（像素）。树比窗格长时才非 0。
+    pub sidebar_scroll: i32,
     /// 焦点行要不要**画**出来。
     ///
     /// `focus_row` 永远存在（第 0 行默认就是焦点行），但资源管理器在刚打开一个
@@ -284,14 +301,75 @@ fn shell_display_name(path: &Path) -> Option<String> {
     crate::icons::IconCache::display_name(path)
 }
 
-/// 取某个驱动器的容量`(总容量, 可用)`，供首页渲染容量条。
-pub fn drive_space_of(app: &App, path: &Path) -> Option<(u64, u64)> {
+/// 取某个驱动器的完整信息（类型 / 卷标 / 容量），供首页容量条与导航窗格使用。
+pub fn drive_of<'a>(app: &'a App, path: &Path) -> Option<&'a fm_core::drives::DriveInfo> {
     let key = path.to_string_lossy().to_uppercase();
-    app.drive_space.get(&key).copied()
+    app.drives.get(&key)
 }
 
 pub const HOVER_SIDEBAR_TOGGLE: u8 = 0b01;
 pub const HOVER_MENU_BTN: u8 = 0b10;
+
+/// 首页驱动器信息的兜底刷新间隔（秒）。
+const DRIVES_TTL_SECS: u64 = 5;
+
+/// 导航窗格一行的图标来源。
+#[derive(Clone, Debug)]
+pub enum SidebarIcon {
+    /// 段首导航项没有真实路径，只能用 Segoe 字形
+    Glyph(&'static str),
+    /// 有真实路径：交给 `IconCache` 去问系统图标（含 `desktop.ini` 自定义图标、
+    /// 驱动器符号），拿到什么就画什么，和资源管理器一致。
+    Path(PathBuf),
+    /// 系统库存图标（`SHGetStockIconInfo`），存的是 SIID 常量值。
+    /// 回收站这种没有实体路径的目标只能走这里。
+    Stock(i32),
+}
+
+/// 导航窗格的一行。**渲染与命中测试共用这份排列**，不存在"看得见但点不到"。
+#[derive(Clone, Debug)]
+pub struct SidebarRow {
+    pub label: String,
+    /// 点击这一行要导航到哪（虚拟视图用 `shell:xxx` 哨兵值）
+    pub target: String,
+    pub depth: usize,
+    /// 有子节点 worth showing（决定要不要画 V 形箭头）
+    pub expandable: bool,
+    pub expanded: bool,
+    /// 展开状态用的 key；不可展开的行为空串
+    pub key: String,
+    pub icon: SidebarIcon,
+}
+
+/// "此电脑"这个虚拟节点在 `sidebar_expanded` 里的 key。
+pub const SIDEBAR_THISPC: &str = "thispc";
+
+/// 一级常用文件夹。顺序照抄资源管理器左侧的上半段。
+fn user_folders() -> Vec<(&'static str, String)> {
+    use fm_core::paths::known_folder;
+    [
+        ("主文件夹", ""),
+        ("桌面", "Desktop"),
+        ("下载", "Downloads"),
+        ("文档", "Documents"),
+        ("图片", "Pictures"),
+        ("音乐", "Music"),
+        ("视频", "Videos"),
+    ]
+    .iter()
+    .map(|(label, clsid)| {
+        // 已知文件夹一律走 Shell 自己给的路径（用户可能把它重定向到 D 盘），
+        // 不要凭 USERPROFILE 去拼 —— 拼出来的和实际位置可以完全无关。
+        let path = if clsid.is_empty() {
+            std::env::var("USERPROFILE").unwrap_or_default()
+        } else {
+            known_folder(clsid).unwrap_or_default()
+        };
+        (*label, path)
+    })
+    .filter(|(_, p)| !p.is_empty() && std::path::Path::new(p).is_dir())
+    .collect()
+}
 
 impl App {
     pub fn new(hwnd: HWND, cfg: Config) -> Self {
@@ -326,7 +404,12 @@ impl App {
             exit_to_tray: false,
             hovering_close: false,
             hover_chrome: 0,
-            drive_space: HashMap::new(),
+            drives: HashMap::new(),
+            drives_stamp: None,
+            sidebar_expanded: HashSet::new(),
+            sidebar_children: HashMap::new(),
+            sidebar_hover: None,
+            sidebar_scroll: 0,
             display_names: HashMap::new(),
             focus_visible: false,
             hover_tab: None,
@@ -359,6 +442,14 @@ impl App {
     // ---------------------------------------------------------------- 导航
 
     pub fn open_tab(&mut self, path: PathBuf) {
+        // 导航树要用驱动器清单，而它只在"进主页 / 定时兜底 / 设备插拔"时刷新。
+        // 首次建标签时那张表还是空的（侧栏会只剩"此电脑"没有盘符），这里补一次。
+        if self.drives.is_empty() {
+            self.refresh_drives();
+            if self.cfg.ui.sidebar_thispc_expanded {
+                self.sidebar_expanded.insert(SIDEBAR_THISPC.to_string());
+            }
+        }
         let mut tab = Tab::new(path);
         tab.view_mode = parse_view(&self.cfg.files.view.default_mode);
         tab.sort = SortSpec { key: parse_sort(&self.cfg.files.view.sort_key), descending: self.cfg.files.view.sort_descending };
@@ -390,6 +481,12 @@ impl App {
         // 入口就把 verbatim 前缀剥掉：调用方可能传的是 canonicalize 的结果
         // （带 `\\?\`），那个前缀会让目录枚举返回空列表。
         let path = fm_core::paths::strip_verbatim(&path);
+        // "跟随展开到当前文件夹"：默认关。开着的时候把当前路径的所有祖先展开，
+        // 让导航窗格始终显示"我在哪"。逐层读目录清单是同步的，所以这个开关
+        // 关着的时候绝不会有任何额外 IO。
+        if self.cfg.ui.sidebar_follow_current && !is_virtual(&path) {
+            self.reveal_in_sidebar(&path);
+        }
         let depth = self.cfg.files.navigation.history_depth;
         // 标签标题也走本地化显示名：资源管理器里 `C:\Users` 的标签写的是"用户"，
         // 直接显示盘上真名会让人对不上号。
@@ -525,6 +622,43 @@ impl App {
         }
     }
 
+    /// 重取本机驱动器清单（类型 / 卷标 / 容量）。
+    ///
+    /// 一次 `drives::list()` 会对每个盘符做 3 次 syscall，量级很小但不该每帧跑。
+    pub fn refresh_drives(&mut self) {
+        self.drives.clear();
+        for d in fm_core::drives::list() {
+            let key = d.root.to_uppercase();
+            self.drives.insert(key, d);
+        }
+        self.drives_stamp = Some(std::time::Instant::now());
+    }
+
+    /// 停在首页时的数据兜底刷新。
+    ///
+    /// 文件系统变化不会通知到"主页"这个虚拟视图（它不是真实目录、没有监听句柄），
+    /// 所以拷完文件后容量条会一直停在旧值上 —— 看着就是"条不准"。这里在消息循环
+    /// 的定时器里每隔 DRIVES_TTL 重取一次；插拔设备另有 WM_DEVICECHANGE 立即触发。
+    pub fn tick_refresh_home(&mut self) -> bool {
+        if !self.tab().home {
+            return false;
+        }
+        let stale = match self.drives_stamp {
+            None => true,
+            Some(t) => t.elapsed() > std::time::Duration::from_secs(DRIVES_TTL_SECS),
+        };
+        if !stale {
+            return false;
+        }
+        self.refresh_drives();
+        let entries = home_entries();
+        let (show_hidden, show_system) = (self.show_hidden, self.show_system);
+        let tab = self.tab_mut();
+        tab.entries = entries;
+        tab.recompute_filter(show_hidden, show_system);
+        true
+    }
+
     /// 启动当前目录枚举。generation 自增使旧批次自然作废（§5 UI 契约）。
     pub fn reload(&mut self) {
         // 目录图标缓存只在这里收口：切换目录 = 一次重绘的起点，此刻销毁旧句柄
@@ -536,16 +670,10 @@ impl App {
             // 首页**不能排序**：合成顺序本身就是"常用文件夹在前、驱动器在后"的分区依据，
             // 一旦按名称重排，两类条目会交错，平铺布局就会分错组。
             let entries = home_entries();
-            // 容量条数据一次性取好：sort 之后局势固定，取数失败就不画条
-            self.drive_space.clear();
-            for e in &entries {
-                if fm_core::paths::is_drive_root(&e.path) {
-                    let key = e.path.to_string_lossy().to_uppercase();
-                    if let Some(space) = fm_core::paths::drive_space(&e.path.to_string_lossy()) {
-                        self.drive_space.insert(key, space);
-                    }
-                }
-            }
+            // 驱动器信息一次性取好：类型、卷标、容量都在里面，之后不再碰磁盘。
+            // 之前缓存的只有两个 u64，类型写死成"本地磁盘"（U 盘也叫本地磁盘），
+            // 而且只在进主页时取一次 —— 拷完一个大文件后，条和数就双双过期了。
+            self.refresh_drives();
             // 先把两个开关拷出来：下面要取 tab 的可变借用，届时再读 self 会撞借用检查
             let (show_hidden, show_system) = (self.show_hidden, self.show_system);
             let tab = self.tab_mut();
@@ -1148,6 +1276,8 @@ impl App {
             Command::SortBySize => self.sort_column(fm_core::SortKey::Size),
             Command::ToggleSidebar => self.toggle_sidebar(),
             Command::ToggleStatusbar => self.toggle_statusbar(),
+            Command::ToggleFollowCurrent => self.toggle_follow_current(),
+            Command::ToggleThispcExpanded => self.toggle_thispc_expanded(),
             Command::ToggleHidden => self.toggle_hidden(),
             Command::ToggleSystem => self.toggle_system(),
             Command::ToggleExtensions => self.toggle_extensions(),
@@ -1338,12 +1468,38 @@ impl App {
         let _ = unsafe { InvalidateRect(Some(self.hwnd), None, true) };
     }
 
+    /// 导航窗格"跟随展开到当前文件夹"。
+    ///
+    /// 打开的那一刻立刻按当前目录补一次展开，否则开关点了要下次导航才见效，
+    /// 用户会以为没生效。
+    pub fn toggle_follow_current(&mut self) {
+        self.cfg.ui.sidebar_follow_current = !self.cfg.ui.sidebar_follow_current;
+        self.persist_ui_pref();
+        if self.cfg.ui.sidebar_follow_current && !is_virtual(&self.tab().path.clone()) {
+            let p = self.tab().path.clone();
+            self.reveal_in_sidebar(&p);
+        }
+        let _ = unsafe { InvalidateRect(Some(self.hwnd), None, true) };
+    }
+
+    /// "此电脑"是否默认展开（展开后才看得见具体盘符）。
+    pub fn toggle_thispc_expanded(&mut self) {
+        self.cfg.ui.sidebar_thispc_expanded = !self.cfg.ui.sidebar_thispc_expanded;
+        self.persist_ui_pref();
+        if self.cfg.ui.sidebar_thispc_expanded {
+            self.sidebar_expanded.insert(SIDEBAR_THISPC.to_string());
+        }
+        let _ = unsafe { InvalidateRect(Some(self.hwnd), None, true) };
+    }
+
     /// 只把 UI 开关写回 settings.user.json，不覆盖其它字段。
     fn persist_ui_pref(&self) {
         if let Err(e) = fm_core::config::Config::save_user_patch(&serde_json::json!({
             "ui": {
                 "sidebar_visible": self.cfg.ui.sidebar_visible,
                 "statusbar_visible": self.cfg.ui.statusbar_visible,
+                "sidebar_follow_current": self.cfg.ui.sidebar_follow_current,
+                "sidebar_thispc_expanded": self.cfg.ui.sidebar_thispc_expanded,
             }
         })) {
             eprintln!("保存 UI 偏好失败: {e}");
@@ -1530,6 +1686,212 @@ impl App {
             )
         } else {
             format!("{visible} / {total} 个项目{hidden_note} · 视图 {view} · {path}", path = path)
+        }
+    }
+
+    /// 展开状态键：一律大写。
+    fn node_key(path: &Path) -> String {
+        path.to_string_lossy().to_uppercase()
+    }
+
+    fn is_expanded(&self, key: &str) -> bool {
+        self.sidebar_expanded.contains(key)
+    }
+
+    /// 读取某目录的**直接子目录**清单并存进缓存。
+    ///
+    /// 只在展开/刷新的那一刻读盘，不在每帧绘制时读 —— 树深一层就等于每帧多一次
+    /// `read_dir`，叠几层下来滚动就卡了。
+    fn load_sidebar_children(&mut self, key: &str) {
+        let children = std::fs::read_dir(key)
+            .map(|rd| {
+                let mut v: Vec<PathBuf> = rd
+                    .flatten()
+                    .filter(|e| {
+                        let Ok(m) = e.metadata() else { return false };
+                        if !m.is_dir() {
+                            return false;
+                        }
+                        // 隐藏/系统项跟随两道开关；Recycle.Bin、System Volume
+                        // Information 这类受保护容器永远不列：列出来只会让用户
+                        // 在树里点到一堆打不开的东西。
+                        use std::os::windows::fs::MetadataExt;
+                        let attrs = m.file_attributes();
+                        let hidden = attrs & 0x2 != 0;
+                        let system = attrs & 0x4 != 0;
+                        (!hidden || self.show_hidden) && (!system || self.show_system)
+                    })
+                    .map(|e| e.path())
+                    .collect();
+                v.sort_by(|a, b| {
+                    fm_core::natural::natural_cmp(
+                        &a.file_name().unwrap_or_default().to_string_lossy(),
+                        &b.file_name().unwrap_or_default().to_string_lossy(),
+                    )
+                });
+                v
+            })
+            .unwrap_or_default();
+        self.sidebar_children.insert(key.to_string(), children);
+    }
+
+    /// 展开 / 收起一个导航节点。**不做导航**：点箭头就只该动树，不该换目录。
+    pub fn toggle_sidebar_node(&mut self, key: &str) {
+        if self.sidebar_expanded.contains(key) {
+            // 收起：子清单一并丢弃，下次展开重新读盘（目录内容早变了）
+            self.sidebar_expanded.remove(key);
+            self.sidebar_children.remove(key);
+            return;
+        }
+        self.sidebar_expanded.insert(key.to_string());
+        if key != SIDEBAR_THISPC {
+            self.load_sidebar_children(key);
+        }
+    }
+
+    /// 导航窗格滚动。偏移按"整棵树的内容高度 vs 窗格高度"钳制，滚到底不会留空白。
+    pub fn scroll_sidebar(&mut self, delta: i32, l: &crate::paint::Layout) {
+        let row_h = crate::paint::sidebar_row_h(self.metrics.scale);
+        let total = self.sidebar_rows().len() as i32 * row_h;
+        let view_h = l.sidebar.bottom - l.sidebar.top - row_h;
+        let max = (total - view_h).max(0);
+        self.sidebar_scroll = (self.sidebar_scroll - delta).clamp(0, max);
+        let _ = unsafe { InvalidateRect(Some(self.hwnd), None, false) };
+    }
+
+    /// 树收起/展开后把滚动偏移重新钳回合法范围（否则会停在空白区）。
+    pub fn clamp_sidebar_scroll(&mut self, l: &crate::paint::Layout) {
+        self.scroll_sidebar(0, l);
+    }
+
+    /// 保证某路径的所有祖先都处于展开状态（"跟随展开到当前文件夹"用）。
+    ///
+    /// 必须逐级 `load_sidebar_children`：只把 key 塞进集合，树依旧是空的 ——
+    /// 展开标记和子清单是两件事，缺一个这一层就画不出来。
+    pub fn reveal_in_sidebar(&mut self, path: &Path) {
+        let full = path.to_string_lossy().to_uppercase();
+        for drive in self.drives.keys().cloned().collect::<Vec<_>>() {
+            let Some(rest) = full.strip_prefix(drive.as_str()) else { continue };
+            self.sidebar_expanded.insert(SIDEBAR_THISPC.to_string());
+            let mut acc = drive.trim_end_matches('\\').to_string();
+            for comp in rest.split('\\') {
+                if comp.is_empty() {
+                    continue;
+                }
+                acc = format!("{acc}\\{comp}");
+                if acc.eq_ignore_ascii_case(&full) {
+                    break;
+                }
+                self.sidebar_expanded.insert(acc.clone());
+                self.load_sidebar_children(&acc);
+            }
+            break;
+        }
+    }
+
+    /// 导航窗格当前要画的那些行（扁平序列，`depth` 决定缩进）。
+    ///
+    /// 渲染与命中测试共用这一份排列：不存在"看得见却点不到"的行。
+    pub fn sidebar_rows(&mut self) -> Vec<SidebarRow> {
+        let mut rows = Vec::new();
+        rows.push(SidebarRow {
+            label: "主页".to_string(),
+            target: HOME_PATH.to_string(),
+            depth: 0,
+            expandable: false,
+            expanded: false,
+            key: String::new(),
+            icon: SidebarIcon::Glyph("\u{E80F}"),
+        });
+        for (label, path) in user_folders() {
+            rows.push(SidebarRow {
+                label: label.to_string(),
+                target: path.clone(),
+                depth: 0,
+                expandable: false,
+                expanded: false,
+                key: String::new(),
+                icon: SidebarIcon::Path(PathBuf::from(path)),
+            });
+        }
+
+        // 此电脑：展开就是本机全部驱动器（含 U 盘、光驱、网络盘）
+        let thispc = self.is_expanded(SIDEBAR_THISPC);
+        rows.push(SidebarRow {
+            label: "此电脑".to_string(),
+            target: HOME_PATH.to_string(),
+            depth: 0,
+            expandable: true,
+            expanded: thispc,
+            key: SIDEBAR_THISPC.to_string(),
+            icon: SidebarIcon::Glyph("\u{F158}"),
+        });
+        if thispc {
+            let mut all: Vec<_> = self.drives.values().cloned().collect();
+            all.sort_by(|a, b| a.letter.cmp(&b.letter));
+            for d in all {
+                let key = Self::node_key(&PathBuf::from(&d.root));
+                let expanded = self.is_expanded(&key);
+                rows.push(SidebarRow {
+                    label: d.display_name(),
+                    target: d.root.clone(),
+                    depth: 1,
+                    expandable: true,
+                    expanded,
+                    key: key.clone(),
+                    icon: SidebarIcon::Path(PathBuf::from(&d.root)),
+                });
+                if expanded {
+                    let kids = self.push_children_rows_into(&key, 2, &mut rows);
+                    let _ = kids;
+                }
+            }
+        }
+
+        // 回收站：空 / 满用不同的系统库存图标，和资源管理器一样一眼能分辨
+        let siid = if self.recycle_items.is_empty() {
+            windows::Win32::UI::Shell::SIID_RECYCLER.0
+        } else {
+            windows::Win32::UI::Shell::SIID_RECYCLERFULL.0
+        };
+        rows.push(SidebarRow {
+            label: "回收站".to_string(),
+            target: RECYCLE_PATH.to_string(),
+            depth: 0,
+            expandable: false,
+            expanded: false,
+            key: String::new(),
+            icon: SidebarIcon::Stock(siid),
+        });
+        rows
+    }
+
+    /// 把某个已展开节点的子目录递归展开成行（深度上限 8，防止符号链接成环）。
+    fn push_children_rows_into(&mut self, key: &str, depth: usize, out: &mut Vec<SidebarRow>) {
+        if depth > 8 {
+            return;
+        }
+        if !self.sidebar_children.contains_key(key) {
+            self.load_sidebar_children(key);
+        }
+        let Some(children) = self.sidebar_children.get(key).cloned() else { return };
+        for child in children {
+            let ckey = Self::node_key(&child);
+            let expanded = self.is_expanded(&ckey);
+            let fb = child.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let name = self.display_name(&child, &fb);
+            out.push(SidebarRow {
+                label: name,
+                target: child.to_string_lossy().to_string(),
+                depth,
+                expandable: true,
+                expanded,
+                key: ckey.clone(),
+                icon: SidebarIcon::Path(child.clone()),
+            });
+            if expanded {
+                self.push_children_rows_into(&ckey, depth + 1, out);
+            }
         }
     }
 

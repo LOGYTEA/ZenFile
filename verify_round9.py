@@ -19,6 +19,12 @@ import struct
 import subprocess
 import time
 
+# 脚本会改写 %APPDATA%\NexFile 下的设置来构造场景 —— 必须隔离，否则跑完
+# 用户自己的软件就带着脚本遗留的状态运行（详见 verify_env.py 的说明）。
+import verify_env
+
+verify_env.isolate()
+
 u = ctypes.WinDLL("user32", use_last_error=True)
 g = ctypes.WinDLL("gdi32", use_last_error=True)
 k = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -395,18 +401,20 @@ if len(clusters) >= 2:
     lx = (left_c[0] + left_c[1]) // 2
     rx = (right_c[0] + right_c[1]) // 2
     cy = (sb_top + h0) // 2
-    click(hwnd, lx, cy)
+    # 次序跟随资源管理器：**最右边**那颗是大图标，它左边一颗是详细信息
+    # （第 11 轮按用户要求互换过，脚本的预期必须跟着换，不然是把对的判成错的）。
+    click(hwnd, rx, cy)
     time.sleep(0.6)
     raw1, stride1, _, _ = grab(hwnd)
     d = sum(1 for i in range(0, len(raw0) - 4, 4) if abs(raw0[i] - raw1[i]) > 20)
-    print(f"    点左按钮后整窗变化样本 {d}")
-    mark(d > 300, "点左按钮切到大图标视图（布局明显变化）")
-    click(hwnd, rx, cy)
+    print(f"    点最右按钮后整窗变化样本 {d}")
+    mark(d > 300, "点最右按钮切到大图标视图（布局明显变化）")
+    click(hwnd, lx, cy)
     time.sleep(0.6)
     raw2, stride2, _, _ = grab(hwnd)
     d2 = sum(1 for i in range(0, len(raw0) - 4, 4) if abs(raw0[i] - raw2[i]) > 20)
-    print(f"    点右按钮后与初始详情视图的差异样本 {d2}")
-    mark(d2 < d / 3, "点右按钮回到详细信息视图（与初始画面基本一致）")
+    print(f"    点左按钮后与初始详情视图的差异样本 {d2}")
+    mark(d2 < d / 3, "点左按钮回到详细信息视图（与初始画面基本一致）")
 
 # ================================================== 5) 返回后保留选中
 print("\n===== 5) 返回上一级后保留进入文件夹的选中 =====")
