@@ -63,6 +63,8 @@ pub enum Command {
     Cut,
     Paste,
     Rename,
+    /// 批量重命名。载荷 = 模式序号（对应 `rename::MODE_LABELS`）
+    BulkRename(usize),
     Delete,
     DeletePermanent,
     NewFolder,

@@ -146,6 +146,24 @@ pub fn rename_item(owner: isize, item_path: &Path, new_name: &str) -> Result<()>
     fo.commit()
 }
 
+/// 批量重命名。`pairs` = (原路径, 新文件名)。
+///
+/// 全部放进**同一个** IFileOperation 再提交：这样要么一起成功，要么一起失败，
+/// 而且 Ctrl+Z 一次就能全部撤销。逐个 `rename_item` 会变成 N 个独立操作，
+/// 用户要按 N 次撤销，中间失败还会留下改了一半的目录。
+pub fn rename_items(owner: isize, pairs: &[(PathBuf, String)]) -> Result<()> {
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    let fo = FileOp::new(owner, false, true)?;
+    for (path, new_name) in pairs {
+        let item = shell_item(path)?;
+        let hs = HSTRING::from(new_name.as_str());
+        unsafe { fo.op.RenameItem(&item, &hs, None)? };
+    }
+    fo.commit()
+}
+
 /// 新建文件夹，返回实际创建的路径（Shell 会自动去重命名）。
 pub fn new_folder(owner: isize, dir: &Path) -> Result<()> {
     let fo = FileOp::new(owner, true, true)?;

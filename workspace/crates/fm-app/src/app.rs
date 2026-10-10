@@ -1342,8 +1342,12 @@ impl App {
     }
 
     pub fn commit_rename(&mut self, new_name: &str) {
-        self.destroy_rename_editor();
+        // 顺序很关键：**先**把 rename_index 取走，再销毁编辑框。
+        // DestroyWindow 会同步发 WM_KILLFOCUS，而 KILLFOCUS 走的是 cancel 分支，
+        // 它正好把 rename_index 清成 None。先销毁的话，回到这里 take() 拿到 None，
+        // 回车就永远改不了名 —— 用户看到"输入框关了但文件没变"。
         let Some(idx) = self.rename_index.take() else { return };
+        self.destroy_rename_editor();
         let Some(entry) = self.tab().entries.get(idx) else { return };
         let target = entry.path.clone();
         if new_name.is_empty() || new_name == entry.name {
@@ -1543,6 +1547,15 @@ impl App {
             Command::Cut => self.clipboard_write(ClipMode::Move),
             Command::Paste => self.paste(),
             Command::Rename => self.begin_rename(),
+            Command::BulkRename(mode) => {
+                let items = self.tab().selected_paths();
+                if items.is_empty() {
+                    report(self.hwnd, "没有选中任何项目：先选中要改名的文件");
+                    return;
+                }
+                let ptr = self as *mut App;
+                crate::rename::open(ptr, items, mode);
+            }
             Command::Delete => self.delete_selected(false),
             Command::DeletePermanent => self.delete_selected(true),
             Command::NewFolder => self.new_folder(),
@@ -2356,6 +2369,17 @@ fn own_menu_rows(app: &App, items: &[PathBuf]) -> Vec<menu::MenuEntry> {
         rows.push(shell_row("剪切", Some("\u{E8C6}"), Command::Cut));
         rows.push(shell_row("复制", Some("\u{E8C8}"), Command::Copy));
         rows.push(shell_row("重命名", Some("\u{E8AC}"), Command::Rename));
+        // 「批量重命名」做成一个带下拉的项：资源管理器把高级选项收在箭头后面，
+        // 平铺出来会把右键菜单顶得很长。五种模式各对应 fm_core::bulk 里的一条规则。
+        rows.push(submenu_row(
+            "批量重命名",
+            Some("\u{E8AC}"),
+            crate::rename::MODE_LABELS
+                .iter()
+                .enumerate()
+                .map(|(i, label)| shell_row(label, None, Command::BulkRename(i)))
+                .collect(),
+        ));
         rows.push(shell_row("删除", Some("\u{E74D}"), Command::Delete));
         rows.push(menu::MenuEntry::sep());
     }

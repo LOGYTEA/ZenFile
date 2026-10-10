@@ -551,9 +551,9 @@ if ok_menu:
     top0, row_h = (band[0], band[-1] - band[0] + 1) if band else (4, 28)
     s = row_h / 28.0
     print(f"  量得: 内容顶边 {top0} 行高 {row_h}px (scale≈{s:.2f})")
-    # 文件菜单顺序: 0打开 1剪切 2复制 3重命名 4删除 5[分隔] 6粘贴 7新建
-    #              8[分隔] 9全选 10刷新 11查看 12排序方式 13属性
-    y13 = int(top0 + 5 * row_h + 6 * s + 2 * row_h + 6 * s + 4 * row_h + row_h / 2)
+    # 文件菜单顺序: 0打开 1打开方式 2剪切 3复制 4重命名 5批量重命名 6删除 7[分隔]
+    #              8粘贴 9新建 10[分隔] 11全选 12刷新 13查看 14排序方式 15属性
+    y13 = int(top0 + 7 * row_h + 6 * s + 2 * row_h + 6 * s + 4 * row_h + row_h / 2)
     print(f"  推定「属性」行中心 y={y13}")
     target = None
     for mul in (0, -1, 1, -2, 2):

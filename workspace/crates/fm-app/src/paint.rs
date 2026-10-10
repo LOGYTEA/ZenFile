@@ -2138,7 +2138,7 @@ pub fn create_children(app: &mut App, instance: Option<HINSTANCE>) {
 }
 
 /// 给 EDIT 子控件套上 UI 字体（默认是系统 12px 位图字体，与自绘 UI 完全不搭）。
-fn set_edit_font(hwnd: HWND, scale: f32) {
+pub(crate) fn set_edit_font(hwnd: HWND, scale: f32) {
     unsafe {
         let f = ui_font(scale);
         let _ = SendMessageW(hwnd, WM_SETFONT, Some(WPARAM(f.0 as usize)), Some(LPARAM(1)));

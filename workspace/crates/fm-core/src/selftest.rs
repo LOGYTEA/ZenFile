@@ -427,6 +427,72 @@ pub fn run() -> i32 {
     let _ = crate::folder_ini::write(&ini_root, &crate::folder_ini::FolderIni::default());
     let _ = std::fs::remove_dir_all(&ini_root);
 
+    // 18. 批量重命名的改名规则：纯函数，最容易出错也最该被自检盯住
+    use crate::bulk::{apply, duplicates, plan, split_ext, Rule};
+    let rp = Rule::Replace {
+        find: ".".into(),
+        repl: "_".into(),
+        case_sensitive: true,
+        first_only: false,
+    };
+    let a_keep = apply("report.final.txt", &rp, true, 0);
+    let a_all = apply("report.final.txt", &rp, false, 0);
+    h.check(
+        "bulk::replace",
+        a_keep == "report_final.txt" && a_all == "report_final_txt",
+        &format!("保留扩展名 -> {a_keep}，作用于全名 -> {a_all}"),
+    );
+    // 大小写不敏感：BanAna 里的 a 和 A 都要被认成同一个字符
+    let mk = |first_only: bool| Rule::Replace {
+        find: "A".into(),
+        repl: "b".into(),
+        case_sensitive: false,
+        first_only,
+    };
+    let c1 = apply("BanAna.txt", &mk(true), true, 0);
+    let c2 = apply("BanAna.txt", &mk(false), true, 0);
+    h.check(
+        "bulk::case_first",
+        c1 == "BbnAna.txt" && c2 == "Bbnbnb.txt",
+        &format!("只替换首个 -> {c1}，全部替换 -> {c2}"),
+    );
+    let num = Rule::Number { template: "照片".into(), start: 1, digits: 3 };
+    let names: Vec<String> = ["a.txt", "b.jpg", "c.png"].iter().map(|s| s.to_string()).collect();
+    let pn = plan(&names, &num, true);
+    h.check(
+        "bulk::number",
+        pn == vec!["照片001.txt", "照片002.jpg", "照片003.png"],
+        &format!("{pn:?}"),
+    );
+    h.check(
+        "bulk::prefix_suffix",
+        apply("a.txt", &Rule::Prefix("【新】".into()), true, 0) == "【新】a.txt"
+            && apply("a.txt", &Rule::Suffix("-副本".into()), true, 0) == "a-副本.txt",
+        &format!(
+            "{} / {}",
+            apply("a.txt", &Rule::Prefix("【新】".into()), true, 0),
+            apply("a.txt", &Rule::Suffix("-副本".into()), true, 0)
+        ),
+    );
+    h.check(
+        "bulk::strip",
+        apply("abcdef.txt", &Rule::Strip { at: 1, len: 3 }, true, 0) == "def.txt",
+        &apply("abcdef.txt", &Rule::Strip { at: 1, len: 3 }, true, 0),
+    );
+    // 非法字符和末尾的点必须被处理掉，否则预览骗人
+    let dirty = apply("a:b<c>.txt", &Rule::Prefix("".into()), false, 0);
+    h.check(
+        "bulk::sanitize",
+        !dirty.contains(['<', '>', ':']) && split_ext("noext").1.is_empty(),
+        &format!("a:b<c>.txt -> {dirty}"),
+    );
+    let dup = duplicates(&["x.txt".to_string(), "X.TXT".to_string(), "y.txt".to_string()]);
+    h.check(
+        "bulk::duplicates",
+        dup == vec![true, true, false],
+        &format!("{dup:?}（NTFS 上大小写视为同一个文件）"),
+    );
+
     println!("\n通过 {}/{} 项", h.passed, h.passed + h.failed);
     if h.failed == 0 {
         0
