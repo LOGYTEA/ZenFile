@@ -14,7 +14,12 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use windows::core::HSTRING;
-use windows::Win32::Graphics::Gdi::HDC;
+use windows::Win32::Foundation::RECT;
+use windows::Win32::Graphics::Gdi::{
+    AlphaBlend, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush, DeleteDC,
+    DeleteObject, FillRect, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, HDC,
+};
+use windows::Win32::Foundation::COLORREF;
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
 use windows::Win32::UI::Shell::{
     SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_SMALLICON,
@@ -24,15 +29,23 @@ use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, DrawIconEx, HICON, DI
 
 const SHGFI_BASE: u32 = SHGFI_ICON.0 | SHGFI_USEFILEATTRIBUTES.0;
 
-/// 目录/驱动器图标缓存的上界。超过就整表清空（在切换目录时做，不在绘制中做）。
+/// 按路径缓存的图标上界。超过就整表清空（在切换目录时做，不在绘制中做）。
 const DIR_CACHE_MAX: usize = 1024;
+
+/// 这几类文件的图标**只属于它自己**，不能按扩展名归并：
+/// 每个 exe/dll/ico 都嵌着自己的图标，.lnk 显示的是目标图标，.url 显示网站图标。
+/// 其余类型（txt/cpp/png…）全系统共用同一个图标，按扩展名取即可，没必要逐文件问 Shell。
+const PER_FILE_ICON_EXT: &[&str] = &[
+    "exe", "dll", "ico", "lnk", "url", "scr", "msi", "cpl", "msc", "drv", "ocx", "sys", "appref-ms",
+];
 
 pub struct IconCache {
     small: HashMap<String, HICON>,
     large: HashMap<String, HICON>,
-    /// **具体**目录 / 驱动器根的图标：key = "L:<小写路径>" / "S:<小写路径>"。
+    /// **具体**目录 / 驱动器根 / 需逐文件取图标的文件的图标：
+    /// key = "L:<小写路径>" / "S:<小写路径>"。
     /// 值是 Option：`None` 表示"已经问过 Shell，但没拿到"，避免每帧重绘都对每个
-    /// 目录重复发起一次 Shell 查询。
+    /// 路径重复发起一次 Shell 查询。
     dir: HashMap<String, Option<HICON>>,
 }
 
@@ -135,27 +148,42 @@ impl IconCache {
     /// `IconResource` 负资源 ID 也好、`IconFile`+`IconIndex` 也好），返回的正是
     /// 资源管理器里看到的那个图标；驱动器根还会直接给硬盘图标。
     pub fn dir_icon(&mut self, path: &Path, large: bool) -> HICON {
+        self.path_icon(path, large)
+            .unwrap_or_else(|| self.icon(true, "", large))
+    }
+
+    /// 文件图标入口。
+    ///
+    /// exe/dll/ico/lnk/url 这类"图标只属于它自己"的类型走真实路径；
+    /// 其余按扩展名拿通用图标（上千个 .txt 逐个问 Shell 没意义，纯属浪费）。
+    pub fn file_icon(&mut self, path: &Path, extension: &str, large: bool) -> HICON {
+        let ext = extension.trim_start_matches('.').to_ascii_lowercase();
+        if !PER_FILE_ICON_EXT.contains(&ext.as_str()) {
+            return self.icon(false, &ext, large);
+        }
+        self.path_icon(path, large)
+            .unwrap_or_else(|| self.icon(false, &ext, large))
+    }
+
+    /// 按真实路径向 Shell 取图标（目录、驱动器根、exe/lnk 等共用这一条路）。
+    fn path_icon(&mut self, path: &Path, large: bool) -> Option<HICON> {
         let prefix = if large { "L:" } else { "S:" };
         let norm = path.to_string_lossy().to_lowercase();
         let dkey = format!("{prefix}{norm}");
         // 先拷出来再可变借用自己，否则撞 borrow checker
         let cached: Option<Option<HICON>> = self.dir.get(&dkey).copied();
-        let got = match cached {
+        match cached {
             Some(h) => h,
             None => {
-                let h = self.shell_dir_icon(path, large);
+                let h = self.shell_path_icon(path, large);
                 self.dir.insert(dkey, h);
                 h
             }
-        };
-        match got {
-            Some(h) => h,
-            None => self.icon(true, "", large),
         }
     }
 
     /// 向 Shell 查询某个真实目录的图标；拿不到返回 None（调用方回退通用图标）。
-    fn shell_dir_icon(&mut self, path: &Path, large: bool) -> Option<HICON> {
+    fn shell_path_icon(&mut self, path: &Path, large: bool) -> Option<HICON> {
         let s = path.to_string_lossy();
         if s.is_empty() {
             return None;
@@ -206,6 +234,45 @@ impl IconCache {
         unsafe {
             // DI_NORMAL：用图标自带的遮罩绘制，边角保持透明
             let _ = DrawIconEx(hdc, x, y, icon, size, size, 0, None, DI_NORMAL);
+        }
+    }
+
+    /// 淡化绘制（隐藏项 / 受保护的系统文件用）。
+    ///
+    /// 资源管理器对隐藏项的做法就是把图标整体调淡，而不是换个图标 ——
+    /// 这里先把图标画进一张 32bpp 位图，再用 AlphaBlend 以指定不透明度贴出去。
+    pub fn draw_faded(&self, hdc: HDC, icon: HICON, x: i32, y: i32, size: i32, alpha: u8) {
+        if icon.0.is_null() || alpha >= 255 {
+            self.draw(hdc, icon, x, y, size);
+            return;
+        }
+        unsafe {
+            let src = windows::Win32::Graphics::Gdi::GetDC(None);
+            let mem = CreateCompatibleDC(Some(src));
+            let _ = windows::Win32::Graphics::Gdi::ReleaseDC(None, src);
+            if mem.is_invalid() {
+                self.draw(hdc, icon, x, y, size);
+                return;
+            }
+            let bmp = CreateCompatibleBitmap(hdc, size, size);
+            let old = SelectObject(mem, bmp.into());
+            // 先铺满透明底：图标是带 alpha 的，直接画上去边角会残留上一次的内容
+            let b = CreateSolidBrush(COLORREF(0));
+            let r = RECT { left: 0, top: 0, right: size, bottom: size };
+            FillRect(mem, &r, b);
+            let _ = DeleteObject(b.into());
+            let _ = DrawIconEx(mem, 0, 0, icon, size, size, 0, None, DI_NORMAL);
+
+            let mut bf: BLENDFUNCTION = std::mem::zeroed();
+            bf.BlendOp = AC_SRC_OVER as u8;
+            bf.BlendFlags = 0;
+            bf.SourceConstantAlpha = alpha;
+            bf.AlphaFormat = AC_SRC_ALPHA as u8;
+            let _ = AlphaBlend(hdc, x, y, size, size, mem, 0, 0, size, size, bf);
+
+            SelectObject(mem, old);
+            let _ = DeleteObject(bmp.into());
+            let _ = DeleteDC(mem);
         }
     }
 }

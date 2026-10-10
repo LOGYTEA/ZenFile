@@ -75,6 +75,9 @@ pub struct FilesConfig {
 pub struct ViewConfig {
     pub default_mode: String,
     pub show_hidden: bool,
+    /// 显示"受保护的操作系统文件"（FILE_ATTRIBUTE_SYSTEM）。默认关闭，
+    /// 与资源管理器"文件夹选项 → 查看"里的同名开关一致。
+    pub show_system: bool,
     pub sort_key: String,
     pub sort_descending: bool,
 }

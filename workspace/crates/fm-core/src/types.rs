@@ -40,6 +40,16 @@ impl FileEntry {
         matches!(self.kind, FileKind::Directory | FileKind::ReparsePoint)
     }
 
+    /// 带隐藏属性的项。
+    pub fn is_hidden(&self) -> bool {
+        self.hidden
+    }
+
+    /// 带系统属性的项（"受保护的操作系统文件"那一类）。
+    pub fn is_system(&self) -> bool {
+        self.attributes & windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_SYSTEM.0 != 0
+    }
+
     /// 用于列表显示的"类型"描述：取扩展名大写 + 文件，或"文件夹"。
     pub fn type_label(&self) -> String {
         match self.kind {
@@ -153,15 +163,29 @@ impl ViewMode {
 }
 
 /// 即时筛选：大小写无关子串匹配。
-pub fn filter_entries(entries: &[FileEntry], query: &str) -> Vec<usize> {
+/// 可见行 = 名称匹配查询 **且** 通过了"隐藏项 / 受保护系统文件"两道开关。
+///
+/// 两道开关相互独立，和资源管理器的"文件夹选项 → 查看"一致：
+/// 系统文件即便勾了"显示隐藏的项目"也仍要单独放行。
+pub fn filter_entries(
+    entries: &[FileEntry],
+    query: &str,
+    show_hidden: bool,
+    show_system: bool,
+) -> Vec<usize> {
     let q = query.to_lowercase();
-    if q.is_empty() {
-        return (0..entries.len()).collect();
-    }
     entries
         .iter()
         .enumerate()
-        .filter(|(_, e)| e.name.to_lowercase().contains(&q))
+        .filter(|(_, e)| {
+            if e.is_system() && !show_system {
+                return false;
+            }
+            if e.is_hidden() && !show_hidden {
+                return false;
+            }
+            q.is_empty() || e.name.to_lowercase().contains(&q)
+        })
         .map(|(i, _)| i)
         .collect()
 }

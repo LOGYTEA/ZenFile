@@ -38,7 +38,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MFS_DISABLED, MFT_SEPARATOR, MIIM_BITMAP, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING,
     MIIM_SUBMENU, SW_SHOWNOACTIVATE, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_DESTROY, WM_ERASEBKGND,
     WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
-    WNDCLASSEXW, WS_BORDER, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WM_RBUTTONUP, WNDCLASSEXW, WS_BORDER, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::theme::Theme;
@@ -80,6 +80,10 @@ pub enum Command {
     SortBySize,
     ToggleSidebar,
     ToggleStatusbar,
+    /// 显示/隐藏"隐藏的项目"（FILE_ATTRIBUTE_HIDDEN）
+    ToggleHidden,
+    /// 显示/隐藏"受保护的操作系统文件"（FILE_ATTRIBUTE_SYSTEM）
+    ToggleSystem,
     NewTab,
     About,
 }
@@ -565,7 +569,20 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             // 子菜单弹出后由**子菜单**持有 capture，本窗口就再也收不到 WM_MOUSEMOVE。
             // 于是鼠标移回父菜单时高亮会一直卡在展开子菜单的那一项上。这里让子菜单在
             // 光标越过自己左边界时把 capture 交还回来，并附带上屏幕坐标重算高亮。
-            if state.parent_menu.is_some() && x < 0 {
+            // 是否该把鼠标交还给父菜单：光标离开本菜单，且落回父菜单的矩形内。
+            // 只判 x<0 是不够的 —— 子菜单被屏幕边界挤到父菜单**左侧**时，
+            // 光标往右移回父菜单，x 是大于宽度的，条件不成立，父子就此失联。
+            let back_to_parent = state.parent_menu.is_some()
+                && !inside_popup(state, x, y)
+                && (x < 0 || {
+                    let p = state.parent_menu.unwrap();
+                    let mut pr = RECT::default();
+                    let mut sp = POINT { x, y };
+                    let _ = ClientToScreen(hwnd, &mut sp);
+                    let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(p, &mut pr);
+                    sp.x >= pr.left - 2 && sp.x <= pr.right + 2 && sp.y >= pr.top && sp.y <= pr.bottom
+                });
+            if back_to_parent {
                 let mut pt = POINT { x, y };
                 let _ = ClientToScreen(hwnd, &mut pt);
                 if let Some(p) = state.parent_menu {
@@ -596,6 +613,10 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                     _ => {
                         if let Some(sub) = state.submenu.take() {
                             let _ = DestroyWindow(sub);
+                            // 子菜单销毁时自己调了 ReleaseCapture —— 那一次释放掉的
+                            // 正是**本窗口**的 capture。不立刻抢回来的话，本窗口从此
+                            // 收不到任何鼠标消息：悬停不再响应、点击外面也关不掉菜单。
+                            let _ = SetCapture(hwnd);
                         }
                         state.open_submenu_for = None;
                     }
@@ -615,6 +636,8 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                 let _ = DestroyWindow(sub);
             }
             state.open_submenu_for = None;
+            // 同理：销毁子菜单会连本窗口的 capture 一起释放掉，必须抢回来
+            let _ = SetCapture(hwnd);
             let idx = if inside_popup(state, pt.x, pt.y) {
                 entry_at(state, pt.y)
             } else {
@@ -629,11 +652,16 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         WM_MENU_SUBCLOSED => {
             state.submenu = None;
             state.open_submenu_for = None;
+            // 子菜单销毁时释放了 capture，父菜单必须自己抢回来，
+            // 否则从此收不到鼠标消息 —— 菜单就"关不掉"了。
+            let _ = SetCapture(hwnd);
             LRESULT(0)
         }
         WM_MENU_CLOSE_CHAIN => {
             // 子菜单里的条目被真正执行了：整条菜单链一起关，
             // 只关最里层会留下一个还开着的空壳父菜单。
+            state.submenu = None;
+            state.open_submenu_for = None;
             state.activated = true;
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
@@ -645,6 +673,9 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             // 落在弹出菜单之外时只能关闭菜单，绝不能触发任何条目 ——
             // 之前缺这个判断，导致每条选项的点击热区在水平方向上等同于整块屏幕。
             if !inside_popup(state, x, y) {
+                // 点空白处 = 关掉**整条**菜单链。只销毁自己会让父菜单变成
+                // 一个还挂在屏幕上、却再也收不到鼠标消息的空壳（表现就是"菜单关不掉"）。
+                state.activated = true;
                 let _ = DestroyWindow(hwnd);
                 return LRESULT(0);
             }
@@ -652,6 +683,12 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                 let entry = state.entries[idx].clone();
                 activate(state, hwnd, &entry);
             }
+            LRESULT(0)
+        }
+        WM_RBUTTONUP => {
+            // 菜单开着时再点右键：资源管理器是整条菜单收起
+            state.activated = true;
+            let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
         WM_MOUSEWHEEL => {

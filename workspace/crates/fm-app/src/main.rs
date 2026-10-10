@@ -13,6 +13,7 @@ mod app;
 mod icons;
 mod menu;
 mod paint;
+mod props;
 mod theme;
 
 use std::path::PathBuf;
@@ -98,6 +99,7 @@ fn main() {
     register_classes(instance);
 
     menu::register_menu_class();
+    props::register_props_class();
 
     let hwnd = unsafe {
         CreateWindowExW(
@@ -448,9 +450,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 // EN_CHANGE：即时筛选
                 let app = &mut *app_ptr;
                 let text = paint::read_window_text(app.hwnd_search);
+                // 先拷出开关，再取 tab 的可变借用（否则撞借用检查 E0503）
+                let (sh, ss) = (app.show_hidden, app.show_system);
                 let tab = app.tab_mut();
                 tab.filter = text;
-                tab.recompute_filter();
+                tab.recompute_filter(sh, ss);
                 let _ = InvalidateRect(Some(hwnd), None, true);
             }
             LRESULT(0)
@@ -473,9 +477,27 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             if inside(&l.menu_btn, x, y) {
                 chrome |= app::HOVER_MENU_BTN;
             }
-            if in_close != app.hovering_close || chrome != app.hover_chrome {
+            // 标签栏悬停：决定了哪个标签显示关闭按钮
+            let hover_tab = hit_tab(app, &l, x, y);
+            // 状态栏布局切换按钮悬停
+            let hover_view = if app.cfg.ui.statusbar_visible {
+                match paint::status_view_hit(&l, &app.metrics, x, y) {
+                    Some(fm_core::ViewMode::LargeIcons) => 1u8,
+                    Some(_) => 2u8,
+                    None => 0u8,
+                }
+            } else {
+                0u8
+            };
+            if in_close != app.hovering_close
+                || chrome != app.hover_chrome
+                || hover_tab != app.hover_tab
+                || hover_view != app.hover_view_btn
+            {
                 app.hovering_close = in_close;
                 app.hover_chrome = chrome;
+                app.hover_tab = hover_tab;
+                app.hover_view_btn = hover_view;
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
             LRESULT(0)
@@ -493,10 +515,23 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let ctrl = GetKeyState(0x11) < 0;
             let shift = GetKeyState(0x10) < 0;
             if let Some(i) = hit_tab(app, &l, x, y) {
-                app.active = i;
+                // 关闭按钮压在标签右上角，命中优先级必须高于"切换标签"，
+                // 否则每次点 × 都会先切一次标签（然后才关掉别的）。
+                if inside(&l.tab_close_rect(i, app.tabs.len(), &app.metrics), x, y) {
+                    app.close_tab(i);
+                } else {
+                    app.active = i;
+                }
                 paint::sync_address(app);
                 let _ = InvalidateRect(Some(hwnd), None, true);
                 return LRESULT(0);
+            }
+            // 状态栏右下角：资源管理器同款的"大图标 / 详细信息"快速切换
+            if app.cfg.ui.statusbar_visible {
+                if let Some(mode) = paint::status_view_hit(&l, &app.metrics, x, y) {
+                    app.set_view(mode);
+                    return LRESULT(0);
+                }
             }
             if inside(&l.back, x, y) {
                 app.go_back();
@@ -582,6 +617,25 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     app.show_more_menu(pt.x, pt.y);
                     return LRESULT(0);
                 }
+            }
+            LRESULT(0)
+        }
+        WM_MBUTTONDOWN => {
+            // 鼠标中键：点标签 = 关闭该标签（资源管理器/浏览器的通用约定）
+            let app = &mut *app_ptr;
+            let (x, y) = client_xy(hwnd, lparam);
+            let l = paint::compute_layout(
+                app.last_size.0,
+                app.last_size.1,
+                &app.metrics,
+                app.cfg.ui.sidebar_visible,
+                app.cfg.ui.statusbar_visible,
+            );
+            if let Some(i) = hit_tab(app, &l, x, y) {
+                app.close_tab(i);
+                app.hover_tab = None;
+                paint::sync_address(app);
+                let _ = InvalidateRect(Some(hwnd), None, true);
             }
             LRESULT(0)
         }
@@ -820,8 +874,14 @@ unsafe fn handle_hit_test(hwnd: HWND, lparam: LPARAM) -> LRESULT {
         let plus = l.new_tab_rect(app.tabs.len(), &app.metrics);
         // 标题栏上的自有按钮（侧栏开关 / 更多菜单 / 新建标签）要能收到
         // WM_LBUTTONUP，必须判为 HTCLIENT，否则系统把它当标题栏拖拽吞掉。
+        // 标签本身也必须判 HTCLIENT：之前整条标签栏都返回 HTCAPTION，
+        // 系统把按下当成"拖窗口"直接吞掉，窗口永远收不到 WM_LBUTTONDOWN
+        // —— 表现就是"标签点不动、切不了"。标签之间的空白仍留给拖拽。
+        let on_tab = (0..app.tabs.len())
+            .any(|i| inside(&l.tab_rect(i, app.tabs.len(), &app.metrics), pt.x, pt.y));
         if inside(&l.sidebar_toggle, pt.x, pt.y)
             || inside(&l.menu_btn, pt.x, pt.y)
+            || on_tab
             || (plus.right < l.tabs.right && inside(&plus, pt.x, pt.y))
         {
             return LRESULT(1); // HTCLIENT
@@ -1042,10 +1102,11 @@ pub(crate) fn on_edit_escape() {
     paint::sync_address(app);
     paint::set_window_text_utf16(app.hwnd_search, "");
     {
+        let (sh, ss) = (app.show_hidden, app.show_system);
         let tab = app.tab_mut();
         tab.filter.clear();
         tab.search_root = None;
-        tab.recompute_filter();
+        tab.recompute_filter(sh, ss);
     }
     app.reload();
     app.invalidate();

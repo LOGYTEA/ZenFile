@@ -1,0 +1,54 @@
+[workspace]
+members = ["crates/fm-core", "crates/fm-app", "crates/fm-taskmgr"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+authors = ["FileManager Team"]
+license = "Apache-2.0"
+
+[workspace.dependencies]
+fm-core = { path = "crates/fm-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 全部 Windows 能力集中在此声明，避免各 crate 重复 feature。
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_DataExchange",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_System_Registry",
+    "Win32_System_Pipes",
+    "Win32_System_IO",
+    "Win32_System_Environment",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Console",
+    "Win32_System_TaskScheduler",
+    "Win32_System_Search_Common",
+    "Win32_System_Time",
+    "Win32_Storage_FileSystem",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Accessibility",
+    "Win32_Security",
+] }
+
+# 面向 §12 内存/体积预算的发布配置
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -4,7 +4,7 @@
 //! 列表是虚拟化的：只为可见行请求数据与图标 index。
 
 use windows::core::HSTRING;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreateSolidBrush, DeleteDC,
     DeleteObject, DrawTextW, FillRect, GetBkColor, InvalidateRect, SelectObject, SetBkMode,
@@ -235,6 +235,23 @@ impl Layout {
         }
     }
 
+    /// 标签页右上角的关闭按钮。
+    ///
+    /// 绘制和命中必须共用这一个函数 —— 两边各写一份常量，改一次就错位（踩过）。
+    /// 资源管理器只在"当前标签"和"鼠标悬停的标签"上画它，所以调用方还要看 hover 态。
+    pub fn tab_close_rect(&self, index: usize, count: usize, m: &Metrics) -> RECT {
+        let r = self.tab_rect(index, count, m);
+        let d = (18.0 * m.scale).round() as i32;
+        let gap = (2.0 * m.scale).round() as i32;
+        let cy = (r.top + r.bottom) / 2;
+        RECT {
+            left: (r.right - gap - d).max(r.left),
+            top: cy - d / 2,
+            right: (r.right - gap).max(r.left + 2),
+            bottom: cy - d / 2 + d,
+        }
+    }
+
     /// 最后一个标签右侧的"新建标签"按钮（+）。宽度固定，不随标签数伸缩。
     pub fn new_tab_rect(&self, count: usize, m: &Metrics) -> RECT {
         let w = (30.0 * m.scale).round() as i32;
@@ -302,8 +319,12 @@ fn paint_title_bar(app: &App, hdc: HDC, l: &Layout) {
         // 标签页
         for (i, tab) in app.tabs.iter().enumerate() {
             let r = l.tab_rect(i, app.tabs.len(), &app.metrics);
+            let hovered = app.hover_tab == Some(i);
             let (bg, fg) = if i == app.active {
                 (t.tab_active, t.text)
+            } else if hovered {
+                // 悬停也要看得出来：不然鼠标扫过标签栏没有任何反馈
+                (t.hover_bg, t.text)
             } else {
                 (t.chrome_bg, t.text_dim)
             };
@@ -311,12 +332,31 @@ fn paint_title_bar(app: &App, hdc: HDC, l: &Layout) {
             FillRect(hdc, &r, b);
             let _ = DeleteObject(b.into());
             SetTextColor(hdc, fg);
-            draw_text(hdc, &tab.title, pad_rect_width(&r, 10), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            // 标题文字右侧要留出关闭按钮的位置，否则长标题会被 × 压住
+            let mut tr = pad_rect_width(&r, 10);
+            if i == app.active || hovered {
+                tr.right -= (18.0 * app.metrics.scale) as i32;
+            }
+            draw_text(hdc, &tab.title, tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
             if i == app.active {
                 let accent = CreateSolidBrush(t.accent);
                 let line = RECT { left: r.left, top: r.bottom - 2, right: r.right, bottom: r.bottom };
                 FillRect(hdc, &line, accent);
                 let _ = DeleteObject(accent.into());
+            }
+            // 关闭按钮：当前标签常驻，其余标签只在鼠标悬停时出现（同资源管理器）
+            if i == app.active || hovered {
+                let cr = l.tab_close_rect(i, app.tabs.len(), &app.metrics);
+                if hovered {
+                    let hb = CreateSolidBrush(t.hover_bg);
+                    FillRect(hdc, &cr, hb);
+                    let _ = DeleteObject(hb.into());
+                }
+                SetTextColor(hdc, t.text);
+                let g = glyph_font(app.metrics.scale);
+                let old_g = SelectObject(hdc, g.into());
+                draw_text(hdc, "\u{E8BB}", cr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                SelectObject(hdc, old_g);
             }
         }
 
@@ -887,12 +927,19 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
 
         // 只为可见行解析 icon index（独占借用 icons），之后再取 tab 的只读引用绘制
         let mut icon_handles: Vec<HICON> = Vec::with_capacity(rows_fit);
+        // 每一行的图标不透明度：隐藏项调淡、受保护的系统文件调得更淡。
+        // 资源管理器就是这么区分的（不换图标，只把图标压暗），照抄能让人一眼认出。
+        let mut icon_alpha: Vec<u8> = Vec::with_capacity(rows_fit);
         for i in first..(first + rows_fit).min(visible.len()) {
             let index = visible[i];
             let Some(e) = app.tab().entries.get(index) else {
                 icon_handles.push(HICON(std::ptr::null_mut()));
+                icon_alpha.push(255);
                 continue;
             };
+            // 先算透明度：下面 icons 要独占借用 app，届时 e 的借用必须已经结束
+            let alpha = if e.is_system() { 110 } else if e.is_hidden() { 150 } else { 255 };
+            icon_alpha.push(alpha);
             let ext = e.path.extension().map(|x| format!(".{}", x.to_string_lossy())).unwrap_or_default();
             // 目录优先用 desktop.ini 指定的自定义图标（§12：无自定义才用通用图标）
             let big = icon_size > 24;
@@ -925,8 +972,9 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
             SetTextColor(hdc, if selected { t.selection_text } else { t.text });
 
             let icon = icon_handles.get(i - first).copied().unwrap_or(HICON(std::ptr::null_mut()));
+            let alpha = icon_alpha.get(i - first).copied().unwrap_or(255);
             if mode == fm_core::ViewMode::Details {
-                app.icons.draw(hdc, icon, col_name - icon_size - icon_gap, y + (row_h - icon_size) / 2, icon_size);
+                app.icons.draw_faded(hdc, icon, col_name - icon_size - icon_gap, y + (row_h - icon_size) / 2, icon_size, alpha);
                 let name_r = RECT { left: col_name, top: y, right: col_date, bottom: y + row_h };
                 draw_text(hdc, &entry.name, name_r, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
                 SetTextColor(hdc, if selected { t.selection_text } else { t.text_dim });
@@ -935,12 +983,12 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
                 draw_text(hdc, &size_of(&entry), RECT { left: col_size, top: y, right: l.view.right, bottom: y + row_h }, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             } else if mode == fm_core::ViewMode::List {
                 let x = l.view.left + text_pad;
-                app.icons.draw(hdc, icon, x, y + (row_h - icon_size) / 2, icon_size);
+                app.icons.draw_faded(hdc, icon, x, y + (row_h - icon_size) / 2, icon_size, alpha);
                 let name_r = RECT { left: x + icon_size + 8, top: y, right: l.view.right, bottom: y + row_h };
                 draw_text(hdc, &entry.name, name_r, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
             } else {
                 let cx = r.left + (r.right - r.left) / 2 - icon_size / 2;
-                app.icons.draw(hdc, icon, cx, y + (8.0 * app.metrics.scale) as i32, icon_size);
+                app.icons.draw_faded(hdc, icon, cx, y + (8.0 * app.metrics.scale) as i32, icon_size, alpha);
                 let name_r = RECT { left: r.left + 4, top: y + icon_size + (4.0 * app.metrics.scale) as i32, right: r.right - 4, bottom: y + row_h };
                 draw_text(hdc, &entry.name, name_r, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_CENTER);
             }
@@ -1013,6 +1061,83 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
+/// 状态栏右下角"快速布局切换"的两个按钮 —— 资源管理器同款。
+///
+/// 返回 (大图标, 详细信息)。**绘制和命中测试必须共用这一个函数**：两边各写一份
+/// 常量，改一次尺寸就错位（这条纪律是踩过坑才立的）。
+pub fn status_view_rects(l: &Layout, m: &Metrics) -> (RECT, RECT) {
+    let btn_w = (30.0 * m.scale).round() as i32;
+    let btn_h = (20.0 * m.scale).round() as i32;
+    let gap = (2.0 * m.scale).round() as i32;
+    let cy = (l.status.top + l.status.bottom) / 2;
+    let top = cy - btn_h / 2;
+    let right = l.status.right - (6.0 * m.scale).round() as i32;
+    let details = RECT { left: right - btn_w, top, right, bottom: top + btn_h };
+    let icons = RECT { left: right - btn_w * 2 - gap, top, right: right - btn_w - gap, bottom: top + btn_h };
+    (icons, details)
+}
+
+/// 命中状态栏的布局切换按钮，返回被点到的按钮对应的视图模式。
+pub fn status_view_hit(l: &Layout, m: &Metrics, x: i32, y: i32) -> Option<fm_core::ViewMode> {
+    let (icons, details) = status_view_rects(l, m);
+    if x >= icons.left && x <= icons.right && y >= icons.top && y <= icons.bottom {
+        return Some(fm_core::ViewMode::LargeIcons);
+    }
+    if x >= details.left && x <= details.right && y >= details.top && y <= details.bottom {
+        return Some(fm_core::ViewMode::Details);
+    }
+    None
+}
+
+/// 两个按钮的图标是**手绘**的：不用 Segoe MDL2 的字形码（不同系统版本的码位
+/// 不一致，容易画出一个空白方框）。2×2 方块 = 大图标；三条横线 = 详细信息。
+unsafe fn draw_view_glyph(hdc: HDC, r: &RECT, grid: bool, color: COLORREF) {
+    let brush = CreateSolidBrush(color);
+    if grid {
+        let cell = ((r.bottom - r.top - 8) / 2).max(2);
+        let x0 = r.left + ((r.right - r.left) - (cell * 2 + 2)) / 2;
+        let y0 = r.top + ((r.bottom - r.top) - (cell * 2 + 2)) / 2;
+        for gy in 0..2 {
+            for gx in 0..2 {
+                let l = x0 + gx * (cell + 2);
+                let t = y0 + gy * (cell + 2);
+                let _ = FillRect(hdc, &RECT { left: l, top: t, right: l + cell, bottom: t + cell }, brush);
+            }
+        }
+    } else {
+        let line_h = 2;
+        let gap = 3;
+        let total = line_h * 3 + gap * 2;
+        let y0 = r.top + ((r.bottom - r.top) - total) / 2;
+        let w = r.right - r.left - 12;
+        for k in 0..3 {
+            let t = y0 + k * (line_h + gap);
+            let _ = FillRect(hdc, &RECT { left: r.left + 6, top: t, right: r.left + 6 + w, bottom: t + line_h }, brush);
+        }
+    }
+    let _ = DeleteObject(brush.into());
+}
+
+/// 画状态栏右下角的两个布局切换按钮。
+fn paint_view_switch(app: &App, hdc: HDC, l: &Layout) {
+    let t = &app.theme;
+    let (icons, details) = status_view_rects(l, &app.metrics);
+    let cur = app.tab().view_mode;
+    let is_details = matches!(cur, fm_core::ViewMode::Details);
+    unsafe {
+        for (i, (r, active, grid)) in [(icons, !is_details, true), (details, is_details, false)].iter().enumerate() {
+            let hovered = app.hover_view_btn == (i as u8) + 1;
+            if hovered || *active {
+                let b = CreateSolidBrush(if hovered { t.hover_bg } else { t.selection_bg });
+                let _ = FillRect(hdc, r, b);
+                let _ = DeleteObject(b.into());
+            }
+            let color = if *active || hovered { t.text } else { t.text_dim };
+            draw_view_glyph(hdc, r, *grid, color);
+        }
+    }
+}
+
 fn paint_status(app: &App, hdc: HDC, l: &Layout) {
     let t = &app.theme;
     unsafe {
@@ -1025,8 +1150,16 @@ fn paint_status(app: &App, hdc: HDC, l: &Layout) {
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, t.text_dim);
         let text = app.status_text();
-        draw_text(hdc, &text, RECT { left: l.status.left + 10, top: l.status.top, right: l.status.right, bottom: l.status.bottom }, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        // 左侧文字要给右下角的两个按钮让出位置，否则长状态文本会压在按钮上
+        let (icons, _) = status_view_rects(l, &app.metrics);
+        draw_text(
+            hdc,
+            &text,
+            RECT { left: l.status.left + 10, top: l.status.top, right: icons.left - 8, bottom: l.status.bottom },
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
         SelectObject(hdc, old);
+        paint_view_switch(app, hdc, l);
     }
 }
 

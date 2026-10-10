@@ -145,8 +145,8 @@ impl Tab {
         out
     }
 
-    pub fn recompute_filter(&mut self) {
-        self.visible = filter_entries(&self.entries, &self.filter);
+    pub fn recompute_filter(&mut self, show_hidden: bool, show_system: bool) {
+        self.visible = filter_entries(&self.entries, &self.filter, show_hidden, show_system);
         if self.focus_row >= self.visible.len() {
             self.focus_row = self.visible.len().saturating_sub(1);
         }
@@ -219,6 +219,9 @@ pub struct App {
     /// 标题栏自有按钮的悬停位：bit0=侧栏开关，bit1=更多菜单
     pub hover_chrome: u8,
     pub show_hidden: bool,
+    /// 是否显示"受保护的操作系统文件"（带 FILE_ATTRIBUTE_SYSTEM 的项）。
+    /// 与 show_hidden 相互独立 —— 资源管理器也是两道分开的开关。
+    pub show_system: bool,
     /// 主页"设备和驱动器"的容量缓存：`盘符 -> (总容量, 可用)`。
     /// 只在进入主页时刷新一次，避免每帧都做磁盘 IO。
     pub drive_space: HashMap<String, (u64, u64)>,
@@ -228,6 +231,15 @@ pub struct App {
     /// 文件夹时，是不会给第 0 行刷一条高亮的 —— 那一行看起来就像"默认被勾选了"。
     /// 只有用户真的用鼠标点过或用键盘移动过，焦点行才显形。
     pub focus_visible: bool,
+    /// 标题栏上鼠标悬停的标签序号（用于画关闭按钮）。
+    pub hover_tab: Option<usize>,
+    /// 状态栏布局切换按钮的悬停位：0=无，1=大图标，2=详细信息。
+    pub hover_view_btn: u8,
+    /// "返回/上一级之后要把哪一项选中"。
+    ///
+    /// 目录枚举是异步的：go_up 的瞬间目标目录一行都没有，直接查找必然落空。
+    /// 所以先把"要选中的路径"记下来，等枚举批次到达（drain）后再落地。
+    pub pending_select: Option<PathBuf>,
 }
 
 /// 取某个驱动器的容量`(总容量, 可用)`，供首页渲染容量条。
@@ -250,6 +262,7 @@ impl App {
             tabs: Vec::new(),
             active: 0,
             show_hidden: cfg.files.view.show_hidden,
+            show_system: cfg.files.view.show_system,
             cfg,
             metrics: Metrics::new(96),
             theme,
@@ -273,6 +286,9 @@ impl App {
             hover_chrome: 0,
             drive_space: HashMap::new(),
             focus_visible: false,
+            hover_tab: None,
+            hover_view_btn: 0,
+            pending_select: None,
         }
     }
 
@@ -316,6 +332,7 @@ impl App {
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
         }
+        self.hover_tab = None;
         self.reload();
         self.invalidate();
     }
@@ -346,6 +363,8 @@ impl App {
         }
         // 刚打开的目录不该有"默认选中的第一行"
         self.focus_visible = false;
+        // 主动跳转到一个新目录时，"回退后要选中谁"这件事就作废了
+        self.pending_select = None;
         self.reload();
         self.invalidate();
     }
@@ -362,21 +381,24 @@ impl App {
         if !self.can_back() {
             return;
         }
+        // 先记住"当前正待在哪个文件夹"：返回之后，它在上一级目录里应该保持选中
+        let from = self.tab().path.clone();
         self.tab_mut().history_pos -= 1;
         let target = self.tab().history[self.tab().history_pos].clone();
-        self.apply_history(&target);
+        self.apply_history(&target, Some(from));
     }
 
     pub fn go_forward(&mut self) {
         if !self.can_forward() {
             return;
         }
+        let from = self.tab().path.clone();
         self.tab_mut().history_pos += 1;
         let target = self.tab().history[self.tab().history_pos].clone();
-        self.apply_history(&target);
+        self.apply_history(&target, Some(from));
     }
 
-    fn apply_history(&mut self, target: &Path) {
+    fn apply_history(&mut self, target: &Path, select: Option<PathBuf>) {
         let tab = self.tab_mut();
         tab.home = is_home_path(target);
         tab.path = target.to_path_buf();
@@ -389,7 +411,10 @@ impl App {
         tab.scroll = 0;
         tab.focus_row = 0;
         tab.filter.clear();
+        self.pending_select = select;
+        self.focus_visible = false;
         self.reload();
+        self.try_pending_select();
         self.invalidate();
     }
 
@@ -399,7 +424,39 @@ impl App {
             return;
         }
         if let Some(parent) = paths::parent_of(&self.tab().path) {
+            // 返回上一级后，刚才从哪一级进来的那个文件夹要保留选中 —— 资源管理器的行为。
+            // 侧键/Alt+↑/Backspace 都走这条路径，所以选中效果的落点在这里统一处理。
+            let from = self.tab().path.clone();
             self.navigate(parent);
+            self.pending_select = Some(from);
+            self.try_pending_select();
+        }
+    }
+
+    /// 尝试把 `pending_select` 落地为真正的选中行；找不到就继续挂着等下一批。
+    pub fn try_pending_select(&mut self) {
+        let Some(path) = self.pending_select.clone() else { return };
+        let mut hit = false;
+        {
+            let tab = self.tab_mut();
+            let row = tab.visible.iter().position(|&idx| {
+                tab.entries.get(idx).map(|e| e.path == path).unwrap_or(false)
+            });
+            if let Some(r) = row {
+                if let Some(e) = tab.entries.get(tab.visible[r]) {
+                    let k = key_of(e);
+                    tab.selected.clear();
+                    tab.selected.insert(k);
+                    tab.focus_row = r;
+                    hit = true;
+                }
+            }
+        }
+        if hit {
+            self.pending_select = None;
+            // 这是"用户从子目录回退"带来的选中，焦点框必须显形，否则等于没选中
+            self.focus_visible = true;
+            self.invalidate();
         }
     }
 
@@ -424,11 +481,13 @@ impl App {
                     }
                 }
             }
+            // 先把两个开关拷出来：下面要取 tab 的可变借用，届时再读 self 会撞借用检查
+            let (show_hidden, show_system) = (self.show_hidden, self.show_system);
             let tab = self.tab_mut();
             tab.generation += 1;
             tab.entries = entries;
             tab.loading = false;
-            tab.recompute_filter();
+            tab.recompute_filter(show_hidden, show_system);
             return;
         }
 
@@ -485,6 +544,8 @@ impl App {
 
     pub fn drain(&mut self) {
         let mut changed = false;
+        // 同 reload()：把开关拷出来，避免循环体内对 self.tabs 的可变借用与 self 字段读取冲突
+        let (show_hidden, show_system) = (self.show_hidden, self.show_system);
         while let Ok(msg) = self.engine_rx.try_recv() {
             match msg {
                 EngineMsg::Batch(batch) => {
@@ -494,7 +555,7 @@ impl App {
                         }
                         tab.entries.extend(batch.entries);
                         tab.sort.sort(&mut tab.entries);
-                        tab.recompute_filter();
+                        tab.recompute_filter(show_hidden, show_system);
                         changed = true;
                     }
                 }
@@ -516,6 +577,8 @@ impl App {
                 self.reload();
             }
         }
+        // 新一批条目到了：如果还挂着"回退后要选中谁"，就趁现在落地
+        self.try_pending_select();
         if changed {
             self.invalidate();
         }
@@ -614,10 +677,11 @@ impl App {
     }
 
     pub fn sort_column(&mut self, key: SortKey) {
+        let (show_hidden, show_system) = (self.show_hidden, self.show_system);
         let tab = self.tab_mut();
         tab.sort.toggle(key);
         tab.sort.sort(&mut tab.entries);
-        tab.recompute_filter();
+        tab.recompute_filter(show_hidden, show_system);
         self.invalidate();
     }
 
@@ -929,7 +993,9 @@ impl App {
                 if crate::app::is_home_path(&target) {
                     report(self.hwnd, "“主页”是虚拟视图，没有对应的文件夹属性");
                 } else {
-                    self.show_properties(&target);
+                    // 自绘属性对话框：不走 ShellExecuteEx("properties")，
+                    // 那个路径要加载属性页扩展、构建属性存储，慢一个数量级。
+                    crate::props::open(self as *mut App, target);
                 }
             }
             Command::ViewIcons => self.set_view(ViewMode::LargeIcons),
@@ -941,6 +1007,8 @@ impl App {
             Command::SortBySize => self.sort_column(fm_core::SortKey::Size),
             Command::ToggleSidebar => self.toggle_sidebar(),
             Command::ToggleStatusbar => self.toggle_statusbar(),
+            Command::ToggleHidden => self.toggle_hidden(),
+            Command::ToggleSystem => self.toggle_system(),
             Command::NewTab => self.new_tab(),
             Command::About => report(self.hwnd, "NexFile 轻量资源管理器\nWin32 + GDI 自绘，无 WebView2 依赖"),
         }
@@ -952,6 +1020,46 @@ impl App {
         self.persist_ui_pref();
         crate::paint::reposition_chrome(self);
         let _ = unsafe { InvalidateRect(Some(self.hwnd), None, true) };
+    }
+
+    /// 显示/隐藏"隐藏的项目"。
+    ///
+    /// 与"受保护的操作系统文件"是**两道独立开关** —— 资源管理器在"查看 → 显示"
+    /// 里也是分开的两项：隐藏属性是用户自己设的，系统属性是系统保护的，混成一个
+    /// 开关会让想看隐藏文件的人被迫看见一堆系统文件。
+    pub fn toggle_hidden(&mut self) {
+        self.show_hidden = !self.show_hidden;
+        self.cfg.files.view.show_hidden = self.show_hidden;
+        self.persist_view_pref();
+        self.apply_filter();
+    }
+
+    pub fn toggle_system(&mut self) {
+        self.show_system = !self.show_system;
+        self.cfg.files.view.show_system = self.show_system;
+        self.persist_view_pref();
+        self.apply_filter();
+    }
+
+    /// 开关变化后只需要重算可见集，不用重新枚举磁盘
+    fn apply_filter(&mut self) {
+        let (sh, ss) = (self.show_hidden, self.show_system);
+        let tab = self.tab_mut();
+        tab.recompute_filter(sh, ss);
+        let _ = unsafe { InvalidateRect(Some(self.hwnd), None, true) };
+    }
+
+    fn persist_view_pref(&self) {
+        if let Err(e) = fm_core::config::Config::save_user_patch(&serde_json::json!({
+            "files": {
+                "view": {
+                    "show_hidden": self.cfg.files.view.show_hidden,
+                    "show_system": self.cfg.files.view.show_system,
+                }
+            }
+        })) {
+            eprintln!("保存视图偏好失败: {e}");
+        }
     }
 
     pub fn toggle_statusbar(&mut self) {
@@ -1004,6 +1112,13 @@ impl App {
             };
             view_row.submenu.push(r);
         }
+        view_row.submenu.push(menu::MenuEntry::sep());
+        view_row
+            .submenu
+            .push(check_row("隐藏的项目", Command::ToggleHidden, self.show_hidden));
+        view_row
+            .submenu
+            .push(check_row("受保护的系统文件", Command::ToggleSystem, self.show_system));
         entries.push(view_row);
 
         let mut sort_row = menu::MenuEntry {
@@ -1053,41 +1168,6 @@ impl App {
         ) {
             self.menu_hwnd = Some(hwnd_menu);
         }
-    }
-
-    /// 打开资源管理器同款"属性"对话框。
-    ///
-    /// 关键点：必须走 `ShellExecuteExW` + `SEE_MASK_INVOKEIDLIST`。
-    /// 只用 `ShellExecuteW("properties")` 时，Shell 不会把动词交给该项的
-    /// IContextMenu，"属性"对话框经常弹不出来（这是原来点它没反应的原因）。
-    fn show_properties(&self, path: &Path) -> bool {
-        use windows::Win32::UI::Shell::{
-            ShellExecuteExW, SHELLEXECUTEINFOW, SEE_MASK_FLAG_NO_UI, SEE_MASK_INVOKEIDLIST,
-            SEE_MASK_NOCLOSEPROCESS,
-        };
-        use windows::Win32::UI::WindowsAndMessaging::SW_SHOW;
-        let file: Vec<u16> = path
-            .to_string_lossy()
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        let verb: Vec<u16> = "properties\0".encode_utf16().collect();
-        let mut info = SHELLEXECUTEINFOW {
-            cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
-            fMask: SEE_MASK_INVOKEIDLIST | SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI,
-            hwnd: self.hwnd,
-            lpVerb: windows::core::PCWSTR(verb.as_ptr()),
-            lpFile: windows::core::PCWSTR(file.as_ptr()),
-            nShow: SW_SHOW.0 as i32,
-            ..Default::default()
-        };
-        unsafe {
-            if ShellExecuteExW(&mut info).is_err() {
-                report(self.hwnd, "无法打开属性对话框");
-                return false;
-            }
-        }
-        true
     }
 
     // ------------------------------------------------------------ 模块与配置
@@ -1152,6 +1232,13 @@ fn shell_row(text: &str, glyph: Option<&'static str>, cmd: Command) -> menu::Men
     }
 }
 
+/// 带勾选状态的条目：开 = "● 名称"，关 = 同样宽度的空白占位（保持文字对齐）。
+fn check_row(text: &str, cmd: Command, on: bool) -> menu::MenuEntry {
+    let mut r = shell_row(text, None, cmd);
+    r.text = if on { format!("● {text}") } else { format!("    {text}") };
+    r
+}
+
 /// 带下级菜单的条目。资源管理器的右键菜单本来就是分层的（新建/查看/排序方式都有
 /// 下拉），做成平铺会把"悬停展开"这条交互整个丢掉。
 fn submenu_row(text: &str, glyph: Option<&'static str>, children: Vec<menu::MenuEntry>) -> menu::MenuEntry {
@@ -1197,6 +1284,10 @@ fn own_menu_rows(app: &App, items: &[PathBuf]) -> Vec<menu::MenuEntry> {
             shell_row("大图标", None, Command::ViewIcons),
             shell_row("列表", None, Command::ViewList),
             shell_row("详细信息", None, Command::ViewDetails),
+            menu::MenuEntry::sep(),
+            // 两道开关分开列：隐藏项是用户自己设的，系统项是系统保护的
+            check_row("隐藏的项目", Command::ToggleHidden, app.show_hidden),
+            check_row("受保护的系统文件", Command::ToggleSystem, app.show_system),
         ],
     ));
     rows.push(submenu_row(
@@ -1221,7 +1312,6 @@ fn own_menu_rows(app: &App, items: &[PathBuf]) -> Vec<menu::MenuEntry> {
         note.disabled = true;
         rows.push(note);
     }
-    let _ = app;
     rows
 }
 
