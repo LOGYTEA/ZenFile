@@ -1530,6 +1530,15 @@ impl App {
     pub fn run_command(&mut self, cmd: Command) {
         match cmd {
             Command::Open => self.open_focused(),
+            Command::OpenWith => {
+                // 有多个选中就对第一个文件问：资源管理器也是这么做的。
+                // `selected_paths()` 在选中为空时会退回焦点行，正合适。
+                let target = self.tab().selected_paths().into_iter().find(|p| p.is_file());
+                if let Some(p) = target {
+                    let ptr = self as *mut App;
+                    crate::openwith::open(ptr, p);
+                }
+            }
             Command::Copy => self.clipboard_write(ClipMode::Copy),
             Command::Cut => self.clipboard_write(ClipMode::Move),
             Command::Paste => self.paste(),
@@ -2340,6 +2349,10 @@ fn own_menu_rows(app: &App, items: &[PathBuf]) -> Vec<menu::MenuEntry> {
     let mut rows = Vec::new();
     if !items.is_empty() {
         rows.push(shell_row("打开", Some("\u{E8A7}"), Command::Open));
+        // 「打开方式」只对文件有意义：文件夹的"打开方式"在资源管理器里也没有。
+        if items.iter().any(|p| p.is_file()) {
+            rows.push(shell_row("打开方式", Some("\u{E7AC}"), Command::OpenWith));
+        }
         rows.push(shell_row("剪切", Some("\u{E8C6}"), Command::Cut));
         rows.push(shell_row("复制", Some("\u{E8C8}"), Command::Copy));
         rows.push(shell_row("重命名", Some("\u{E8AC}"), Command::Rename));

@@ -12,6 +12,7 @@
 mod app;
 mod icons;
 mod menu;
+mod openwith;
 mod paint;
 mod props;
 mod theme;
@@ -100,6 +101,7 @@ fn main() {
 
     menu::register_menu_class();
     props::register_props_class();
+    openwith::register_class();
 
     let hwnd = unsafe {
         CreateWindowExW(

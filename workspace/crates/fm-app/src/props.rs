@@ -1042,7 +1042,7 @@ const PIC_FILTER: &str = "图片\0*.bmp;*.jpg;*.jpeg;*.png;*.gif;*.tif;*.tiff\0�
 const ICON_FILTER: &str = "图标\0*.ico;*.icl\0程序\0*.exe;*.dll\0所有文件\0*.*\0\0";
 
 /// `GetOpenFileNameW` 的一层薄封装：返回选中的完整路径。
-fn pick_file(hwnd: HWND, title: &str, filter: &str, def_ext: &str) -> Option<String> {
+pub(crate) fn pick_file(hwnd: HWND, title: &str, filter: &str, def_ext: &str) -> Option<String> {
     let mut buf = vec![0u16; 4096];
     let wide_filter: Vec<u16> = filter.encode_utf16().collect();
     let wide_title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();

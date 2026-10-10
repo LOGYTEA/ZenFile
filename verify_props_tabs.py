@@ -244,8 +244,12 @@ def row_bands(raw, stride, x0, x1, y0, y1):
     return out
 
 
-def open_props(dir_path, row_pref=1):
-    """借助右键菜单打开自绘属性窗口，返回窗口句柄。"""
+def open_props(dir_path, row_pref=1, nrow_first=6):
+    """借助右键菜单打开自绘属性窗口，返回窗口句柄。
+
+    `nrow_first` = 第一组（打开 … 删除）有几行。**文件的菜单里多一个「打开方式」**，
+    所以文件是 6 行、文件夹是 5 行 —— 差一行，后面「属性」的位置就整体错一格。
+    """
     hw = launch(dir_path)
     raw, stride, w, h = grab(hw)
     bands = [b for b in row_bands(raw, stride, 170, 600, 90, h - 40) if b[1] - b[0] >= 8]
@@ -263,9 +267,10 @@ def open_props(dir_path, row_pref=1):
     mh, _mx, _my, mw, mhh = menus[0]
     top0, row_h = menu_row_height(mh, mw, mhh)
     s = row_h / 28.0
-    # 文件菜单: 0打开 1剪切 2复制 3重命名 4删除 5[分隔] 6粘贴 7新建
-    #           8[分隔] 9全选 10刷新 11查看 12排序方式 13属性
-    y13 = int(top0 + 5 * row_h + 6 * s + 2 * row_h + 6 * s + 4 * row_h + row_h / 2)
+    # 文件菜单: 0打开 1打开方式 2剪切 3复制 4重命名 5删除 6[分隔] 7粘贴 8新建
+    #           9[分隔] 10全选 11刷新 12查看 13排序方式 14属性
+    # 文件夹菜单没有第 1 行，后面整体前移一格。
+    y13 = int(top0 + nrow_first * row_h + 6 * s + 2 * row_h + 6 * s + 4 * row_h + row_h / 2)
     for mul in (0, -1, 1, -2, 2):
         yy = y13 + int(mul * row_h)
         if yy < 2 or yy > mhh - 2:
@@ -339,7 +344,7 @@ mark(restored == before, f"「取消」把属性位还原回 0x{before:08X}")
 
 # ---------------------------------------------------------------- 2. 标签页
 print("\n[2] 标签页（文件夹：常规/安全/自定义/详细信息）")
-pw = open_props(CDIR, 0)
+pw = open_props(CDIR, 0, 5)  # 文件夹：第一组 5 行（没有「打开方式」）
 mark(pw is not None, "文件夹的属性窗口打开")
 if pw is None:
     subprocess.run(["taskkill", "/F", "/IM", "fm-app.exe"], capture_output=True)

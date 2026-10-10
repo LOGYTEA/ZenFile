@@ -57,6 +57,8 @@ const WM_MENU_CLOSE_CHAIN: u32 = 0x0403;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Command {
     Open,
+    /// 「打开方式」：弹出自绘的程序选择窗口
+    OpenWith,
     Copy,
     Cut,
     Paste,
