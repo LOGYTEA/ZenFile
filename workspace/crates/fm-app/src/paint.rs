@@ -1247,6 +1247,55 @@ fn paint_home(app: &mut App, hdc: HDC, l: &Layout) {
     }
 }
 
+/// 详细信息视图的列几何：**绘制与表头共用这一份**（老纪律：两边各写一份常量，
+/// 改一次就错位 —— 这条已经踩过三次）。
+///
+/// 搜索结果（`tab.search_root` 非空）额外多一列"位置"：全卷搜出来的同名文件
+/// 只显示文件名根本分不清是哪个，资源管理器也是这么加列的。
+pub struct DetailCols {
+    pub name: i32,
+    pub path: Option<i32>,
+    pub date: i32,
+    pub kind: i32,
+    pub size: i32,
+    pub name_w: i32,
+    pub path_w: i32,
+    pub date_w: i32,
+    pub kind_w: i32,
+    pub size_w: i32,
+}
+
+pub fn detail_cols(app: &App, l: &Layout, icon_size: i32) -> DetailCols {
+    let s = app.metrics.scale;
+    let text_pad = (21.0 * s) as i32;
+    let icon_gap = (3.0 * s) as i32;
+    let name = l.view.left + text_pad + icon_size + icon_gap;
+    let searching = app.tab().search_root.is_some();
+    let (name_w, path_w) = if searching {
+        ((190.0 * s) as i32, (270.0 * s) as i32)
+    } else {
+        ((274.0 * s) as i32, 0)
+    };
+    let date = name + name_w + path_w;
+    let date_w = (144.0 * s) as i32;
+    let kind = date + date_w;
+    let kind_w = (120.0 * s) as i32;
+    let size = kind + kind_w;
+    let size_w = (80.0 * s) as i32;
+    DetailCols {
+        name,
+        path: if searching { Some(name + name_w) } else { None },
+        date,
+        kind,
+        size,
+        name_w,
+        path_w,
+        date_w,
+        kind_w,
+        size_w,
+    }
+}
+
 fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
     if app.tab().home {
         paint_home(app, hdc, l);
@@ -1290,10 +1339,11 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
         } else {
             (16.0 * app.metrics.scale) as i32
         };
-        let col_name = l.view.left + text_pad + icon_size + icon_gap;
-        let col_date = col_name + (274.0 * app.metrics.scale) as i32;
-        let col_type = col_date + (144.0 * app.metrics.scale) as i32;
-        let col_size = col_type + (120.0 * app.metrics.scale) as i32;
+        let cols = detail_cols(app, l, icon_size);
+        let col_name = cols.name;
+        let col_date = cols.date;
+        let col_type = cols.kind;
+        let col_size = cols.size;
 
         let visible: Vec<usize> = app.tab().visible.clone();
         let header_h = (26.0 * app.metrics.scale) as i32;
@@ -1416,9 +1466,28 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
             let name = names.get(k).cloned().unwrap_or_default();
             if mode == fm_core::ViewMode::Details {
                 app.icons.draw_faded(hdc, icon, col_name - icon_size - icon_gap, y + (row_h - icon_size) / 2, icon_size, alpha);
-                let name_r = RECT { left: col_name, top: y, right: col_date, bottom: y + row_h };
+                let name_r = RECT {
+                    left: col_name,
+                    top: y,
+                    right: cols.path.unwrap_or(col_date),
+                    bottom: y + row_h,
+                };
                 draw_text(hdc, &name, name_r, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
                 SetTextColor(hdc, if selected { t.selection_text } else { t.text_dim });
+                if let Some(px0) = cols.path {
+                    // 搜索结果里的"位置"：显示所在文件夹，超长省略中间
+                    let folder = entry
+                        .path
+                        .parent()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    draw_text(
+                        hdc,
+                        &folder,
+                        RECT { left: px0, top: y, right: col_date, bottom: y + row_h },
+                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+                    );
+                }
                 draw_text(hdc, &format_date(entry.modified), RECT { left: col_date, top: y, right: col_type, bottom: y + row_h }, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
                 draw_text(hdc, &entry.type_label(), RECT { left: col_type, top: y, right: col_size, bottom: y + row_h }, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
                 draw_text(hdc, size_texts.get(k).unwrap_or(&String::new()), RECT { left: col_size, top: y, right: l.view.right, bottom: y + row_h }, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
@@ -1451,12 +1520,23 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
             let sort = app.tab().sort;
             let hf = header_font(app.metrics.scale);
             let old = SelectObject(hdc, hf.into());
-            for (label, key, x0, w) in [
-                ("名称", fm_core::SortKey::Name, col_name, (274.0 * app.metrics.scale) as i32),
-                ("修改日期", fm_core::SortKey::Modified, col_date, (144.0 * app.metrics.scale) as i32),
-                ("类型", fm_core::SortKey::Type, col_type, (120.0 * app.metrics.scale) as i32),
-                ("大小", fm_core::SortKey::Size, col_size, (80.0 * app.metrics.scale) as i32),
-            ] {
+            let mut cols_hdr = [
+                ("名称", fm_core::SortKey::Name, col_name, cols.name_w),
+                ("修改日期", fm_core::SortKey::Modified, col_date, cols.date_w),
+                ("类型", fm_core::SortKey::Type, col_type, cols.kind_w),
+                ("大小", fm_core::SortKey::Size, col_size, cols.size_w),
+            ];
+            let mut path_hdr = ("位置", fm_core::SortKey::Name, 0, 0);
+            let mut all: Vec<(&str, fm_core::SortKey, i32, i32)> = Vec::new();
+            all.push(cols_hdr[0]);
+            if let Some(px0) = cols.path {
+                path_hdr.2 = px0;
+                path_hdr.3 = cols.path_w;
+                all.push(path_hdr);
+            }
+            all.extend_from_slice(&cols_hdr[1..]);
+            for (label, key, x0, w) in all {
+                let _ = &mut cols_hdr;
                 // 排序指示：当前排序列标出方向，否则点了看不出按哪列排
                 let text = if sort.key == key {
                     format!("{label} {}", if sort.descending { "\u{25BC}" } else { "\u{25B2}" })

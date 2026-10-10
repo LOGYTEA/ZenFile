@@ -245,6 +245,71 @@ pub fn run() -> i32 {
     });
     h.check("drives::ratio", ratios_ok, "已用占比均落在 [0,1]");
 
+    // 15. 文件名索引：建索引 → 查询 → 序列化往返
+    // 刻意建在 %TEMP% 下的子树上，且**不调 save()**（save 会按盘符写进
+    // %LOCALAPPDATA%\NexFile\index\C.bin，把真实缓存冲掉）。
+    let idx_root = std::env::temp_dir().join("fm-selftest-index");
+    prepare_tree(&idx_root, 12, 3);
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let idx = crate::index::Index::build(&idx_root.to_string_lossy(), &cancel, None);
+    let built_n = idx.len();
+    h.check("index::build", built_n >= 12 * 3, &format!("{built_n} 条"));
+    // 查询必须能命中深层目录里的文件（这正是"整卷秒搜"要的效果）
+    let hits = idx.query("item7", 100);
+    let deep_ok = hits.iter().any(|x| x.path.to_string_lossy().contains("dir1"));
+    h.check(
+        "index::query",
+        !hits.is_empty() && deep_ok,
+        &format!("item7 命中 {} 项，含子目录 {}", hits.len(), deep_ok),
+    );
+    // 大小写不敏感 + 子串（不是前缀）
+    h.check(
+        "index::case",
+        !idx.query("ITEM7", 10).is_empty(),
+        "大写查询同样命中",
+    );
+    // 通配符
+    h.check(
+        "index::wildcard",
+        idx.query("item1*.txt", 500).len() >= 3,
+        &format!("item1*.txt -> {} 项", idx.query("item1*.txt", 500).len()),
+    );
+    // 前缀命中的要排在前面：搜 item1 时 item1.txt 优先于 item10.txt
+    let ranked = idx.query("item1", 50);
+    let first = ranked.first().map(|x| x.name.clone()).unwrap_or_default();
+    h.check(
+        "index::rank",
+        first == "item1.txt",
+        &format!("首位 = {first}"),
+    );
+    // 序列化往返：缓存能不能还原，决定了"第二次搜索是否秒开"
+    let bytes = idx.to_bytes();
+    let back = crate::index::Index::from_bytes(&bytes);
+    let roundtrip = match &back {
+        Some(b) => b.len() == idx.len() && b.query("item7", 100).len() == hits.len(),
+        None => false,
+    };
+    h.check(
+        "index::roundtrip",
+        roundtrip,
+        &format!("{} 字节，还原 {} 条", bytes.len(), back.map(|b| b.len()).unwrap_or(0)),
+    );
+    // 缓存路径必须落在 %LOCALAPPDATA% 下，且按盘符分文件
+    let cp = crate::index::Index::cache_path("C:\\");
+    let cp_ok = cp
+        .as_ref()
+        .map(|p| p.to_string_lossy().contains("NexFile") && p.to_string_lossy().ends_with("C.bin"))
+        .unwrap_or(false);
+    h.check("index::cache_path", cp_ok, &format!("{:?}", cp));
+    // 卷根解析：C:\Users\a -> C:\，UNC 不给建索引
+    h.check(
+        "index::volume_root",
+        crate::index::volume_root(&PathBuf::from("C:\\Users\\a")).as_deref() == Some("C:\\")
+            && crate::index::volume_root(&PathBuf::from("\\\\srv\\share")).is_none(),
+        r#"C:\Users\a -> C:\，UNC -> None"#,
+    );
+    let _ = std::fs::remove_dir_all(&idx_root);
+
     println!("\n通过 {}/{} 项", h.passed, h.passed + h.failed);
     if h.failed == 0 {
         0

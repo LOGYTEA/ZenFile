@@ -19,6 +19,7 @@ pub mod drives;
 pub mod engine;
 pub mod error;
 pub mod hotkey;
+pub mod index;
 pub mod ipc;
 pub mod natural;
 pub mod ops;

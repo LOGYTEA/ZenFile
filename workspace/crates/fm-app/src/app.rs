@@ -14,9 +14,7 @@ use fm_core::ops::{
 };
 use fm_core::paths;
 use fm_core::process::ProcessTree;
-use fm_core::types::{
-    filter_entries, FileEntry, SortKey, SortSpec, ViewMode,
-};
+use fm_core::types::{filter_entries, FileEntry, FileKind, SortKey, SortSpec, ViewMode};
 use fm_core::watch::{DirWatcher, WatchMsg};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::InvalidateRect;
@@ -180,6 +178,18 @@ impl Tab {
         }
     }
 
+    /// 只按"隐藏/受保护系统项"两道开关重算可见项，**不按名字过滤**。
+    ///
+    /// 搜索结果已经是查过的了，再拿查询串当子串过一遍是错的：通配符查询
+    /// （`a*.txt`）命中项的名字里并不含 `a*.txt`，会被整份滤掉，界面上看起来
+    /// 就是"通配符搜不到任何东西"。
+    pub fn recompute_visibility(&mut self, show_hidden: bool, show_system: bool) {
+        self.visible = filter_entries(&self.entries, "", show_hidden, show_system);
+        if self.focus_row >= self.visible.len() {
+            self.focus_row = self.visible.len().saturating_sub(1);
+        }
+    }
+
     pub fn selected_bytes(&self) -> u64 {
         self.entries
             .iter()
@@ -290,6 +300,19 @@ pub struct App {
     pub recycle_sel: HashSet<String>,
     /// 设置页里鼠标悬停的行（存的是该行的动作编号，行位置会随开关文案变化）。
     pub settings_hover: Option<u32>,
+    /// 文件名索引（Everything 式秒搜）。整卷一份，常驻内存。
+    pub index: Option<std::sync::Arc<fm_core::index::Index>>,
+    /// `index` 属于哪个卷根（`C:\`）。换了卷要重新载入。
+    pub index_root: Option<String>,
+    /// 索引当前在干什么：给状态栏/列表顶上那行提示用。
+    pub index_state: IndexState,
+    /// 后台"建索引"线程的消息通道。
+    pub index_rx: Option<Receiver<IndexMsg>>,
+    /// 让正在跑的建索引线程尽快收工（换卷 / 关窗时用）。
+    pub index_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// 用户回车搜索了，但索引还没到位：此刻列表里顶着的是"当前目录"的递归结果，
+    /// 索引一到就要换成全卷结果。
+    pub index_pending: bool,
     /// 标题栏三大金刚键的悬停位：0=无，1=最小化，2=最大化，3=关闭。
     pub hover_caption: u8,
     /// 按下未抬起的那一个（0=无，1/2/3 同上）。
@@ -301,6 +324,28 @@ pub struct App {
     pub addr_editing: bool,
     /// 鼠标悬停的面包屑下标（hover 反馈）。
     pub addr_hover: Option<usize>,
+}
+
+/// 文件名索引在后台的进度状态。
+#[derive(Clone, PartialEq)]
+pub enum IndexState {
+    /// 没在动
+    Idle,
+    /// 正在从磁盘缓存载入
+    Loading,
+    /// 正在遍历整卷（数字 = 已扫到的条目数，用于给个可见的进度）
+    Building(usize),
+    /// 索引已就绪
+    Ready,
+    /// 建不了（非 NTFS / 没权限 / UNC），搜索回退到现地递归
+    Failed(String),
+}
+
+pub enum IndexMsg {
+    /// 建索引过程中周期性回报已扫条目数
+    Progress(usize),
+    Ready(std::sync::Arc<fm_core::index::Index>),
+    Failed(String),
 }
 
 /// 地址栏面包屑的一节。
@@ -495,6 +540,12 @@ impl App {
             pressed_caption: 0,
             addr_editing: false,
             addr_hover: None,
+            index: None,
+            index_root: None,
+            index_state: IndexState::Idle,
+            index_pending: false,
+            index_rx: None,
+            index_cancel: None,
         }
     }
 
@@ -834,8 +885,176 @@ impl App {
         }
     }
 
-    pub fn drain(&mut self) {
+    // ------------------------------------------------------------ 整卷搜索（索引）
+
+    /// 搜索框回车：搜**整个卷**，而不是只搜当前目录。
+    ///
+    /// 索引在内存里就直接查（毫秒级，不再碰磁盘）；不在就后台载入/建立，
+    /// 期间先跑现地递归搜索顶着，索引好了再换成全卷结果。
+    pub fn begin_volume_search(&mut self) {
+        let q = self.tab().filter.trim().to_string();
+        let cur = self.tab().path.clone();
+        let Some(root) = fm_core::index::volume_root(&cur) else {
+            // UNC / 拿不到卷根：退回"当前子树递归"，行为跟以前一样
+            let tab = self.tab_mut();
+            tab.search_root = Some(tab.path.clone());
+            self.reload();
+            return;
+        };
+        if q.is_empty() {
+            let tab = self.tab_mut();
+            tab.search_root = None;
+            tab.filter.clear();
+            self.reload();
+            return;
+        }
+        {
+            let tab = self.tab_mut();
+            tab.search_root = Some(PathBuf::from(&root));
+            tab.filter = q.clone();
+        }
+        if self.index_root.as_deref() == Some(root.as_str()) {
+            if let Some(idx) = self.index.clone() {
+                self.index_pending = false;
+                self.apply_index_hits(&idx, &q);
+                return;
+            }
+        }
+        // 索引还没就绪：**只搜当前目录**（有界，几十毫秒就出结果），绝不去递归
+        // 整个卷 —— 那边索引线程正在全卷扫盘，再叠一个全卷递归会把机器压死，
+        // 而且两个结果集先后到达，用户会看到列表先变一次再变一次。
+        self.index_pending = true;
+        {
+            let tab = self.tab_mut();
+            tab.search_root = Some(cur.clone());
+            tab.filter = q.clone();
+        }
+        self.ensure_index(&root);
+        self.reload();
+    }
+
+    /// 保证 `root` 这个卷的索引在后台被载入或建立好。
+    pub fn ensure_index(&mut self, root: &str) {
+        if self.index_root.as_deref() == Some(root)
+            && !matches!(self.index_state, IndexState::Idle | IndexState::Failed(_))
+        {
+            return;
+        }
+        // 换卷：先把上一个卷的建索引线程收掉，别两个线程一起扫盘
+        if let Some(c) = &self.index_cancel {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.index = None;
+        self.index_root = Some(root.to_string());
+        let (tx, rx) = channel::<IndexMsg>();
+        self.index_rx = Some(rx);
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.index_cancel = Some(cancel.clone());
+        let has_cache = fm_core::index::Index::load(root).is_some();
+        self.index_state = if has_cache {
+            IndexState::Loading
+        } else {
+            IndexState::Building(0)
+        };
+        let root_s = root.to_string();
+        std::thread::spawn(move || {
+            // 有缓存：直接反序列化，比遍历快两个数量级
+            if let Some(idx) = fm_core::index::Index::load(&root_s) {
+                let _ = tx.send(IndexMsg::Ready(std::sync::Arc::new(idx)));
+                return;
+            }
+            // 没有：遍历一遍。中途回报条数，好让界面上有可见的进度
+            let last = std::cell::Cell::new(0usize);
+            let idx = fm_core::index::Index::build(&root_s, &cancel, Some(&|n: usize| {
+                if n >= last.get() + 20_000 {
+                    last.set(n);
+                    let _ = tx.send(IndexMsg::Progress(n));
+                }
+            }));
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            // 存下来，下次启动/下次搜索直接命中缓存
+            let _ = idx.save();
+            let _ = tx.send(IndexMsg::Ready(std::sync::Arc::new(idx)));
+        });
+    }
+
+    /// 用索引里的结果替换当前标签的内容。
+    pub fn apply_index_hits(&mut self, idx: &fm_core::index::Index, q: &str) {
+        let limit = self.cfg.files.navigation.search_limit.max(50);
+        let hits = idx.query(q, limit);
+        let (show_hidden, show_system) = (self.show_hidden, self.show_system);
+        let mut entries: Vec<FileEntry> = hits
+            .into_iter()
+            .map(|h| FileEntry {
+                name: h.name,
+                path: h.path,
+                kind: if h.dir { FileKind::Directory } else { FileKind::File },
+                size: h.size,
+                modified: h.modified,
+                attributes: if h.dir { 0x10 } else { 0 } | if h.hidden { 0x2 } else { 0 },
+                hidden: h.hidden,
+            })
+            .collect();
+        let tab = self.tab_mut();
+        tab.generation += 1;
+        tab.entries.clear();
+        tab.entries.append(&mut entries);
+        tab.sort.sort(&mut tab.entries);
+        tab.search_root = Some(PathBuf::from(&idx.root));
+        tab.loading = false;
+        tab.scroll = 0;
+        tab.focus_row = 0;
+        tab.recompute_visibility(show_hidden, show_system);
+        self.focus_visible = false;
+        self.invalidate();
+    }
+
+    /// 收索引线程的消息（在消息循环里每帧调一次）。
+    pub fn drain_index(&mut self) -> bool {
         let mut changed = false;
+        let msgs: Vec<IndexMsg> = match &self.index_rx {
+            Some(rx) => rx.try_iter().collect(),
+            None => Vec::new(),
+        };
+        for msg in msgs {
+            match msg {
+                IndexMsg::Progress(n) => {
+                    self.index_state = IndexState::Building(n);
+                    changed = true;
+                }
+                IndexMsg::Ready(idx) => {
+                    self.index_root = Some(idx.root.clone());
+                    self.index_state = IndexState::Ready;
+                    self.index = Some(idx.clone());
+                    // 索引刚到位：如果当前正处于搜索态，立刻换成全卷结果。
+                    // `index_pending` 覆盖"索引还没好、先顶着的是当前目录结果"这一种；
+                    // `root_match` 覆盖"用户已经搜过一次、索引后来才到"这一种。
+                    let root_match = self
+                        .tab()
+                        .search_root
+                        .as_ref()
+                        .map(|p| p.to_string_lossy() == idx.root)
+                        .unwrap_or(false);
+                    let q = self.tab().filter.trim().to_string();
+                    if !q.is_empty() && (self.index_pending || root_match) {
+                        self.index_pending = false;
+                        self.apply_index_hits(&idx, &q);
+                    }
+                    changed = true;
+                }
+                IndexMsg::Failed(why) => {
+                    self.index_state = IndexState::Failed(why);
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    pub fn drain(&mut self) {
+        let mut changed = self.drain_index();
         // 同 reload()：把开关拷出来，避免循环体内对 self.tabs 的可变借用与 self 字段读取冲突
         let (show_hidden, show_system) = (self.show_hidden, self.show_system);
         while let Ok(msg) = self.engine_rx.try_recv() {
@@ -847,7 +1066,13 @@ impl App {
                         }
                         tab.entries.extend(batch.entries);
                         tab.sort.sort(&mut tab.entries);
-                        tab.recompute_filter(show_hidden, show_system);
+                        // 搜索批次已经被引擎按查询串筛过了，这里只补"隐藏/受保护"
+                        // 两道开关；否则通配符查询的命中项会被子串规则全滤掉。
+                        if tab.search_root.is_some() {
+                            tab.recompute_visibility(show_hidden, show_system);
+                        } else {
+                            tab.recompute_filter(show_hidden, show_system);
+                        }
                         changed = true;
                     }
                 }
@@ -1740,6 +1965,14 @@ impl App {
         if tab.settings {
             return "设置 · 改动即时写入 %APPDATA%\\NexFile\\settings.user.json".to_string();
         }
+        // 索引在建/在载入时给一句可见的话：整卷第一次搜索会花几秒，
+        // 界面上什么都不说，用户只会以为"搜索框坏了"。
+        let index_note = match &self.index_state {
+            IndexState::Loading => " · 正在载入卷索引…".to_string(),
+            IndexState::Building(n) => format!(" · 正在建立卷索引（{} 项）…", n),
+            IndexState::Failed(why) => format!(" · 索引不可用（{why}）"),
+            _ => String::new(),
+        };
         let total = tab.entries.len();
         let visible = tab.visible.len();
         let sel = tab.selected.len();
@@ -1756,14 +1989,27 @@ impl App {
         if total > visible {
             hidden_note = format!(" · 已隐藏 {} 项", total - visible);
         }
+        // 搜索范围要说明白：搜当前目录和搜整个卷的差别人眼看不出来，
+        // 不给提示用户会以为"结果就这么点，软件没找到"。
+        let scope_note = match tab.search_root.as_ref() {
+            None => String::new(),
+            Some(p) => {
+                let s = p.to_string_lossy().to_string();
+                if fm_core::index::volume_root(p).as_deref() == Some(s.as_str()) {
+                    " · 整卷搜索".to_string()
+                } else {
+                    " · 仅当前目录（卷索引尚未就绪）".to_string()
+                }
+            }
+        };
         if sel > 0 {
             format!(
-                "{visible} / {total} 个项目{hidden_note} · 已选 {sel} 项 {bytes} · 视图 {view} · {path}",
+                "{visible} / {total} 个项目{hidden_note}{index_note}{scope_note} · 已选 {sel} 项 {bytes} · 视图 {view} · {path}",
                 bytes = human_unit(bytes, unit),
                 path = path
             )
         } else {
-            format!("{visible} / {total} 个项目{hidden_note} · 视图 {view} · {path}", path = path)
+            format!("{visible} / {total} 个项目{hidden_note}{index_note}{scope_note} · 视图 {view} · {path}", path = path)
         }
     }
 

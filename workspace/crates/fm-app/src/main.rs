@@ -1408,11 +1408,10 @@ pub(crate) fn on_search_enter() {
         app.reload();
         return;
     }
-    // 回车 = 递归搜索整个子树；仅输入则是即时筛选当前目录 §5
+    // 回车 = 搜整个卷（走文件名索引，毫秒级）；仅输入则是即时筛选当前目录 §5
     let tab = app.tab_mut();
-    tab.search_root = Some(tab.path.clone());
     tab.filter = text;
-    app.reload();
+    app.begin_volume_search();
     app.invalidate();
 }
 
