@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "core": {
+    "language": "zh-CN",
+    "theme": "dark",
+    "exit_to_tray": true,
+    "startup": {
+      "enabled": true,
+      "mode": "tray",
+      "delay_seconds": 20
+    },
+    "hotkeys": {
+      "global.show_window": "ctrl+alt+f",
+      "window.new_tab": "ctrl+t",
+      "window.close_tab": "ctrl+w",
+      "nav.back": "alt+left",
+      "nav.forward": "alt+right",
+      "nav.up": "alt+up",
+      "file.new_folder": "ctrl+shift+n",
+      "file.rename": "f2",
+      "file.delete": "delete",
+      "file.delete_permanent": "shift+delete",
+      "file.copy": "ctrl+c",
+      "file.cut": "ctrl+x",
+      "file.paste": "ctrl+v",
+      "file.select_all": "ctrl+a",
+      "file.refresh": "f5",
+      "view.cycle": "ctrl+shift+v",
+      "ui.focus_address": "ctrl+l",
+      "ui.focus_search": "ctrl+f"
+    }
+  },
+  "ui": {
+    "statusbar_visible": true,
+    "sidebar_visible": true,
+    "sidebar_width": 200,
+    "titlebar_height": 36,
+    "tabs": {
+      "show_close_button": true,
+      "max_tabs": 16,
+      "open_new_tab_on_double_click": true
+    }
+  },
+  "files": {
+    "view": {
+      "default_mode": "details",
+      "show_hidden": false,
+      "sort_key": "name",
+      "sort_descending": false
+    },
+    "operations": {
+      "mode": "shell",
+      "fast_mode": false,
+      "worker_threads": 32,
+      "confirm_delete": true
+    },
+    "thumbnails": {
+      "enabled": true,
+      "max_memory_mb": 64
+    },
+    "navigation": {
+      "search_limit": 20000,
+      "watch_current_dir": true,
+      "history_depth": 64
+    }
+  },
+  "modules": {
+    "clipboard": { "enabled": false, "autostart": true },
+    "screenshot": { "enabled": false, "autostart": false },
+    "taskmgr": { "enabled": true, "autostart": false },
+    "terminal": { "enabled": false, "autostart": false },
+    "preview": { "enabled": false, "autostart": false },
+    "widget": { "enabled": false, "autostart": false }
+  }
+}

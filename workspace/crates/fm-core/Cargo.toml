@@ -1,0 +1,13 @@
+[package]
+name = "fm-core"
+description = "UI 无关的原生资源管理内核：目录引擎、文件操作、配置模型、IPC 协议、进程树"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+windows.workspace = true
