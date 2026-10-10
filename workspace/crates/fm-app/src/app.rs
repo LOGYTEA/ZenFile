@@ -294,11 +294,83 @@ pub struct App {
     pub hover_caption: u8,
     /// 按下未抬起的那一个（0=无，1/2/3 同上）。
     pub pressed_caption: u8,
+    /// 地址栏是否处于"文本编辑"态。
+    ///
+    /// Win11 的地址栏平时是**面包屑**（一节一节可点的路径），只有点空白处或
+    /// 按 Ctrl+L/F4 才变成可输入的文本框。平时把 EDIT 藏着，编辑时再显示出来。
+    pub addr_editing: bool,
+    /// 鼠标悬停的面包屑下标（hover 反馈）。
+    pub addr_hover: Option<usize>,
+}
+
+/// 地址栏面包屑的一节。
+#[derive(Clone)]
+pub struct Crumb {
+    /// 显示文字。目录走本地化显示名（"Users"→"用户"），盘符走卷标。
+    pub label: String,
+    /// 点击后要导航到的路径；`None` = 虚拟节点（主页 / 回收站 / 设置 / 此电脑）。
+    pub target: Option<PathBuf>,
+    /// 这一节是"折叠起来的中间层级"占位（`…`），点击跳到被折叠的最深一层。
+    pub ellipsis: bool,
 }
 
 /// 向 Shell 问目录的本地化显示名（见 `App::display_name`）。
 fn shell_display_name(path: &Path) -> Option<String> {
     crate::icons::IconCache::display_name(path)
+}
+
+/// 把路径拆成"逐级累积"的若干节：`C:\Users\a` → [`C:\`, `C:\Users`, `C:\Users\a`]。
+///
+/// 不用 `Path::components` + `PathBuf::push` 去拼：`PathBuf::push` 遇到以分隔符
+/// 开头的片段会**整条替换**（`push("\\")` 把 `C:` 变成 `\`），而且 `C:`（盘符前缀）
+/// 会和 `C:\`（盘符根）分成两节 —— 前者是"该盘上的当前目录"，点下去会跳错地方。
+/// 这里按字符串逐级累积，第一节就带根分隔符。
+fn path_segments(path: &Path) -> Vec<PathBuf> {
+    let s = path.to_string_lossy().to_string();
+    let mut segs: Vec<PathBuf> = Vec::new();
+    if s.is_empty() {
+        return segs;
+    }
+    if let Some(rest) = s.strip_prefix(r"\\") {
+        // UNC：`\\server\share\...`
+        let mut acc = String::from(r"\\");
+        for p in rest.split('\\').filter(|p| !p.is_empty()) {
+            if acc != r"\\" {
+                acc.push('\\');
+            }
+            acc.push_str(p);
+            segs.push(PathBuf::from(&acc));
+        }
+        return segs;
+    }
+    let b = s.as_bytes();
+    if b.len() >= 2 && b[1] == b':' {
+        // 盘符路径：第一节必须带上根分隔符（`C:\`，不能是 `C:`）
+        let mut acc = String::from(&s[..2]);
+        if s.len() > 2 && b[2] == b'\\' {
+            acc.push('\\');
+        }
+        segs.push(PathBuf::from(&acc));
+        let rest = s[acc.len()..].trim_start_matches('\\');
+        for p in rest.split('\\').filter(|p| !p.is_empty()) {
+            if !acc.ends_with('\\') {
+                acc.push('\\');
+            }
+            acc.push_str(p);
+            segs.push(PathBuf::from(&acc));
+        }
+        return segs;
+    }
+    // 相对路径等退化情况：按分隔符逐级累积
+    let mut acc = String::new();
+    for p in s.split('\\').filter(|p| !p.is_empty()) {
+        if !acc.is_empty() {
+            acc.push('\\');
+        }
+        acc.push_str(p);
+        segs.push(PathBuf::from(&acc));
+    }
+    segs
 }
 
 /// 取某个驱动器的完整信息（类型 / 卷标 / 容量），供首页容量条与导航窗格使用。
@@ -421,6 +493,8 @@ impl App {
             settings_hover: None,
             hover_caption: 0,
             pressed_caption: 0,
+            addr_editing: false,
+            addr_hover: None,
         }
     }
 
@@ -526,6 +600,10 @@ impl App {
         self.focus_visible = false;
         // 主动跳转到一个新目录时，"回退后要选中谁"这件事就作废了
         self.pending_select = None;
+        // 地址栏文本在这里一次更新掉：原来靠每个调用方自己记得调 sync_address，
+        // 漏一个就表现为"点了面包屑看着没反应"（其实目录已经切了，只是地址栏
+        // 还写着旧路径）。刷新放在导航里，调用方就不可能忘。
+        crate::paint::sync_address(self);
         self.reload();
         self.invalidate();
     }
@@ -1912,6 +1990,68 @@ impl App {
         }
         v
     }
+
+    // ------------------------------------------------------------ 地址栏面包屑
+
+    /// 当前路径拆成一节一节的面包屑（Win11 地址栏的样子）。
+    ///
+    /// 首节恒为"此电脑"（点它回主页），其后是盘符、各级目录。目录用本地化
+    /// 显示名（资源管理器里 `C:\Users` 显示"用户"），盘符用卷标 + 盘符。
+    /// 虚拟视图（主页 / 回收站 / 设置）只有一节，不可再拆。
+    pub fn address_crumbs(&mut self) -> Vec<Crumb> {
+        let (home, recycle, settings, path) = {
+            let t = self.tab();
+            (
+                t.home,
+                t.recycle,
+                t.settings,
+                fm_core::paths::strip_verbatim(&t.path).to_path_buf(),
+            )
+        };
+        if home {
+            return vec![Crumb { label: "主页".into(), target: None, ellipsis: false }];
+        }
+        if recycle {
+            return vec![Crumb { label: "回收站".into(), target: None, ellipsis: false }];
+        }
+        if settings {
+            return vec![Crumb { label: "设置".into(), target: None, ellipsis: false }];
+        }
+
+        let segs = path_segments(&path);
+        if segs.is_empty() {
+            return vec![Crumb {
+                label: path.to_string_lossy().to_string(),
+                target: None,
+                ellipsis: false,
+            }];
+        }
+
+        let mut out = Vec::with_capacity(segs.len() + 1);
+        out.push(Crumb { label: "此电脑".into(), target: None, ellipsis: false });
+        for (i, p) in segs.iter().enumerate() {
+            let label = if i == 0 {
+                // 盘符：优先卷标（"FurFHT (F:)"），没卷标就退回类型名 + 盘符
+                let mut root = p.to_string_lossy().to_string();
+                if !root.ends_with('\\') {
+                    root.push('\\');
+                }
+                match drive_of(self, &PathBuf::from(&root)) {
+                    Some(d) => d.display_name(),
+                    None => root.trim_end_matches('\\').to_string(),
+                }
+            } else {
+                let fallback = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| p.to_string_lossy().to_string());
+                self.display_name(p, &fallback)
+            };
+            out.push(Crumb { label, target: Some(p.clone()), ellipsis: false });
+        }
+        out
+    }
+
 }
 
 fn shell_row(text: &str, glyph: Option<&'static str>, cmd: Command) -> menu::MenuEntry {

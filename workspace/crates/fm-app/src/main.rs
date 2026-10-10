@@ -516,12 +516,20 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             } else {
                 None
             };
+            // 地址栏面包屑悬停：只在非编辑态、且光标确实落在地址框里时算
+            let hover_addr = if !app.addr_editing && inside(&l.address, x, y) {
+                let bar = paint::address_bar(app, &l);
+                paint::address_hit(&bar, x, y)
+            } else {
+                None
+            };
             if in_close != app.hovering_close
                 || chrome != app.hover_chrome
                 || hover_tab != app.hover_tab
                 || hover_view != app.hover_view_btn
                 || hover_setting != app.settings_hover
                 || hover_sidebar != app.sidebar_hover
+                || hover_addr != app.addr_hover
             {
                 app.hovering_close = in_close;
                 app.hover_chrome = chrome;
@@ -529,6 +537,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 app.hover_view_btn = hover_view;
                 app.settings_hover = hover_setting;
                 app.sidebar_hover = hover_sidebar;
+                app.addr_hover = hover_addr;
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
             LRESULT(0)
@@ -669,6 +678,25 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     app.set_view(mode);
                     return LRESULT(0);
                 }
+            }
+            // 地址栏（Win11 面包屑）：点某一节跳到那一层，点空白进编辑态
+            if inside(&l.address, x, y) {
+                if app.addr_editing {
+                    return LRESULT(0);
+                }
+                let bar = paint::address_bar(app, &l);
+                match paint::address_hit(&bar, x, y) {
+                    Some(i) => {
+                        // 必须用"命中的那一节自己带的 target"，不能拿下标回完整
+                        // 路径列表里取：窗口一窄，中间层级会被折成一个 `…`，
+                        // 折叠后的下标和完整列表的下标根本不是一回事（实测点 `…`
+                        // 会跳到 C:\ —— 那是完整列表的第 1 节）。
+                        let target = bar.crumbs[i].target.clone();
+                        app.navigate(target.unwrap_or_else(|| PathBuf::from(app::HOME_PATH)));
+                    }
+                    None => paint::begin_address_edit(app),
+                }
+                return LRESULT(0);
             }
             if inside(&l.back, x, y) {
                 app.go_back();
@@ -1265,7 +1293,9 @@ fn handle_key(app: &mut App, key: i32) {
         _ if ctrl && key == 0x58 => app.clipboard_write(fm_core::clipboard::ClipMode::Move),
         _ if ctrl && key == 0x56 => app.paste(),
         _ if ctrl && key == 0x46 => paint::focus_edit(app.hwnd_search),
-        _ if ctrl && key == 0x4C => paint::focus_edit(app.hwnd_address),
+        // Ctrl+L / F4 / Alt+D：地址栏。Win11 下这三个键都是"切到可输入的地址栏"，
+        // 所以不能只 focus 那个平时藏着的 EDIT，得先把它显示出来。
+        _ if ctrl && key == 0x4C => paint::begin_address_edit(app),
         _ if ctrl && key == 0x54 => app.new_tab(),
         _ if ctrl && key == 0x57 => app.close_tab(app.active),
         _ if ctrl && shift && key == 0x4E => app.new_folder(),
@@ -1279,7 +1309,7 @@ fn handle_key(app: &mut App, key: i32) {
         _ if ctrl && !shift && key == 0x09 => app.cycle_tab(1),
         _ if ctrl && shift && key == 0x09 => app.cycle_tab(-1),
         // 地址栏 / 搜索框（Explorer 用 F4 与 Alt+D 定位地址栏）
-        _ if key == 0x73 || (alt && key == 0x44) => paint::focus_edit(app.hwnd_address),
+        _ if key == 0x73 || (alt && key == 0x44) => paint::begin_address_edit(app),
         _ if ctrl && key == 0x45 => paint::focus_edit(app.hwnd_search),
         _ if key == 0x72 => paint::focus_edit(app.hwnd_search),
         // 刷新（F5 之外的 Ctrl+R）
@@ -1320,6 +1350,8 @@ pub(crate) fn on_address_enter() {
     let app = app_ref();
     let text = paint::read_window_text(app.hwnd_address);
     let cwd = app.tab().path.clone();
+    // 回车之后地址栏要收回面包屑 —— 不收回的话它会一直挂在屏幕上挡着路径
+    paint::end_address_edit(app, true);
     match fm_core::paths::resolve(&text, &cwd) {
         Ok(Target::Navigate(p)) => {
             if p.is_dir() {
@@ -1337,6 +1369,12 @@ pub(crate) fn on_address_enter() {
     unsafe {
         let _ = SetForegroundWindow(app.hwnd);
     }
+}
+
+/// 地址框失去焦点：收回面包屑（不抢焦点，否则会和 SetFocus 互相踢）。
+pub(crate) fn on_address_blur() {
+    let app = app_ref();
+    paint::end_address_edit(app, false);
 }
 
 /// §13：地址栏输入 cmd/powershell/wsl 时，在当前目录启动对应 shell。
@@ -1380,6 +1418,7 @@ pub(crate) fn on_search_enter() {
 
 pub(crate) fn on_edit_escape() {
     let app = app_ref();
+    paint::end_address_edit(app, true);
     paint::sync_address(app);
     paint::set_window_text_utf16(app.hwnd_search, "");
     {

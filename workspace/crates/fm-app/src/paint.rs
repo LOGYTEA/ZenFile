@@ -4,13 +4,14 @@
 //! 列表是虚拟化的：只为可见行请求数据与图标 index。
 
 use windows::core::HSTRING;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreateSolidBrush, DeleteDC,
-    DeleteObject, DrawTextW, FillRect, IntersectClipRect, RestoreDC, SaveDC, SelectObject,
-    SetBkMode, SetTextColor, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT,
-    DT_SINGLELINE, DT_VCENTER, DRAW_TEXT_FORMAT, FONT_CHARSET, FONT_CLIP_PRECISION,
-    FONT_OUTPUT_PRECISION, FONT_QUALITY, HDC, HFONT, SRCCOPY, TRANSPARENT,
+    DeleteObject, DrawTextW, FillRect, GetTextExtentPoint32W, IntersectClipRect, InvalidateRect,
+    ReleaseDC, RestoreDC, SaveDC, SelectObject, SetBkMode, SetTextColor, DT_CENTER,
+    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DRAW_TEXT_FORMAT,
+    FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FONT_QUALITY, HDC, HFONT, SRCCOPY,
+    TRANSPARENT,
 };
 use windows::Win32::UI::Controls::EM_SETSEL;
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
@@ -560,8 +561,190 @@ pub fn draw_text(hdc: HDC, text: &str, mut rect: RECT, flags: DRAW_TEXT_FORMAT) 
     }
 }
 
-fn paint_toolbar(app: &App, hdc: HDC, l: &Layout) {
-    let t = &app.theme;
+// ---------------------------------------------------------------- 地址栏（Win11 面包屑）
+
+/// 面包屑排版结果。**绘制与命中测试共用这一份**（老纪律：两边各写一份常量，
+/// 改一次就错位）。
+pub struct AddressBar {
+    pub crumbs: Vec<crate::app::Crumb>,
+    /// 与 `crumbs` 一一对应的命中矩形
+    pub rects: Vec<RECT>,
+    /// 相邻两节之间的分隔箭头矩形（纯装饰，不参与命中）
+    pub seps: Vec<RECT>,
+}
+
+/// 量一段文字在指定字体下的像素宽度。
+///
+/// 面包屑排版必须量真实宽度：按"字数 × 平均宽"估算在中英混排下必然错位
+/// （"用户" 两字和 "Administrator" 十三个字母完全不是一个尺度）。
+unsafe fn text_width(hdc: HDC, font: HFONT, text: &str) -> i32 {
+    let old = SelectObject(hdc, font.into());
+    let w: Vec<u16> = text.encode_utf16().collect();
+    let mut sz = SIZE::default();
+    let _ = GetTextExtentPoint32W(hdc, &w, &mut sz);
+    SelectObject(hdc, old);
+    sz.cx
+}
+
+/// 把当前路径排成资源管理器那种"一节一节"的地址栏。
+///
+/// 宽度不够时按 Win11 的做法折叠中间层级：保留"此电脑"和末尾几节，中间压成一个
+/// `…`（点它跳到被折叠的最深一层）。**先量宽再决定折叠** —— 少了这一步，路径一深
+/// 就会画出右边框外面去。
+pub fn address_bar(app: &mut App, l: &Layout) -> AddressBar {
+    let scale = app.metrics.scale;
+    let mut crumbs = app.address_crumbs();
+    let pad = (8.0 * scale).round() as i32;
+    let cpad = (5.0 * scale).round() as i32;
+    let avail = (l.address.right - l.address.left - pad * 2).max(20);
+    let font = ui_font(scale);
+    let hwnd = app.hwnd;
+    let hdc = unsafe { windows::Win32::Graphics::Gdi::GetDC(Some(hwnd)) };
+    if hdc.is_invalid() {
+        return AddressBar { crumbs, rects: Vec::new(), seps: Vec::new() };
+    }
+    let width_of = |s: &str| unsafe { text_width(hdc, font, s) };
+    let sep_w = width_of("\u{203A}") + (2.0 * scale) as i32;
+    let ell_w = width_of("\u{2026}") + cpad * 2;
+
+    let widths: Vec<i32> = crumbs.iter().map(|c| width_of(&c.label) + cpad * 2).collect();
+    let n = widths.len();
+    let total: i32 = widths.iter().sum::<i32>() + sep_w * n.saturating_sub(1) as i32;
+    if total > avail && n > 2 {
+        // 从右往左累计能塞下的节；剩下的中间层级折成一个 `…`
+        let mut used = widths[n - 1];
+        let mut start = n - 1;
+        let mut i = n - 1;
+        while i > 1 {
+            i -= 1;
+            let need = widths[i] + sep_w;
+            if used + need + sep_w + ell_w + sep_w + widths[0] > avail {
+                break;
+            }
+            used += need;
+            start = i;
+        }
+        if start > 1 {
+            let ell_target = crumbs[start - 1].target.clone();
+            let mut v = vec![crumbs[0].clone()];
+            v.push(crate::app::Crumb {
+                label: "\u{2026}".into(),
+                target: ell_target,
+                ellipsis: true,
+            });
+            v.extend_from_slice(&crumbs[start..]);
+            crumbs = v;
+        // 连"此电脑 + … + 最后一节"都放不下：只留最后一节，宁可截断也不越界
+        } else {
+            crumbs = vec![crumbs[n - 1].clone()];
+        }
+    }
+
+    let widths: Vec<i32> = crumbs.iter().map(|c| width_of(&c.label) + cpad * 2).collect();
+    let mut rects = Vec::with_capacity(crumbs.len());
+    let mut seps = Vec::with_capacity(crumbs.len());
+    let top = l.address.top + 1;
+    let bottom = l.address.bottom - 1;
+    let mut x = l.address.left + pad;
+    let limit = l.address.right - 2;
+    for (i, w) in widths.iter().enumerate() {
+        let r = RECT { left: x, top, right: (x + w).min(limit), bottom };
+        rects.push(r);
+        x += w;
+        if i + 1 < widths.len() {
+            seps.push(RECT { left: x, top, right: x + sep_w, bottom });
+            x += sep_w;
+        }
+    }
+    unsafe {
+        let _ = ReleaseDC(Some(hwnd), hdc);
+    }
+    AddressBar { crumbs, rects, seps }
+}
+
+/// 命中测试：返回被点到的面包屑下标。
+pub fn address_hit(bar: &AddressBar, x: i32, y: i32) -> Option<usize> {
+    for (i, r) in bar.rects.iter().enumerate() {
+        if x >= r.left && x <= r.right && y >= r.top && y <= r.bottom {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// 画地址栏：平时是面包屑，编辑态时让 EDIT 自己画（它此时才显示出来）。
+fn paint_address(app: &mut App, hdc: HDC, l: &Layout) {
+    let t = app.theme;
+    unsafe {
+        // 底 + 1px 边框（EDIT 与工具栏同色，没有框就等于看不见）
+        let bg = CreateSolidBrush(t.surface);
+        FillRect(hdc, &l.address, bg);
+        let _ = DeleteObject(bg.into());
+        let pf = CreateSolidBrush(t.border);
+        for e in [
+            RECT { left: l.address.left, top: l.address.top, right: l.address.right, bottom: l.address.top + 1 },
+            RECT { left: l.address.left, top: l.address.bottom - 1, right: l.address.right, bottom: l.address.bottom },
+            RECT { left: l.address.left, top: l.address.top, right: l.address.left + 1, bottom: l.address.bottom },
+            RECT { left: l.address.right - 1, top: l.address.top, right: l.address.right, bottom: l.address.bottom },
+        ] {
+            FillRect(hdc, &e, pf);
+        }
+        let _ = DeleteObject(pf.into());
+        if app.addr_editing {
+            return;
+        }
+
+        let bar = address_bar(app, l);
+        // 必须 Save/Restore：这是**整窗共用的内存 DC**，裁剪区一改，后面画的
+        // 导航窗格、列表、状态栏全被裁进地址框里（整窗变成一片空白）。
+        let saved = SaveDC(hdc);
+        let _ = IntersectClipRect(
+            hdc,
+            l.address.left + 1,
+            l.address.top + 1,
+            l.address.right - 1,
+            l.address.bottom - 1,
+        );
+        let font = ui_font(app.metrics.scale);
+        let old = SelectObject(hdc, font.into());
+        SetBkMode(hdc, TRANSPARENT);
+        for (i, c) in bar.crumbs.iter().enumerate() {
+            let r = match bar.rects.get(i) {
+                Some(r) => *r,
+                None => continue,
+            };
+            let last = i + 1 == bar.crumbs.len();
+            if app.addr_hover == Some(i) {
+                let hb = CreateSolidBrush(t.hover_bg);
+                FillRect(hdc, &r, hb);
+                let _ = DeleteObject(hb.into());
+            }
+            SetTextColor(hdc, if last { t.text } else { t.text_dim });
+            let mut w: Vec<u16> = c.label.encode_utf16().collect();
+            DrawTextW(
+                hdc,
+                &mut w,
+                &mut r.clone(),
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+            );
+        }
+        SetTextColor(hdc, t.text_dim);
+        for s in &bar.seps {
+            let mut w: Vec<u16> = "\u{203A}".encode_utf16().collect();
+            DrawTextW(
+                hdc,
+                &mut w,
+                &mut s.clone(),
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+        }
+        SelectObject(hdc, old);
+        let _ = RestoreDC(hdc, saved);
+    }
+}
+
+fn paint_toolbar(app: &mut App, hdc: HDC, l: &Layout) {
+    let t = app.theme;
     unsafe {
         let brush = CreateSolidBrush(t.chrome_bg);
         FillRect(hdc, &l.toolbar, brush);
@@ -577,8 +760,11 @@ fn paint_toolbar(app: &App, hdc: HDC, l: &Layout) {
         draw_text(hdc, "\u{E74A}", l.up, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_CENTER);
         SelectObject(hdc, old_g);
 
-        // 输入框底色 + 1px 边框：否则 EDIT 与工具栏同色，肉眼不可见
-        for r in [&l.address, &l.search] {
+        // 搜索框底色 + 1px 边框：否则 EDIT 与工具栏同色，肉眼不可见。
+        // 地址栏交给 paint_address —— 它平时是面包屑，只有编辑态才露出 EDIT。
+        paint_address(app, hdc, l);
+        {
+            let r = &l.search;
             let bg = CreateSolidBrush(t.surface);
             FillRect(hdc, r, bg);
             let _ = DeleteObject(bg.into());
@@ -1847,6 +2033,8 @@ pub fn create_children(app: &mut App, instance: Option<HINSTANCE>) {
         app.hwnd_address = addr;
         ADDR_OLD = SetWindowLongPtrW(addr, GWLP_WNDPROC, (addr_proc as *const ()) as isize);
         set_edit_font(addr, app.metrics.scale);
+        // 平时是面包屑，EDIT 只在编辑态才露出来（Win11 的资源管理器也是这样）。
+        let _ = ShowWindow(addr, SW_HIDE);
 
         let search = CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -1964,6 +2152,11 @@ unsafe extern "system" fn addr_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         crate::on_edit_escape();
         return LRESULT(0);
     }
+    // 焦点离开地址框就收回面包屑（不抢焦点，避免来回踢）
+    if msg == WM_KILLFOCUS {
+        crate::on_address_blur();
+        return LRESULT(0);
+    }
     call_old(ADDR_OLD, hwnd, msg, wparam, lparam)
 }
 
@@ -2012,6 +2205,41 @@ pub fn set_window_text_utf16(hwnd: HWND, text: &str) {
     let buf = wide(text);
     unsafe {
         let _ = SetWindowTextW(hwnd, windows::core::PCWSTR(buf.as_ptr()));
+    }
+}
+
+/// 进入地址栏编辑态：把平时藏着的 EDIT 显示出来、填入真实路径并全选。
+///
+/// Win11 的地址栏点了空白处才变成输入框 —— 平时是面包屑，直接拿一个常驻的
+/// EDIT 当地址栏，既不像资源管理器，也没法一节一节点着跳。
+pub fn begin_address_edit(app: &mut App) {
+    if app.addr_editing {
+        return;
+    }
+    app.addr_editing = true;
+    app.addr_hover = None;
+    sync_address(app);
+    unsafe {
+        let _ = ShowWindow(app.hwnd_address, SW_SHOW);
+        let _ = SetFocus(Some(app.hwnd_address));
+        let _ = SendMessageW(app.hwnd_address, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
+        let _ = InvalidateRect(Some(app.hwnd), None, true);
+    }
+}
+
+/// 退出编辑态。`refocus` 为 false 时不要把焦点抢回主窗口 —— 在 WM_KILLFOCUS
+/// 里再调 SetFocus 会来回踢焦点。
+pub fn end_address_edit(app: &mut App, refocus: bool) {
+    if !app.addr_editing {
+        return;
+    }
+    app.addr_editing = false;
+    unsafe {
+        let _ = ShowWindow(app.hwnd_address, SW_HIDE);
+        if refocus {
+            let _ = SetFocus(Some(app.hwnd));
+        }
+        let _ = InvalidateRect(Some(app.hwnd), None, true);
     }
 }
 
