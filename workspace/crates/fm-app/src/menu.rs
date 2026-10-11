@@ -36,7 +36,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetMenuItemInfoW, GetWindowLongPtrW, RegisterClassExW, SetWindowLongPtrW, ShowWindow,
     TrackPopupMenu, GWLP_USERDATA, HMENU, MENUITEMINFOW,
     MFS_DISABLED, MFT_SEPARATOR, MIIM_BITMAP, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING,
-    MIIM_SUBMENU, SW_SHOWNOACTIVATE, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_DESTROY, WM_ERASEBKGND,
+    MIIM_SUBMENU, MFS_CHECKED, SW_SHOWNOACTIVATE, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_DESTROY,
+    WM_ERASEBKGND,
     WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
     WM_RBUTTONUP, WNDCLASSEXW, WS_BORDER, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
@@ -156,6 +157,11 @@ pub struct MenuEntry {
     pub bmp: Option<isize>,
     pub separator: bool,
     pub disabled: bool,
+    /// "这一项就是当前生效的那个"（查看 → 详细信息、排序方式 → 名称 …）。
+    ///
+    /// 渲染成行首一条**橙色**竖线：蓝色竖线已经用来表示"鼠标正悬停在这行"，
+    /// 两者撞色就分不清"我指在这儿"和"现在用的是这个"。
+    pub selected: bool,
     pub has_submenu: bool,
     pub submenu: Vec<MenuEntry>,
     pub action: MenuAction,
@@ -169,6 +175,7 @@ impl MenuEntry {
             bmp: None,
             separator: true,
             disabled: false,
+            selected: false,
             has_submenu: false,
             submenu: Vec::new(),
             action: MenuAction::None,
@@ -322,6 +329,7 @@ fn read_entry(hmenu: HMENU, pos: u32, first_id: u32, depth: usize) -> Option<Men
             bmp,
             separator: false,
             disabled,
+            selected: (mii.fState & MFS_CHECKED) == MFS_CHECKED,
             has_submenu: has_submenu && !submenu.is_empty(),
             submenu,
             action,
@@ -1014,7 +1022,8 @@ unsafe fn paint_menu(hdc: HDC, state: &MenuWindow) {
                 continue;
             }
             let rect = RECT { left: 0, top, right: state.width, bottom: top + state.row_h };
-            if state.hover == Some(i) && !e.disabled {
+            let hovered = state.hover == Some(i) && !e.disabled;
+            if hovered {
                 let hb = CreateSolidBrush(t.hover_bg);
                 let _ = FillRect(hdc, &rect, hb);
                 DeleteObject(hb.into());
@@ -1025,6 +1034,18 @@ unsafe fn paint_menu(hdc: HDC, state: &MenuWindow) {
                 let _ = FillRect(hdc, &ar, ab);
                 DeleteObject(ab.into());
             }
+            // 「当前生效的那一项」：和悬停同构（行首竖线），但换橙色。
+            // 悬停时优先画蓝色（鼠标位置是更即时、更需要看清的信息），
+            // 没悬停才显示橙色的选中标记。
+            if e.selected && !hovered {
+                let ob = CreateSolidBrush(t.orange);
+                let or_ = RECT { left: 0, top, right: (3.0 * state.scale) as i32, bottom: top + state.row_h };
+                let _ = FillRect(hdc, &or_, ob);
+                DeleteObject(ob.into());
+            }
+            // 禁用态要和 Windows 一致：字淡到"读得出但明显不可用"，并且**不参与
+            // 悬停高亮**（上面 hovered 已经排除了）。只改颜色不改布局，
+            // 免得菜单宽度随状态跳来跳去。
             SetTextColor(hdc, if e.disabled { t.text_dim } else { t.text });
             let icon_pad = (10.0 * state.scale) as i32;
             if let Some(glyph) = e.glyph {

@@ -32,6 +32,10 @@ pub struct Theme {
     pub border: COLORREF,
     pub danger: COLORREF,
     pub tab_active: COLORREF,
+    /// 菜单里"当前生效的那一项"的标记色。与 hover 同构（同样是行首一条竖线），
+    /// 只是换成橙色：蓝色竖条已经被"鼠标正悬停在哪一行"占用了，两者撞色就分不清
+    /// "我指在这儿"和"现在用的是这个"。
+    pub orange: COLORREF,
 }
 
 /// 暗色配色取自本机 Windows 10 资源管理器的实测像素（CabinetWClass，DPI 96）：
@@ -60,6 +64,7 @@ pub fn dark() -> Theme {
         border: rgb(0x535353),
         danger: rgb(0xE4585A),
         tab_active: rgb(0x2B2B2B),
+        orange: rgb(0xE8A33D),
     }
 }
 
@@ -80,6 +85,7 @@ pub fn light() -> Theme {
         border: rgb(0xC8C8C8),
         danger: rgb(0xC42B2B),
         tab_active: rgb(0xFFFFFF),
+        orange: rgb(0xC2700A),
     }
 }
 

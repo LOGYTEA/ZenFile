@@ -53,6 +53,9 @@ use fm_core::paths::Target;
 static mut APP: *mut App = std::ptr::null_mut();
 
 const WM_TRAY: u32 = WM_APP + 1;
+/// 后台文件操作（复制/移动/拖拽落地）完成。由 worker 线程 Post 回来，
+/// UI 线程在这条消息里收口：报错 + 重列当前目录。**不能**在 worker 里直接碰 UI。
+pub const WM_APP_IO_DONE: u32 = WM_APP + 2;
 const TIMER_DRAIN: usize = 1;
 /// 对外显示的产品名。托盘提示、窗口标题、标题栏落款共用这一份，改一处就够。
 pub const APP_TITLE: &str = "ZenFile";
@@ -459,6 +462,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             LRESULT(1)
         }
         WM_CTLCOLOREDIT => handle_ctl_color(app_ptr, wparam),
+        // 后台复制/移动干完了：收错误、重列目录。**只在这条消息里 reload** ——
+        // 在 worker 线程里碰 UI 状态会跨线程改 App，在松手那条消息里做又会
+        // 阻塞输入（IFileOperation 是模态的）。
+        crate::WM_APP_IO_DONE => {
+            let app = &mut *app_ptr;
+            app.drain_io();
+            app.reload();
+            let _ = InvalidateRect(Some(hwnd), None, true);
+            LRESULT(0)
+        }
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut ps);
@@ -598,6 +611,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             }
             // 标签栏悬停：决定了哪个标签显示关闭按钮
             let hover_tab = hit_tab(app, &l, x, y);
+            // 目录栏最右侧「批量重命名」按钮的悬停。虚拟视图里不画，就也不该有悬停态
+            let hover_bulk = paint::bulk_rename_available(app) && inside(&l.bulk_btn, x, y);
             // 状态栏布局切换按钮悬停
             let hover_view = if app.cfg.ui.statusbar_visible {
                 match paint::status_view_hit(&l, &app.metrics, x, y) {
@@ -638,8 +653,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 || hover_addr != app.addr_hover
                 || hover_split != app.hover_split
                 || hover_collapse != app.hover_sidebar_collapse
+                || hover_bulk != app.hover_bulk
             {
                 app.hover_sidebar_collapse = hover_collapse;
+                app.hover_bulk = hover_bulk;
                 app.hover_split = hover_split;
                 app.hovering_close = in_close;
                 app.hover_chrome = chrome;
@@ -848,6 +865,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             if inside(&l.up, x, y) {
                 app.go_up();
                 paint::sync_address(app);
+                return LRESULT(0);
+            }
+            // 目录栏最右侧「批量重命名 ▾」：下拉形式弹出五种模式
+            if paint::bulk_rename_available(app) && inside(&l.bulk_btn, x, y) {
+                show_bulk_rename_menu(hwnd, app, &l);
                 return LRESULT(0);
             }
             // 导航窗格右上角的折叠按钮：压在首行之上那条预留带里，先判它
@@ -1258,6 +1280,34 @@ fn drop_target_at(app: &mut App, l: &paint::Layout, x: i32, y: i32) -> Option<ap
         }
     }
     None
+}
+
+/// 目录栏最右侧「批量重命名 ▾」的下拉：五种模式，各对应 `fm_core::bulk` 一条规则。
+///
+/// 菜单定位在按钮**正下方**左对齐 —— 下拉菜单的通行摆法，别从鼠标位置弹。
+fn show_bulk_rename_menu(hwnd: HWND, app: &mut App, l: &paint::Layout) {
+    let entries: Vec<menu::MenuEntry> = crate::rename::MODE_LABELS
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            crate::app::shell_row(label, Some("\u{E8AC}"), menu::Command::BulkRename(i))
+        })
+        .collect();
+    let mut pt = POINT { x: l.bulk_btn.left, y: l.bulk_btn.bottom };
+    let _ = unsafe { ClientToScreen(hwnd, &mut pt) };
+    let app_ptr = app as *mut App;
+    if let Some(h) = menu::open_menu(
+        app_ptr,
+        hwnd,
+        entries,
+        pt.x,
+        pt.y,
+        app.metrics.scale,
+        app.theme,
+        None,
+    ) {
+        app.menu_hwnd = Some(h);
+    }
 }
 
 /// 松手：条目拖拽去落地 / 框选去选中。

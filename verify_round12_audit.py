@@ -215,10 +215,11 @@ if not ms:
 mh, mx, my, mw, mhh = ms[0]
 top0, row_h = menu_metrics(mh, mw, mhh)
 print(f"  菜单量得: 顶边 {top0} 行高 {row_h}")
-# 文件菜单: 0打开 1打开方式 2剪切 3复制 4重命名 5批量重命名 6删除 7[sep]
-# 8粘贴 9新建 10[sep] 11全选 12刷新 13查看 14排序方式 15属性
-FILE_SEPS = (7, 10)
-y_sort = menu_row_center(top0, row_h, 14, FILE_SEPS)
+# 文件菜单: 0打开 1打开方式 2剪切 3复制 4重命名 5删除 6[sep]
+# 7粘贴 8新建 9[sep] 10全选 11刷新 12查看 13排序方式 14属性
+# （第 15 轮「批量重命名」搬去目录栏按钮，后面整体前移一格）
+FILE_SEPS = (6, 9)
+y_sort = menu_row_center(top0, row_h, 13, FILE_SEPS)
 print(f"  「排序方式」行中心 y={y_sort}")
 move(mh, mw // 2, y_sort)
 time.sleep(0.5)

@@ -23,6 +23,41 @@ const CF_HDROP_FMT: u32 = 15;
 /// GMEM_MOVEABLE | GMEM_ZEROINIT
 const GHND: u32 = 0x0042;
 
+/// `GlobalUnlock` 的返回值**不能**当成功/失败看。
+///
+/// MSDN：对象的锁计数降到 0 时返回 **FALSE**，且此时 `GetLastError()` 是
+/// `NO_ERROR(0)`；只有"出错"时才是 FALSE + 非零 GetLastError。而 windows-rs
+/// 把 BOOL 返回值统一映射成"返回 0 就是 Err(win32)"，于是正常的解锁被判成失败，
+/// 错误码还是 0 —— 界面上那句"剪贴板写入失败：HRESULT 0x00000000"就是这么来的
+/// （数据在 `GlobalUnlock` 前就已经拷好了，但因为提前 return，CF_HDROP 根本没
+/// 放进剪贴板，于是"复制"看起来毫无效果）。
+unsafe fn global_unlock(h: HGLOBAL) {
+    let _ = GlobalUnlock(h);
+}
+
+/// 打开剪贴板。别的进程（Explorer、Office、远程桌面剪贴板监视器…）可能正占着，
+/// 单次失败很常见，因此**重试若干次**再放弃，并带上真实的 GetLastError。
+unsafe fn open_clipboard(owner: isize) -> Result<()> {
+    let hwnd = if owner == 0 {
+        None
+    } else {
+        Some(windows::Win32::Foundation::HWND(owner as *mut core::ffi::c_void))
+    };
+    let mut last = 0u32;
+    for _ in 0..12 {
+        match OpenClipboard(hwnd) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let code = e.code().0 as u32;
+                // HRESULT_FROM_WIN32(x) → 0x8007xxxx，这里拆回 Win32 码便于阅读
+                last = if code & 0xFFFF0000 == 0x80070000 { code & 0xFFFF } else { code };
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+        }
+    }
+    Err(Error::Other(format!("打开剪贴板失败（可能被其它程序占用），Win32 错误 {last}")))
+}
+
 const CFSTR_PREFERREDDROPEFFECT: &str = "Preferred DropEffect";
 
 /// CF_UNICODETEXT = 13：用于"复制路径"这类纯文本场景。
@@ -34,8 +69,8 @@ pub fn set_text(text: &str) -> Result<()> {
     units.push(0);
     let bytes = (units.len() * 2) as usize;
     unsafe {
-        OpenClipboard(None)?;
-        EmptyClipboard()?;
+        open_clipboard(0)?;
+        let _ = EmptyClipboard();
         let alloc = GlobalAlloc(GLOBAL_ALLOC_FLAGS(GHND), bytes);
         let res = (|| -> Result<()> {
             let h = match alloc {
@@ -47,7 +82,7 @@ pub fn set_text(text: &str) -> Result<()> {
                 return Err(Error::Other("GlobalLock 失败".into()));
             }
             std::ptr::copy_nonoverlapping(units.as_ptr(), p, units.len());
-            let _ = GlobalUnlock(h);
+            global_unlock(h);
             SetClipboardData(CF_UNICODETEXT_FMT, Some(HANDLE(h.0)))?;
             Ok(())
         })();
@@ -72,7 +107,9 @@ struct DropFiles {
 }
 
 /// 把一组文件放进剪贴板。`mode` 决定 Explorer 粘贴时的语义（剪切/复制）。
-pub fn set_files(files: &[PathBuf], mode: ClipMode) -> Result<()> {
+///
+/// `owner` 是调用方窗口句柄（用于剪贴板归属，传 0 表示不指定）。
+pub fn set_files(files: &[PathBuf], mode: ClipMode, owner: isize) -> Result<()> {
     if files.is_empty() {
         return Ok(());
     }
@@ -84,17 +121,26 @@ pub fn set_files(files: &[PathBuf], mode: ClipMode) -> Result<()> {
     }
 
     unsafe {
-        OpenClipboard(Some(windows::Win32::Foundation::HWND(std::ptr::null_mut())))?;
-        EmptyClipboard()?;
+        open_clipboard(owner)?;
+        if EmptyClipboard().is_err() {
+            let _ = CloseClipboard();
+            return Err(Error::Other("清空剪贴板失败".into()));
+        }
 
         let header_size = std::mem::size_of::<DropFiles>();
         let total = header_size + blob.len() * 2;
-        let hg = GlobalAlloc(GLOBAL_ALLOC_FLAGS(GHND), total + 2)?;
+        let hg = match GlobalAlloc(GLOBAL_ALLOC_FLAGS(GHND), total + 2) {
+            Ok(v) if !v.0.is_null() => v,
+            _ => {
+                let _ = CloseClipboard();
+                return Err(Error::Other("GlobalAlloc 失败".into()));
+            }
+        };
         let gh = HGLOBAL(hg.0);
         let ptr = GlobalLock(gh) as *mut u8;
         if ptr.is_null() {
-            GlobalFree(Some(hg))?;
-            CloseClipboard()?;
+            let _ = GlobalFree(Some(hg));
+            let _ = CloseClipboard();
             return Err(Error::Other("GlobalLock 失败".into()));
         }
         let header = ptr as *mut DropFiles;
@@ -105,28 +151,29 @@ pub fn set_files(files: &[PathBuf], mode: ClipMode) -> Result<()> {
         (*header).f_wide = 1;
         let tail = ptr.add(header_size) as *mut u16;
         std::ptr::copy_nonoverlapping(blob.as_ptr(), tail, blob.len());
-        GlobalUnlock(gh)?;
+        global_unlock(gh);
 
         if SetClipboardData(CF_HDROP_FMT, Some(HANDLE(hg.0))).is_err() {
-            GlobalFree(Some(hg))?;
-            CloseClipboard()?;
+            let _ = GlobalFree(Some(hg));
+            let _ = CloseClipboard();
             return Err(Error::Other("SetClipboardData(CF_HDROP) 失败".into()));
         }
 
         // Preferred DropEffect：4 字节 little-endian DROPEFFECT
         let effect_format = RegisterClipboardFormatW(&HSTRING::from(CFSTR_PREFERREDDROPEFFECT));
-        let hg2 = GlobalAlloc(GLOBAL_ALLOC_FLAGS(GHND), 4)?;
-        let p2 = GlobalLock(hg2) as *mut u32;
-        if !p2.is_null() {
-            *p2 = match mode {
-                ClipMode::Copy => 1, // DROPEFFECT_COPY
-                ClipMode::Move => 2, // DROPEFFECT_MOVE
-            };
-            GlobalUnlock(hg2)?;
-            let _ = SetClipboardData(effect_format, Some(HANDLE(hg2.0)));
+        if let Ok(hg2) = GlobalAlloc(GLOBAL_ALLOC_FLAGS(GHND), 4) {
+            let p2 = GlobalLock(hg2) as *mut u32;
+            if !p2.is_null() {
+                *p2 = match mode {
+                    ClipMode::Copy => 1, // DROPEFFECT_COPY
+                    ClipMode::Move => 2, // DROPEFFECT_MOVE
+                };
+                global_unlock(hg2);
+                let _ = SetClipboardData(effect_format, Some(HANDLE(hg2.0)));
+            }
         }
 
-        CloseClipboard()?;
+        let _ = CloseClipboard();
     }
     Ok(())
 }
@@ -134,18 +181,18 @@ pub fn set_files(files: &[PathBuf], mode: ClipMode) -> Result<()> {
 /// 读取剪贴板中的 CF_HDROP。返回 None 表示当前剪贴板不含文件。
 pub fn get_files() -> Result<Option<(Vec<PathBuf>, ClipMode)>> {
     unsafe {
-        OpenClipboard(Some(windows::Win32::Foundation::HWND(std::ptr::null_mut())))?;
+        open_clipboard(0)?;
         let handle = match GetClipboardData(CF_HDROP_FMT) {
             Ok(h) if !h.is_invalid() => HANDLE(h.0),
             _ => {
-                CloseClipboard()?;
+                let _ = CloseClipboard();
                 return Ok(None);
             }
         };
         let gh = HGLOBAL(handle.0);
         let ptr = GlobalLock(gh) as *const DropFiles;
         if ptr.is_null() {
-            CloseClipboard()?;
+            let _ = CloseClipboard();
             return Ok(None);
         }
         let offset = (*ptr).p_files as usize;
@@ -181,7 +228,7 @@ pub fn get_files() -> Result<Option<(Vec<PathBuf>, ClipMode)>> {
                 break;
             }
         }
-        GlobalUnlock(gh)?;
+        global_unlock(gh);
 
         let effect_format = RegisterClipboardFormatW(&HSTRING::from(CFSTR_PREFERREDDROPEFFECT));
         let mut mode = ClipMode::Copy;
@@ -193,10 +240,10 @@ pub fn get_files() -> Result<Option<(Vec<PathBuf>, ClipMode)>> {
                     1 => mode = ClipMode::Copy,
                     _ => {}
                 }
-                GlobalUnlock(HGLOBAL(h2.0))?;
+                global_unlock(HGLOBAL(h2.0));
             }
         }
-        CloseClipboard()?;
+        let _ = CloseClipboard();
         if files.is_empty() {
             Ok(None)
         } else {

@@ -3,7 +3,8 @@
 判定全用像素 + 磁盘事实，不靠肉眼：
 
   1) F2 -> 出现内联编辑框 -> 打新名 -> 回车 -> **磁盘上真的改名了**
-  2) 文件右键菜单第 5 行是「批量重命名」，悬停能展开出 5 个模式
+  2) 目录栏最右侧的「批量重命名 ▾」按钮点一下弹出 5 个模式的下拉
+     （第 15 轮从右键菜单搬出来了）
   3) 点「查找并替换」-> 弹出 `ZenFileRename`，不是空板，预览区有行
   4) 往两个输入框写字 -> 点「重命名」-> **三个文件一起改了名**
   5) 制造重名冲突 -> 「重命名」按钮不可用，点了磁盘不变（不能改一半）
@@ -14,8 +15,8 @@
   * 每次重新 launch 都会销毁上一次的菜单窗口，必须**现开现点**。
   * Ctrl+A 走的是 `GetKeyState(VK_CONTROL)`，光 PostMessage WM_KEYDOWN 不行，
     得先用 keybd_event 把 Ctrl 真的按下去。
-  * 文件菜单顺序（有选中项）：0打开 1打开方式 2剪切 3复制 4重命名 5批量重命名
-    6删除 7[分隔] 8粘贴 9新建 10[分隔] 11全选 12刷新 13查看 14排序方式 15属性。
+  * 文件菜单顺序（有选中项）：0打开 1打开方式 2剪切 3复制 4重命名 5删除 6[分隔]
+    7粘贴 8新建 9[分隔] 10全选 11刷新 12查看 13排序方式 14属性。
 
 素材只在 %TEMP%。
 """
@@ -321,29 +322,43 @@ there = os.path.exists(os.path.join(ONE, "bbb.txt"))
 print(f"  aaa.txt 还在? {not gone}   bbb.txt 出现? {there}")
 mark(gone and there, "回车后磁盘上真的改了名（aaa.txt -> bbb.txt）")
 
+def open_bulk_dropdown(path):
+    """进目录 -> Ctrl+A 全选 -> 点目录栏最右侧的「批量重命名 ▾」，返回下拉句柄。
+
+    全选不能省：批量重命名作用的是"当前选中集"，只留一个选中项的话
+    后面"三个文件一起改名"这条断言必然不成立。
+    """
+    hw = launch(path)
+    time.sleep(0.6)
+    raw, stride, w, h = grab(hw)
+    bs = [b for b in bands(raw, stride, 170, 600, 90, h - 40) if b[1] - b[0] >= 8]
+    if bs:
+        click(hw, 300, (bs[0][0] + bs[0][1]) // 2)
+    u.keybd_event(0x11, 0, 0, 0)  # Ctrl 要真的按下：代码读的是 GetKeyState
+    time.sleep(0.1)
+    u.PostMessageW(hw, WM_KEYDOWN, 0x41, 0)
+    time.sleep(0.2)
+    u.keybd_event(0x11, 0, 2, 0)
+    time.sleep(0.3)
+    click(hw, w - 6 - 66, 34 + 20)  # 按钮右沿 = w-6、宽 132；垂直落在目录栏中间
+    time.sleep(1.0)
+    subs = windows_of("ZenFileMenu")
+    return hw, (subs[0][0] if subs else None)
+
+
 # ---------------------------------------------------------------- 2. 下拉菜单
-print("\n[2] 右键菜单里的「批量重命名 ▸」下拉")
-hw, mh = fresh_menu(BULK)
-mark(mh is not None, "右键菜单弹出")
-if mh is None:
-    subprocess.run(["taskkill", "/F", "/IM", "ZenFile.exe"], capture_output=True)
-    raise SystemExit(1)
-mw, mhh, top0, row_h = menu_geom(mh)
-print(f"  菜单 {mw}x{mhh}，内容顶 {top0}，行高 {row_h}")
-y5 = int(top0 + 5 * row_h + row_h / 2)
-move(mh, mw // 2, y5)
-subs = windows_of("ZenFileMenu")
-print(f"  悬停第 5 行后菜单窗口 {len(subs)} 个")
-mark(len(subs) >= 2, "悬停「批量重命名」展开了下级菜单")
-child = None
-if len(subs) >= 2:
-    # 子菜单更矮，且是后创建的那个
-    child = min(subs, key=lambda m: m[4])[0]
+print("\n[2] 目录栏最右侧的「批量重命名 ▾」下拉")
+# 第 15 轮：这一项从右键菜单搬到了目录栏最右侧的按钮，点它直接弹下拉
+hw, child = open_bulk_dropdown(BULK)
+print(f"  点按钮后下拉窗口: {child}")
+mark(child is not None, "点目录栏的「批量重命名」弹出了下拉菜单")
+if child:
     cw, chh, ctop, crow = menu_geom(child)
-    print(f"  子菜单 {cw}x{chh}，内容顶 {ctop}，行高 {crow}")
-    crows = bands(*(grab(child)[0], grab(child)[1]), 4, cw - 4, 0, chh)
-    print(f"  子菜单行带 {len(crows)}: {crows}")
-    mark(len(crows) == 5, f"下级菜单有 5 种模式（量到 {len(crows)} 行）")
+    print(f"  下拉 {cw}x{chh}，内容顶 {ctop}，行高 {crow}")
+    craw, cstride, _, _ = grab(child)
+    crows = bands(craw, cstride, 4, cw - 4, 0, chh)
+    print(f"  下拉行带 {len(crows)}: {crows}")
+    mark(len(crows) == 5, f"下拉里有 5 种模式（量到 {len(crows)} 行）")
 
 # ---------------------------------------------------------------- 3. 弹窗
 print("\n[3] 点「查找并替换」弹出批量重命名窗口")
@@ -408,13 +423,8 @@ mark(got == ["new1.txt", "new2.txt", "new3.txt"], f"三个文件一起改了名�
 
 # ---------------------------------------------------------------- 5. 冲突
 print("\n[5] 制造重名冲突 -> 不允许执行")
-hw, mh = fresh_menu(CONF)
-mw, mhh, top0, row_h = menu_geom(mh)
-move(mh, mw // 2, int(top0 + 5 * row_h + row_h / 2))
-time.sleep(0.6)
-subs = windows_of("ZenFileMenu")
-child = min(subs, key=lambda m: m[4])[0] if len(subs) >= 2 else None
-mark(child is not None, "第二次也展开了下级菜单")
+hw, child = open_bulk_dropdown(CONF)
+mark(child is not None, "第二次也弹出了下拉")
 if child:
     cw, chh, ctop, crow = menu_geom(child)
     click(child, cw // 2, int(ctop + crow / 2))

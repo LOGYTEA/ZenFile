@@ -244,10 +244,18 @@ pub struct App {
     pub drag_origin: Option<(i32, i32)>,
     pub fast_mode: bool,
     pub transfer: Option<SharedStats>,
+    /// 后台文件操作的回执通道。worker 干完把错误串（成功则是空串）丢进来，
+    /// UI 线程在 `WM_APP_IO_DONE` 里统一收口。
+    pub io_tx: Sender<String>,
+    pub io_rx: Receiver<String>,
+    /// 正在后台跑的文件操作数。>0 时目录栏下沿的进度条要动起来。
+    pub io_pending: usize,
     pub exit_to_tray: bool,
     pub hovering_close: bool,
     /// 标题栏自有按钮的悬停位：bit0=侧栏开关，bit1=更多菜单
     pub hover_chrome: u8,
+    /// 鼠标是不是悬在目录栏最右侧的「批量重命名」按钮上
+    pub hover_bulk: bool,
     pub show_hidden: bool,
     /// 是否显示"受保护的操作系统文件"（带 FILE_ATTRIBUTE_SYSTEM 的项）。
     /// 与 show_hidden 相互独立 —— 资源管理器也是两道分开的开关。
@@ -573,6 +581,7 @@ fn user_folders() -> Vec<(&'static str, String)> {
 impl App {
     pub fn new(hwnd: HWND, cfg: Config) -> Self {
         let (engine_tx, engine_rx) = channel::<EngineMsg>();
+        let (io_tx, io_rx) = channel::<String>();
         let theme = if cfg.core.theme == "light" { theme::light() } else { theme::dark() };
         Self {
             hwnd,
@@ -600,9 +609,13 @@ impl App {
             drag_origin: None,
             fast_mode: false,
             transfer: None,
+            io_tx,
+            io_rx,
+            io_pending: 0,
             exit_to_tray: false,
             hovering_close: false,
             hover_chrome: 0,
+            hover_bulk: false,
             drives: HashMap::new(),
             drives_stamp: None,
             sidebar_expanded: HashSet::new(),
@@ -1589,7 +1602,7 @@ impl App {
         if items.is_empty() {
             return;
         }
-        if let Err(e) = clipboard::set_files(&items, mode) {
+        if let Err(e) = clipboard::set_files(&items, mode, self.hwnd.0 as isize) {
             report(self.hwnd, &format!("剪贴板写入失败：{e}"));
         }
     }
@@ -1602,28 +1615,83 @@ impl App {
                     report(self.hwnd, "源与目标相同，跳过");
                     return;
                 }
-                let owner = self.hwnd.0 as isize;
-                let result = if self.fast_mode || self.cfg.files.operations.fast_mode {
+                let label = if mode == ClipMode::Move { "粘贴（移动）" } else { "粘贴（复制）" };
+                if self.fast_mode || self.cfg.files.operations.fast_mode {
                     self.transfer = Some(transfer_async(
                         if mode == ClipMode::Move { TransferKind::Move } else { TransferKind::Copy },
                         &dest,
                         files,
                         self.cfg.files.operations.worker_threads,
                     ));
-                    Ok(())
-                } else if mode == ClipMode::Move {
-                    move_items(owner, &dest, &files)
-                } else {
-                    copy_items(owner, &dest, &files)
-                };
-                if let Err(e) = result {
-                    report(self.hwnd, &format!("粘贴失败：{e}"));
+                    return;
                 }
-                self.reload();
+                // 同 drop_items：真正的搬迁去后台线程，UI 线程不阻塞、不被重入
+                self.spawn_io(label, move || {
+                    if mode == ClipMode::Move {
+                        move_items(0, &dest, &files)
+                    } else {
+                        copy_items(0, &dest, &files)
+                    }
+                });
+                self.invalidate();
             }
             Ok(Some(_)) | Ok(None) => {}
             Err(e) => report(self.hwnd, &format!("剪贴板读取失败：{e}")),
         }
+    }
+
+    /// 后台文件操作完成：UI 线程在这里收口（报错 + 重列）。
+    ///
+    /// 由 `WM_APP_IO_DONE` 调用。空串 = 成功。
+    pub fn drain_io(&mut self) {
+        let mut err: Option<String> = None;
+        while let Ok(msg) = self.io_rx.try_recv() {
+            self.io_pending = self.io_pending.saturating_sub(1);
+            if !msg.is_empty() && err.is_none() {
+                err = Some(msg);
+            }
+        }
+        if let Some(e) = err {
+            report(self.hwnd, &e);
+        }
+    }
+
+    /// 把一次 Shell 文件操作丢到**独立线程**上去跑。
+    ///
+    /// `IFileOperation::PerformOperations` 是模态的：它会在 COM 自己的循环里泵
+    /// 消息，于是 WndProc 被重入 —— 而调用方（比如松手那条 `WM_LBUTTONUP`）此刻
+    /// 正握着 `&mut App`。两个 `&mut` 同时存在是未定义行为，落到界面上就是
+    /// "拖完一松手就僵住"。放到独立线程上，UI 线程既不阻塞也不会被重入；
+    /// 搬大文件时界面照样能刷能点。
+    ///
+    /// owner 一律传 0：Shell 的进度/确认框因此是无属主的顶级窗口，不会反过来
+    /// 把我们的窗口 disable 掉（那才是真的"卡死"）。
+    fn spawn_io<F>(&mut self, label: &str, job: F)
+    where
+        F: FnOnce() -> fm_core::Result<()> + Send + 'static,
+    {
+        let tx = self.io_tx.clone();
+        let hwnd_raw = self.hwnd.0 as usize;
+        let label = label.to_string();
+        self.io_pending += 1;
+        std::thread::spawn(move || {
+            // IFileOperation 的前置条件是 STA，而且 COM 要**每线程**各自初始化。
+            let _ = ComGuard::init();
+            let r = job();
+            let msg = match r {
+                Ok(()) => String::new(),
+                Err(e) => format!("{label}失败：{e}"),
+            };
+            let _ = tx.send(msg);
+            unsafe {
+                windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(windows::Win32::Foundation::HWND(hwnd_raw as *mut core::ffi::c_void)),
+                    crate::WM_APP_IO_DONE,
+                    windows::Win32::Foundation::WPARAM(0),
+                    windows::Win32::Foundation::LPARAM(0),
+                );
+            }
+        });
     }
 
     /// 拖拽落地：把 `items` 放进 `dest`。
@@ -1648,24 +1716,27 @@ impl App {
         }
         let cross = !same_volume(&items[0], &dest);
         let mode = if copy || cross { ClipMode::Copy } else { ClipMode::Move };
-        let owner = self.hwnd.0 as isize;
-        let result = if self.fast_mode || self.cfg.files.operations.fast_mode {
+        let label = if mode == ClipMode::Move { "移动" } else { "复制" };
+        if self.fast_mode || self.cfg.files.operations.fast_mode {
             self.transfer = Some(transfer_async(
                 if mode == ClipMode::Move { TransferKind::Move } else { TransferKind::Copy },
                 &dest,
                 items,
                 self.cfg.files.operations.worker_threads,
             ));
-            Ok(())
-        } else if mode == ClipMode::Move {
-            move_items(owner, &dest, &items)
-        } else {
-            copy_items(owner, &dest, &items)
-        };
-        if let Err(e) = result {
-            report(self.hwnd, &format!("{}失败：{e}", if mode == ClipMode::Move { "移动" } else { "复制" }));
+            return;
         }
-        self.reload();
+        // 关键：**不在松手这条消息里真的去搬文件**。搬迁交给后台线程，
+        // 完成后由 WM_APP_IO_DONE 触发 reload —— 这里的 reload 会等到那一步。
+        self.spawn_io(label, move || {
+            if mode == ClipMode::Move {
+                move_items(0, &dest, &items)
+            } else {
+                copy_items(0, &dest, &items)
+            }
+        });
+        // 立刻重画一次：让"正在移动"的进度条出现
+        self.invalidate();
     }
 
     /// 拖拽到另一个标签页不适用时的替代：粘贴到指定目录（供外部调用）。
@@ -2102,60 +2173,27 @@ impl App {
 
     /// 标题栏最右侧「更多」按钮（§3 布局：最小化左侧）。
     pub fn show_more_menu(&mut self, x: i32, y: i32) {
-        let view = self.tab().view_mode;
         let mut entries = Vec::new();
         entries.push(shell_row("新建标签页", Some("\u{E8A7}"), Command::NewTab));
         entries.push(shell_row("刷新", Some("\u{E72C}"), Command::Refresh));
         entries.push(menu::MenuEntry::sep());
 
-        let mut view_row = menu::MenuEntry {
-            text: "视图".to_string(),
-            glyph: Some("\u{E7B3}"),
-            bmp: None,
-            separator: false,
-            disabled: false,
-            has_submenu: true,
-            submenu: Vec::new(),
-            action: MenuAction::None,
-        };
-        for (label, cmd, mode) in [
-            ("大图标", Command::ViewIcons, ViewMode::LargeIcons),
-            ("列表", Command::ViewList, ViewMode::List),
-            ("详细信息", Command::ViewDetails, ViewMode::Details),
-        ] {
-            let mut r = shell_row(label, None, cmd);
-            r.text = if view == mode {
-                format!("● {label}")
-            } else {
-                format!("    {label}")
-            };
-            view_row.submenu.push(r);
-        }
-        view_row.submenu.push(menu::MenuEntry::sep());
-        view_row
-            .submenu
-            .push(check_row("隐藏的项目", Command::ToggleHidden, self.show_hidden));
-        view_row
-            .submenu
-            .push(check_row("受保护的系统文件", Command::ToggleSystem, self.show_system));
-        view_row.submenu.push(check_row(
+        let mut view_children = view_rows(self);
+        view_children.push(menu::MenuEntry::sep());
+        view_children.push(pick_row("隐藏的项目", Command::ToggleHidden, self.show_hidden));
+        view_children.push(pick_row(
+            "受保护的系统文件",
+            Command::ToggleSystem,
+            self.show_system,
+        ));
+        view_children.push(pick_row(
             "文件扩展名",
             Command::ToggleExtensions,
             self.cfg.files.view.show_extensions,
         ));
-        entries.push(view_row);
+        entries.push(submenu_row("视图", Some("\u{E7B3}"), view_children));
 
-        let mut sort_row = menu::MenuEntry {
-            text: "排序方式".to_string(),
-            glyph: Some("\u{E8CB}"),
-            bmp: None,
-            separator: false,
-            disabled: false,
-            has_submenu: true,
-            submenu: Vec::new(),
-            action: MenuAction::None,
-        };
-        sort_row.submenu = sort_rows(self);
+        let sort_row = submenu_row("排序方式", Some("\u{E8CB}"), sort_rows(self));
         entries.push(sort_row);
         entries.push(menu::MenuEntry::sep());
 
@@ -2250,7 +2288,7 @@ impl App {
     /// 现在是不是"有事在跑"：正在列目录、正在搜索、正在建索引。
     /// 目录栏下沿的进度条只看这一个开关。
     pub fn busy(&self) -> bool {
-        if self.tab().loading || self.index_pending {
+        if self.tab().loading || self.index_pending || self.io_pending > 0 {
             return true;
         }
         matches!(self.index_state, IndexState::Loading | IndexState::Building(_))
@@ -2609,23 +2647,35 @@ impl App {
 
 }
 
-fn shell_row(text: &str, glyph: Option<&'static str>, cmd: Command) -> menu::MenuEntry {
+pub fn shell_row(text: &str, glyph: Option<&'static str>, cmd: Command) -> menu::MenuEntry {
     menu::MenuEntry {
         text: text.to_string(),
         glyph,
         bmp: None,
         separator: false,
         disabled: false,
+        selected: false,
         has_submenu: false,
         submenu: Vec::new(),
         action: MenuAction::Own(cmd),
     }
 }
 
-/// 带勾选状态的条目：开 = "● 名称"，关 = 同样宽度的空白占位（保持文字对齐）。
-fn check_row(text: &str, cmd: Command, on: bool) -> menu::MenuEntry {
+/// 二级菜单里"当前生效的那一项"。
+///
+/// 之前用 `● 名称` 的圆点标记，两处别扭：圆点挤在文字前面让同级项对不齐，
+/// 而且它和"鼠标正悬停"的反馈完全是两套语言。改成 `selected`：渲染层会在行首
+/// 画一条**橙色竖线**，形状与悬停高亮一致、颜色区分开。
+fn pick_row(text: &str, cmd: Command, on: bool) -> menu::MenuEntry {
     let mut r = shell_row(text, None, cmd);
-    r.text = if on { format!("● {text}") } else { format!("    {text}") };
+    r.selected = on;
+    r
+}
+
+/// 禁用态条目：字淡一档，且点上去不会有任何反应（与资源管理器一致）。
+fn disabled_row(text: &str, glyph: Option<&'static str>, cmd: Command) -> menu::MenuEntry {
+    let mut r = shell_row(text, glyph, cmd);
+    r.disabled = true;
     r
 }
 
@@ -2637,14 +2687,38 @@ fn sort_rows(app: &App) -> Vec<menu::MenuEntry> {
     let key = app.tab().sort.key;
     let desc = app.tab().sort.descending;
     vec![
-        check_row("名称", Command::SortByName, key == fm_core::SortKey::Name),
-        check_row("修改日期", Command::SortByModified, key == fm_core::SortKey::Modified),
-        check_row("类型", Command::SortByType, key == fm_core::SortKey::Type),
-        check_row("大小", Command::SortBySize, key == fm_core::SortKey::Size),
+        pick_row("名称", Command::SortByName, key == fm_core::SortKey::Name),
+        pick_row("修改日期", Command::SortByModified, key == fm_core::SortKey::Modified),
+        pick_row("类型", Command::SortByType, key == fm_core::SortKey::Type),
+        pick_row("大小", Command::SortBySize, key == fm_core::SortKey::Size),
         menu::MenuEntry::sep(),
-        check_row("递增顺序", Command::SortAscending, !desc),
-        check_row("递减顺序", Command::SortDescending, desc),
+        pick_row("递增顺序", Command::SortAscending, !desc),
+        pick_row("递减顺序", Command::SortDescending, desc),
     ]
+}
+
+/// 视图三选一。当前视图用行首橙色竖线标出来（见 `pick_row`）。
+fn view_rows(app: &App) -> Vec<menu::MenuEntry> {
+    let mode = app.tab().view_mode;
+    vec![
+        pick_row("大图标", Command::ViewIcons, mode == fm_core::ViewMode::LargeIcons),
+        pick_row("列表", Command::ViewList, mode == fm_core::ViewMode::List),
+        pick_row("详细信息", Command::ViewDetails, mode == fm_core::ViewMode::Details),
+    ]
+}
+
+/// 剪贴板此刻能不能往当前目录里粘贴。
+///
+/// 两件事都要看：剪贴板里得有文件，而且当前页得是一个真目录
+/// （主页/回收站/设置都是虚拟视图，往里"粘贴"没有落点）。
+fn can_paste_into(app: &App) -> bool {
+    !is_virtual(&app.tab().path) && clipboard::has_files()
+}
+
+/// 当前视图里的条目能不能"复制出去"。虚拟视图（主页/回收站/设置）的条目是
+/// 合成的，没有真实路径可复制，此时「复制/剪切」必须是禁用态。
+fn copyable_here(app: &App) -> bool {
+    !is_virtual(&app.tab().path)
 }
 
 /// 带下级菜单的条目。资源管理器的右键菜单本来就是分层的（新建/查看/排序方式都有
@@ -2656,6 +2730,7 @@ fn submenu_row(text: &str, glyph: Option<&'static str>, children: Vec<menu::Menu
         bmp: None,
         separator: false,
         disabled: false,
+        selected: false,
         has_submenu: !children.is_empty(),
         submenu: children,
         action: MenuAction::None,
@@ -2671,24 +2746,27 @@ fn own_menu_rows(app: &App, items: &[PathBuf]) -> Vec<menu::MenuEntry> {
         if items.iter().any(|p| p.is_file()) {
             rows.push(shell_row("打开方式", Some("\u{E7AC}"), Command::OpenWith));
         }
-        rows.push(shell_row("剪切", Some("\u{E8C6}"), Command::Cut));
-        rows.push(shell_row("复制", Some("\u{E8C8}"), Command::Copy));
+        // 「复制」这类"要拿走点什么"的动作，在没有可复制内容时必须是**禁用态**：
+        // 资源管理器里它就是淡的、点不动。之前不管有没有选中都照常列出，
+        // 点下去静悄悄什么都不发生，看着像菜单坏了。
+        if copyable_here(app) {
+            rows.push(shell_row("剪切", Some("\u{E8C6}"), Command::Cut));
+            rows.push(shell_row("复制", Some("\u{E8C8}"), Command::Copy));
+        } else {
+            rows.push(disabled_row("剪切", Some("\u{E8C6}"), Command::Cut));
+            rows.push(disabled_row("复制", Some("\u{E8C8}"), Command::Copy));
+        }
         rows.push(shell_row("重命名", Some("\u{E8AC}"), Command::Rename));
-        // 「批量重命名」做成一个带下拉的项：资源管理器把高级选项收在箭头后面，
-        // 平铺出来会把右键菜单顶得很长。五种模式各对应 fm_core::bulk 里的一条规则。
-        rows.push(submenu_row(
-            "批量重命名",
-            Some("\u{E8AC}"),
-            crate::rename::MODE_LABELS
-                .iter()
-                .enumerate()
-                .map(|(i, label)| shell_row(label, None, Command::BulkRename(i)))
-                .collect(),
-        ));
+        // 「批量重命名」搬到了目录栏最右侧的按钮（带下拉），不再占右键菜单的位置
         rows.push(shell_row("删除", Some("\u{E74D}"), Command::Delete));
         rows.push(menu::MenuEntry::sep());
     }
-    rows.push(shell_row("粘贴", Some("\u{E77F}"), Command::Paste));
+    // 粘贴要有东西可粘才可用：剪贴板里没有 CF_HDROP 时同样是禁用态
+    if clipboard::has_files() {
+        rows.push(shell_row("粘贴", Some("\u{E77F}"), Command::Paste));
+    } else {
+        rows.push(disabled_row("粘贴", Some("\u{E77F}"), Command::Paste));
+    }
     rows.push(submenu_row(
         "新建",
         Some("\u{E8F4}"),
@@ -2700,21 +2778,18 @@ fn own_menu_rows(app: &App, items: &[PathBuf]) -> Vec<menu::MenuEntry> {
     rows.push(menu::MenuEntry::sep());
     rows.push(shell_row("全选", Some("\u{E762}"), Command::SelectAll));
     rows.push(shell_row("刷新", Some("\u{E72C}"), Command::Refresh));
-    rows.push(submenu_row(
-        "查看",
-        Some("\u{E7B3}"),
-        vec![
-            shell_row("大图标", None, Command::ViewIcons),
-            shell_row("列表", None, Command::ViewList),
-            shell_row("详细信息", None, Command::ViewDetails),
-            menu::MenuEntry::sep(),
-            // 三道开关分开列：隐藏项是用户自己设的，系统项是系统保护的，
-            // 扩展名是纯显示开关 —— 混成一个开关没法单独控制。
-            check_row("隐藏的项目", Command::ToggleHidden, app.show_hidden),
-            check_row("受保护的系统文件", Command::ToggleSystem, app.show_system),
-            check_row("文件扩展名", Command::ToggleExtensions, app.cfg.files.view.show_extensions),
-        ],
+    let mut view_children = view_rows(app);
+    view_children.push(menu::MenuEntry::sep());
+    // 三道开关分开列：隐藏项是用户自己设的，系统项是系统保护的，
+    // 扩展名是纯显示开关 —— 混成一个开关没法单独控制。
+    view_children.push(pick_row("隐藏的项目", Command::ToggleHidden, app.show_hidden));
+    view_children.push(pick_row("受保护的系统文件", Command::ToggleSystem, app.show_system));
+    view_children.push(pick_row(
+        "文件扩展名",
+        Command::ToggleExtensions,
+        app.cfg.files.view.show_extensions,
     ));
+    rows.push(submenu_row("查看", Some("\u{E7B3}"), view_children));
     rows.push(submenu_row("排序方式", Some("\u{E8CB}"), sort_rows(app)));
     rows.push(shell_row(
         if items.is_empty() { "属性（当前文件夹）" } else { "属性" },

@@ -130,8 +130,11 @@ def geom(hwnd):
     return {
         "w": r.right - r.left,
         "h": r.bottom - r.top,
+        # 右沿 = 窗口 - pad - 搜索框(170) - 「批量重命名」按钮(132) - 16。
+        # 第 15 轮目录栏最右侧多了那个按钮，地址栏跟着变窄，这里必须同步 ——
+        # 否则"点地址栏空白处"会点到按钮/搜索框上去。
         "addr": (pad + nav * 3 + 10, title_h + pad,
-                 (r.right - r.left) - pad - 170 - 8, title_h + toolbar_h - pad),
+                 (r.right - r.left) - pad - 170 - 132 - 16, title_h + toolbar_h - pad),
     }
 
 
@@ -239,8 +242,14 @@ if len(cs) >= 2:
     click(hw, (cs[1][0] + cs[1][1]) // 2, (A[1] + A[3]) // 2)
     after = addr_text(hw)
     print(f"  点 `…`：'{before}' -> '{after}'")
-    # 折叠掉的最深一层是 NexAddr（保留的是 Level1..Level4）
-    mark(after.lower().endswith("nexaddr"), f"点 `…` 跳到被折叠的那一层（{after}）")
+    # 地址栏越窄，被折叠掉的层级越多，`…` 指向的那一层就越靠近末尾 —— 所以这里
+    # 不能写死某一层，判据只能是"跳到了当前路径的某个**严格祖先**上"。
+    is_ancestor = (
+        before.lower().startswith(after.lower())
+        and after.lower() != before.lower()
+        and after.lower().rstrip("\\") != "c:"
+    )
+    mark(is_ancestor, f"点 `…` 跳到被折叠的那一层（{before} -> {after}）")
 raw, stride, w, h = grab(hw)
 # 不能拿"地址框右边 30px 内没有亮像素"当判据：那块地盘现在是**搜索框**，
 # 它自己的放大镜和占位文字本来就该亮在那儿（第十轮加的）。真正要守的是

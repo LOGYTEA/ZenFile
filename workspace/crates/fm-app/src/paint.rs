@@ -7,12 +7,12 @@ use windows::core::HSTRING;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
-    CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, FillRect, GetDC, GetTextExtentPoint32W,
-    IntersectClipRect, InvalidateRect, LineTo, MoveToEx, PS_SOLID, Rectangle, ReleaseDC, RestoreDC,
-    SaveDC, SelectObject, SetBkMode, SetTextColor, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
-    DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DRAW_TEXT_FORMAT, FONT_CHARSET,
-    FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FONT_QUALITY, GetStockObject, HDC, HFONT,
-    NULL_BRUSH, SRCCOPY, TRANSPARENT,
+    CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse, FillRect, GetDC,
+    GetTextExtentPoint32W, IntersectClipRect, InvalidateRect, LineTo, MoveToEx, PS_SOLID, Rectangle,
+    ReleaseDC, RestoreDC, RoundRect, SaveDC, SelectObject, SetBkMode, SetTextColor, DT_CENTER,
+    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DRAW_TEXT_FORMAT,
+    FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FONT_QUALITY, GetStockObject, HDC,
+    HFONT, NULL_BRUSH, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::UI::Controls::EM_SETSEL;
@@ -196,6 +196,11 @@ pub struct Layout {
     pub menu_btn: RECT,
     /// 标题栏最左侧的侧栏折叠开关
     pub sidebar_toggle: RECT,
+    /// 目录栏最右侧的「批量重命名 ▾」按钮。
+    ///
+    /// 画/命中共用这一份几何（同一条纪律）。点它弹出五种重命名模式的下拉，
+    /// 右键菜单里不再放这一项 —— 右键菜单要留给"对选中项做什么"的高频动作。
+    pub bulk_btn: RECT,
     pub tabs: RECT,
 }
 
@@ -214,6 +219,8 @@ pub fn compute_layout(w: i32, h: i32, m: &Metrics, sidebar: bool, status: bool) 
     let view_top = tb_top;
     let view_bottom = h - status_h;
     let search_w = (170.0 * m.scale).round() as i32;
+    // 「批量重命名 ▾」：目录栏最右侧。搜索框整体左移让位，地址栏再跟着收窄。
+    let bulk_w = (132.0 * m.scale).round() as i32;
 
     let btn_w = (44.0 * m.scale).round() as i32;
     let toggle_w = (40.0 * m.scale).round() as i32;
@@ -232,10 +239,16 @@ pub fn compute_layout(w: i32, h: i32, m: &Metrics, sidebar: bool, status: bool) 
         address: RECT {
             left: pad + nav * 3 + 10,
             top: top + pad,
-            right: w - pad - search_w - 8,
+            right: w - pad - search_w - bulk_w - 16,
             bottom: tb_top - pad,
         },
-        search: RECT { left: w - pad - search_w, top: top + pad, right: w - pad, bottom: tb_top - pad },
+        search: RECT {
+            left: w - pad - search_w - bulk_w - 8,
+            top: top + pad,
+            right: w - pad - bulk_w - 8,
+            bottom: tb_top - pad,
+        },
+        bulk_btn: RECT { left: w - pad - bulk_w, top: top + pad, right: w - pad, bottom: tb_top - pad },
         min_btn: RECT { left: w - btn_w * 3, top: 0, right: w - btn_w * 2, bottom: title_h },
         max_btn: RECT { left: w - btn_w * 2, top: 0, right: w - btn_w, bottom: title_h },
         close_btn: RECT { left: w - btn_w, top: 0, right: w, bottom: title_h },
@@ -537,17 +550,26 @@ fn paint_drag_overlay(app: &mut App, hdc: HDC, l: &Layout) {
                 right: cur.0 + (14.0 * s) as i32 + w,
                 bottom: cur.1 + (14.0 * s) as i32 + h,
             };
-            let bg = CreateSolidBrush(t.surface);
+            // 与自绘菜单的悬停项、列表选中行同一套语言：hover 底色 + 行首
+            // 强调竖线 + accent 描边。之前是 surface 底 + 一圈线，三种"高亮"
+            // 三种配色，看着像三个软件拼起来的。
+            let bg = CreateSolidBrush(t.hover_bg);
             FillRect(hdc, &r, bg);
             let _ = DeleteObject(bg.into());
+            let bw = (3.0 * s).round().max(2.0) as i32;
+            let bar = CreateSolidBrush(t.accent);
+            FillRect(hdc, &RECT { left: r.left, top: r.top, right: r.left + bw, bottom: r.bottom }, bar);
+            let _ = DeleteObject(bar.into());
             MoveToEx(hdc, r.left, r.top, None);
             LineTo(hdc, r.right - 1, r.top);
             LineTo(hdc, r.right - 1, r.bottom - 1);
             LineTo(hdc, r.left, r.bottom - 1);
             LineTo(hdc, r.left, r.top);
             SetBkMode(hdc, TRANSPARENT);
+            // 文字起点让开那条竖线，否则"移"字会压在竖线上
+            let tr = RECT { left: r.left + bw, top: r.top, right: r.right, bottom: r.bottom };
             SetTextColor(hdc, t.text);
-            draw_text(hdc, &text, r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            draw_text(hdc, &text, tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
             SelectObject(hdc, old_font);
         }
 
@@ -1237,6 +1259,11 @@ fn paint_toolbar(app: &mut App, hdc: HDC, l: &Layout) {
             let _ = DeleteObject(pf.into());
         }
 
+        // 「批量重命名 ▾」：只在真目录里出现（主页/回收站/设置没有可重命名的条目）
+        if bulk_rename_available(app) {
+            paint_bulk_button(app, hdc, l);
+        }
+
         // 工具栏下分隔线，否则与列表区糊成一片
         let lb = CreateSolidBrush(t.border);
         FillRect(hdc, &RECT { left: 0, top: l.toolbar.bottom - 1, right: l.toolbar.right, bottom: l.toolbar.bottom }, lb);
@@ -1244,6 +1271,53 @@ fn paint_toolbar(app: &mut App, hdc: HDC, l: &Layout) {
 
         // 加载/搜索进度条画在这一条线上（见 paint_busy_strip）
         paint_busy_strip(app, hdc, l);
+    }
+}
+
+/// 目录栏最右侧这个按钮要不要画。虚拟视图（主页/回收站/设置）没有可批量重命名
+/// 的条目，画出来点了也没反应 —— 不如不画。
+///
+/// 绘制与命中都走这一个判断，免得"看得见点不到"。
+pub fn bulk_rename_available(app: &App) -> bool {
+    !crate::app::is_virtual(&app.tab().path)
+}
+
+/// 「批量重命名 ▾」按钮。点一下弹出五种模式的下拉菜单。
+fn paint_bulk_button(app: &App, hdc: HDC, l: &Layout) {
+    let t = app.theme;
+    let s = app.metrics.scale;
+    let hovered = app.hover_bulk;
+    unsafe {
+        let r = &l.bulk_btn;
+        let bg = CreateSolidBrush(if hovered { t.hover_bg } else { t.surface });
+        FillRect(hdc, r, bg);
+        let _ = DeleteObject(bg.into());
+        let pf = CreateSolidBrush(if hovered { t.accent } else { t.border });
+        let edges = [
+            RECT { left: r.left, top: r.top, right: r.right, bottom: r.top + 1 },
+            RECT { left: r.left, top: r.bottom - 1, right: r.right, bottom: r.bottom },
+            RECT { left: r.left, top: r.top, right: r.left + 1, bottom: r.bottom },
+            RECT { left: r.right - 1, top: r.top, right: r.right, bottom: r.bottom },
+        ];
+        for e in &edges {
+            FillRect(hdc, e, pf);
+        }
+        let _ = DeleteObject(pf.into());
+
+        let font = ui_font(s);
+        let old = SelectObject(hdc, font.into());
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, t.text);
+        let tr = RECT { left: r.left + (8.0 * s) as i32, top: r.top, right: r.right - (18.0 * s) as i32, bottom: r.bottom };
+        draw_text(hdc, "批量重命名", tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        // 下拉箭头：和自绘菜单里子菜单那个 ">" 用同一套字形字体
+        let g = glyph_font(s);
+        let og = SelectObject(hdc, g.into());
+        SetTextColor(hdc, t.text_dim);
+        let ar = RECT { left: r.right - (18.0 * s) as i32, top: r.top, right: r.right - (4.0 * s) as i32, bottom: r.bottom };
+        draw_text(hdc, "\u{E70D}", ar, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(hdc, og);
+        SelectObject(hdc, old);
     }
 }
 
@@ -1818,6 +1892,15 @@ fn paint_home(app: &mut App, hdc: HDC, l: &Layout) {
                 let b = CreateSolidBrush(if sel { t.selection_bg } else { t.hover_bg });
                 FillRect(hdc, &tile.rect, b);
                 let _ = DeleteObject(b.into());
+                // 与列表行 / 菜单悬停项同一套语言：选中态在左沿压一条强调竖线
+                let bw = (3.0 * scale).round().max(2.0) as i32;
+                let bar = CreateSolidBrush(t.accent);
+                FillRect(
+                    hdc,
+                    &RECT { left: tile.rect.left, top: tile.rect.top, right: tile.rect.left + bw, bottom: tile.rect.bottom },
+                    bar,
+                );
+                let _ = DeleteObject(bar.into());
             }
             SetTextColor(hdc, if sel { t.selection_text } else { t.text });
             app.icons.draw(hdc, icons[n], tile.icon_x, tile.icon_y, tile.icon_size);
@@ -2129,6 +2212,14 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
                 let fill = CreateSolidBrush(if selected { t.selection_bg } else { t.hover_bg });
                 FillRect(hdc, &r, fill);
                 let _ = DeleteObject(fill.into());
+                // 行首一条竖线：和自绘右键菜单的悬停项**同一套语言**
+                // （那里是"底色 + 3px 竖线"）。只有一层底色时，暗色主题下
+                // "选中了哪几行"要逐个比对亮度才看得出来；加了竖线，扫一眼
+                // 左边缘就知道。
+                let bw = (3.0 * app.metrics.scale).round().max(2.0) as i32;
+                let bar = CreateSolidBrush(t.accent);
+                FillRect(hdc, &RECT { left: r.left, top: r.top, right: r.left + bw, bottom: r.bottom }, bar);
+                let _ = DeleteObject(bar.into());
             }
             SetTextColor(hdc, if selected { t.selection_text } else { t.text });
 
@@ -2291,6 +2382,38 @@ pub struct SettingRow {
     pub value: String,
     pub action: u32,
     pub on: bool,
+    /// `Some(开/关)` = 这一项是开关，画成真正的 Toggle 控件；
+    /// `None` = 多选项（主题/单位/默认视图），画成带当前值的下拉按钮。
+    ///
+    /// 之前一律用"开"/"关"两个**文字**表示状态，一行行读下来全是字，
+    /// 哪个是开关哪个是当前值要逐行分辨；开关就该长成开关。
+    pub toggle: Option<bool>,
+}
+
+/// 开关控件的矩形。绘制与命中共用（同一条纪律）。
+pub fn setting_switch_rect(row: &SettingRow, s: f32) -> RECT {
+    let w = (38.0 * s).round() as i32;
+    let h = (18.0 * s).round() as i32;
+    let cy = (row.rect.top + row.rect.bottom) / 2;
+    RECT {
+        left: row.rect.right - w,
+        top: cy - h / 2,
+        right: row.rect.right,
+        bottom: cy - h / 2 + h,
+    }
+}
+
+/// 多选项那个"当前值 ▾"按钮的矩形。
+pub fn setting_value_rect(row: &SettingRow, s: f32) -> RECT {
+    let w = (120.0 * s).round() as i32;
+    let h = (22.0 * s).round() as i32;
+    let cy = (row.rect.top + row.rect.bottom) / 2;
+    RECT {
+        left: row.rect.right - w,
+        top: cy - h / 2,
+        right: row.rect.right,
+        bottom: cy - h / 2 + h,
+    }
 }
 
 pub fn settings_rows(app: &App, l: &Layout) -> Vec<SettingRow> {
@@ -2302,50 +2425,70 @@ pub fn settings_rows(app: &App, l: &Layout) -> Vec<SettingRow> {
     let unit = app.cfg.files.view.size_unit_of();
     let dark = app.cfg.core.theme != "light";
 
-    let groups: Vec<(&str, Vec<(String, String, u32, bool)>)> = vec![
+    let groups: Vec<(&str, Vec<(String, String, u32, Option<bool>)>)> = vec![
         (
             "文件与文件夹",
             vec![
-                ("显示隐藏的项目".to_string(), on_off(app.show_hidden), SET_HIDDEN, app.show_hidden),
-                ("显示受保护的系统文件".to_string(), on_off(app.show_system), SET_SYSTEM, app.show_system),
+                (
+                    "显示隐藏的项目".to_string(),
+                    String::new(),
+                    SET_HIDDEN,
+                    Some(app.show_hidden),
+                ),
+                (
+                    "显示受保护的系统文件".to_string(),
+                    String::new(),
+                    SET_SYSTEM,
+                    Some(app.show_system),
+                ),
                 (
                     "显示文件扩展名".to_string(),
-                    on_off(app.cfg.files.view.show_extensions),
+                    String::new(),
                     SET_EXT,
-                    app.cfg.files.view.show_extensions,
+                    Some(app.cfg.files.view.show_extensions),
                 ),
-                (
-                    "大小单位".to_string(),
-                    unit.label().to_string(),
-                    SET_UNIT,
-                    unit != fm_core::SizeUnit::Auto,
-                ),
+                ("大小单位".to_string(), unit.label().to_string(), SET_UNIT, None),
                 (
                     "新标签默认视图".to_string(),
                     crate::app::default_view_label(&app.cfg.files.view.default_mode).to_string(),
                     SET_VIEW,
-                    true,
+                    None,
                 ),
             ],
         ),
         (
             "外观",
             vec![
-                ("主题".to_string(), if dark { "暗色".to_string() } else { "亮色".to_string() }, SET_THEME, dark),
-                ("显示导航窗格".to_string(), on_off(app.cfg.ui.sidebar_visible), SET_SIDEBAR, app.cfg.ui.sidebar_visible),
+                (
+                    "主题".to_string(),
+                    if dark { "暗色".to_string() } else { "亮色".to_string() },
+                    SET_THEME,
+                    None,
+                ),
+                (
+                    "显示导航窗格".to_string(),
+                    String::new(),
+                    SET_SIDEBAR,
+                    Some(app.cfg.ui.sidebar_visible),
+                ),
                 (
                     "导航窗格跟随当前文件夹展开".to_string(),
-                    on_off(app.cfg.ui.sidebar_follow_current),
+                    String::new(),
                     SET_FOLLOW,
-                    app.cfg.ui.sidebar_follow_current,
+                    Some(app.cfg.ui.sidebar_follow_current),
                 ),
                 (
                     "「此电脑」默认展开到盘符".to_string(),
-                    on_off(app.cfg.ui.sidebar_thispc_expanded),
+                    String::new(),
                     SET_THISPC,
-                    app.cfg.ui.sidebar_thispc_expanded,
+                    Some(app.cfg.ui.sidebar_thispc_expanded),
                 ),
-                ("显示状态栏".to_string(), on_off(app.cfg.ui.statusbar_visible), SET_STATUS, app.cfg.ui.statusbar_visible),
+                (
+                    "显示状态栏".to_string(),
+                    String::new(),
+                    SET_STATUS,
+                    Some(app.cfg.ui.statusbar_visible),
+                ),
             ],
         ),
     ];
@@ -2359,6 +2502,7 @@ pub fn settings_rows(app: &App, l: &Layout) -> Vec<SettingRow> {
         value: String::new(),
         action: 0,
         on: false,
+        toggle: None,
     });
     top += title_h + (8.0 * s).round() as i32;
     for (group, rows) in groups {
@@ -2368,15 +2512,17 @@ pub fn settings_rows(app: &App, l: &Layout) -> Vec<SettingRow> {
             value: String::new(),
             action: 0,
             on: false,
+            toggle: None,
         });
         top += head_h;
-        for (label, value, action, on) in rows {
+        for (label, value, action, toggle) in rows {
             out.push(SettingRow {
                 rect: RECT { left, top, right, bottom: top + row_h },
                 label,
                 value,
                 action,
-                on,
+                on: toggle.unwrap_or(false),
+                toggle,
             });
             top += row_h;
         }
@@ -2389,12 +2535,9 @@ pub fn settings_rows(app: &App, l: &Layout) -> Vec<SettingRow> {
         value: String::new(),
         action: 0,
         on: false,
+        toggle: None,
     });
     out
-}
-
-fn on_off(v: bool) -> String {
-    if v { "开".to_string() } else { "关".to_string() }
 }
 
 /// 设置页命中测试：返回被点中的动作编号。
@@ -2403,6 +2546,64 @@ pub fn settings_hit(app: &App, l: &Layout, x: i32, y: i32) -> Option<u32> {
         .iter()
         .find(|r| r.action != 0 && x >= r.rect.left && x < r.rect.right && y >= r.rect.top && y < r.rect.bottom)
         .map(|r| r.action)
+}
+
+/// Windows 11 风格的开关：胶囊轨道 + 圆滑块。开 = 强调色轨道、滑块靠右。
+fn draw_toggle(hdc: HDC, row: &SettingRow, app: &App, on: bool) {
+    let t = app.theme;
+    let s = app.metrics.scale;
+    let r = setting_switch_rect(row, s);
+    let d = r.bottom - r.top;
+    unsafe {
+        // 轨道：RoundRect 用当前刷子填充 + 当前画笔描边
+        let track = CreateSolidBrush(if on { t.accent } else { t.border });
+        let old = SelectObject(hdc, track.into());
+        let _ = RoundRect(hdc, r.left, r.top, r.right, r.bottom, d / 2, d / 2);
+        SelectObject(hdc, old);
+        let _ = DeleteObject(track.into());
+        // 滑块：直径比轨道高度小 4px，左右各留 2px
+        let kd = d - (4.0 * s).round() as i32;
+        let pad = (2.0 * s).round() as i32;
+        let kleft = if on { r.right - pad - kd } else { r.left + pad };
+        let knob = CreateSolidBrush(if on { t.selection_text } else { t.surface });
+        SelectObject(hdc, knob.into());
+        let _ = Ellipse(hdc, kleft, r.top + pad, kleft + kd, r.top + pad + kd);
+        let _ = DeleteObject(knob.into());
+        SelectObject(hdc, old);
+    }
+}
+
+/// 多选项（主题 / 大小单位 / 默认视图）：画成一个"当前值 ▾"按钮，
+/// 一眼看得出这一行是可以点开换值的。
+fn draw_value_button(hdc: HDC, row: &SettingRow, app: &App) {
+    let t = app.theme;
+    let s = app.metrics.scale;
+    let r = setting_value_rect(row, s);
+    unsafe {
+        let bg = CreateSolidBrush(t.surface);
+        let old = SelectObject(hdc, bg.into());
+        let pen = CreatePen(PS_SOLID, 1, t.border);
+        let old_pen = SelectObject(hdc, pen.into());
+        let _ = RoundRect(hdc, r.left, r.top, r.right, r.bottom, (4.0 * s) as i32, (4.0 * s) as i32);
+        SelectObject(hdc, old_pen);
+        let _ = DeleteObject(pen.into());
+        SelectObject(hdc, old);
+        let _ = DeleteObject(bg.into());
+
+        let font = ui_font(s);
+        let of = SelectObject(hdc, font.into());
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, t.text);
+        let tr = RECT { left: r.left + (8.0 * s) as i32, top: r.top, right: r.right - (16.0 * s) as i32, bottom: r.bottom };
+        draw_text(hdc, &row.value, tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        let g = glyph_font(s);
+        let og = SelectObject(hdc, g.into());
+        SetTextColor(hdc, t.text_dim);
+        let ar = RECT { left: r.right - (16.0 * s) as i32, top: r.top, right: r.right - (2.0 * s) as i32, bottom: r.bottom };
+        draw_text(hdc, "\u{E70D}", ar, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(hdc, og);
+        SelectObject(hdc, of);
+    }
 }
 
 fn paint_settings(app: &mut App, hdc: HDC, l: &Layout) {
@@ -2438,12 +2639,15 @@ fn paint_settings(app: &mut App, hdc: HDC, l: &Layout) {
                 hover_rect = Some(row.rect);
             }
             SetTextColor(hdc, t.text);
-            let label_rect = RECT { left: row.rect.left, top: row.rect.top, right: row.rect.right - (140.0 * s) as i32, bottom: row.rect.bottom };
+            let label_rect = RECT { left: row.rect.left, top: row.rect.top, right: row.rect.right - (150.0 * s) as i32, bottom: row.rect.bottom };
             draw_text(hdc, &row.label, label_rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-            // 开关状态用强调色画出来，一眼能看出是开还是关
-            SetTextColor(hdc, if row.on { t.accent } else { t.text_dim });
-            let value_rect = RECT { left: row.rect.right - (140.0 * s) as i32, top: row.rect.top, right: row.rect.right, bottom: row.rect.bottom };
-            draw_text(hdc, &row.value, value_rect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            // 开关画成开关：轨道 + 滑块，开=强调色、关=描边灰。
+            // 之前这里是两个汉字"开"/"关"，一页设置读下来全是文字，
+            // 分不清哪行是开关、哪行是"当前值"。
+            match row.toggle {
+                Some(on) => draw_toggle(hdc, row, app, on),
+                None => draw_value_button(hdc, row, app),
+            }
             // 行分隔线
             let lb = CreateSolidBrush(t.border);
             FillRect(hdc, &RECT { left: row.rect.left, top: row.rect.bottom - 1, right: row.rect.right, bottom: row.rect.bottom }, lb);

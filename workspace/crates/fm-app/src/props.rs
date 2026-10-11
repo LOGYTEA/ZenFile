@@ -47,11 +47,11 @@ use windows::Win32::UI::Shell::{
     ExtractIconW, SHGetFileInfoW, SHFILEINFOW, SHGFI_TYPENAME,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DrawIconEx, GetWindowLongPtrW, PostMessageW,
-    RegisterClassExW, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    GWLP_USERDATA, HICON, SET_WINDOW_POS_FLAGS, SWP_NOZORDER, SW_SHOW, DI_NORMAL, WM_CLOSE,
-    WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT,
-    WNDCLASSEXW, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DrawIconEx, GetWindowLongPtrW, LoadIconW,
+    PostMessageW, RegisterClassExW, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    GWLP_USERDATA, HICON, IDI_APPLICATION, SET_WINDOW_POS_FLAGS, SWP_NOZORDER, SW_SHOW, DI_NORMAL,
+    WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST,
+    WM_PAINT, WNDCLASSEXW, WS_EX_APPWINDOW, WS_POPUP,
 };
 
 use crate::app::App;
@@ -284,10 +284,15 @@ impl Props {
 
 pub fn register_props_class() {
     let cls = HSTRING::from("ZenFileProps");
+    // 任务栏按钮上的图标取自窗口类（不是窗口本身），类里不带图标的话
+    // 任务栏上就是一个空白方块。
+    let icon = unsafe { LoadIconW(None, IDI_APPLICATION).unwrap_or_default() };
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
         lpfnWndProc: Some(props_proc),
         lpszClassName: PCWSTR(cls.as_ptr()),
+        hIcon: icon,
+        hIconSm: icon,
         ..Default::default()
     };
     unsafe {
@@ -390,7 +395,11 @@ pub fn open(app_ptr: *mut App, path: PathBuf) {
     let cls = HSTRING::from("ZenFileProps");
     let hwnd = unsafe {
         CreateWindowExW(
-            windows::Win32::UI::WindowsAndMessaging::WS_EX_WINDOWEDGE,
+            // WS_EX_APPWINDOW 是"属性窗口要有自己的任务栏按钮"的关键：
+            // 这个窗口是有属主的 WS_POPUP，按 Windows 的默认规则**不会**进任务栏，
+            // 于是用户点了属性之后只能在 Alt+Tab 里看不见、任务栏里也没有，
+            // 切走就再也切不回来。加上这个扩展样式才会强制给它一个任务栏按钮。
+            WS_EX_APPWINDOW | windows::Win32::UI::WindowsAndMessaging::WS_EX_WINDOWEDGE,
             PCWSTR(cls.as_ptr()),
             PCWSTR(HSTRING::from("属性").as_ptr()),
             WS_POPUP,

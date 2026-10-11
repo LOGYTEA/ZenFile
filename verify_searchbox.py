@@ -127,8 +127,10 @@ hw = launch(BASE)
 r = wt.RECT()
 u.GetWindowRect(hw, ctypes.byref(r))
 W = r.right - r.left
-# 与 paint.rs compute_layout 一致：search_w=170, pad=6, title_h=34, toolbar_h=40
-SX0, SX1 = W - 6 - 170, W - 6
+# 与 paint.rs compute_layout 一致：search_w=170, bulk_w=132, pad=6,
+# title_h=34, toolbar_h=40。第 15 轮目录栏最右侧多了「批量重命名」按钮（132px），
+# 搜索框整体左移，这里必须跟着改 —— 否则量的是按钮那一块，墨迹当然是 0。
+SX0, SX1 = W - 6 - 170 - 132 - 8, W - 6 - 132 - 8
 SY0, SY1 = 34 + 6, 34 + 40 - 6
 TB_BOTTOM = 34 + 40
 ed_search = u.GetDlgItem(hw, 102)
