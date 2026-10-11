@@ -367,6 +367,17 @@ pub struct Geom {
     pub preview: RECT,
     /// 「外观」：圆角滑杆
     pub slider: RECT,
+    /// 「右键菜单」：左侧那块**真实渲染**的菜单面板
+    pub menu_panel: RECT,
+    /// 菜单面板里每一条（分隔线不占）的矩形与条目下标
+    pub menu_rows: Vec<RECT>,
+    pub menu_idx: Vec<usize>,
+    /// 「右键菜单」：右上「打开方式」面板
+    pub ow_panel: RECT,
+    /// 打开方式里每一条候选程序
+    pub ow_rows: Vec<RECT>,
+    /// 「右键菜单」：右下系统集成开关
+    pub sys_panel: RECT,
 }
 
 /// 命中结果。
@@ -383,6 +394,10 @@ pub enum Hit {
     Tree(usize),
     /// 「外观」圆角滑杆（按下处的横坐标）
     RadiusSlider(i32),
+    /// 「右键菜单」实时菜单里第 n 条（下标见 `Geom::menu_idx`）
+    MenuRow(usize),
+    /// 「右键菜单」打开方式列表里第 n 个程序
+    OpenWith(usize),
 }
 
 /// 排布编辑器里正在被拖的那一张。
@@ -454,10 +469,61 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
         tree_ids: Vec::new(),
         preview: RECT::default(),
         slider: RECT::default(),
+        menu_panel: RECT::default(),
+        menu_rows: Vec::new(),
+        menu_idx: Vec::new(),
+        ow_panel: RECT::default(),
+        ow_rows: Vec::new(),
+        sys_panel: RECT::default(),
     };
 
     match app.settings_tab {
-        crate::app::SETTINGS_TAB_UI | crate::app::SETTINGS_TAB_MENU => {
+        crate::app::SETTINGS_TAB_MENU => {
+            // 左边是**按当前排布真实渲染**的右键菜单，右边上半是「打开方式」
+            // 的真实候选程序，右边下半是写回 Windows 的系统右键菜单开关。
+            let mw = px(300.0).min((content.right - content.left) * 42 / 100);
+            g.menu_panel = RECT {
+                left: content.left,
+                top: content.top,
+                right: content.left + mw,
+                bottom: content.bottom,
+            };
+            let rh = px(30.0);
+            let mut top = g.menu_panel.top + px(4.0);
+            for (i, e) in menu_preview_entries(app).iter().enumerate() {
+                if e.separator {
+                    top += px(6.0);
+                    continue;
+                }
+                if top + rh > g.menu_panel.bottom - px(4.0) {
+                    break;
+                }
+                g.menu_rows.push(RECT {
+                    left: g.menu_panel.left,
+                    top,
+                    right: g.menu_panel.right,
+                    bottom: top + rh,
+                });
+                g.menu_idx.push(i);
+                top += rh;
+            }
+            let rx = g.menu_panel.right + px(14.0);
+            let rh2 = (content.bottom - content.top) * 62 / 100;
+            g.ow_panel = RECT { left: rx, top: content.top, right: content.right, bottom: content.top + rh2 };
+            g.sys_panel = RECT { left: rx, top: content.top + rh2 + px(10.0), right: content.right, bottom: content.bottom };
+            let n = app.openwith_preview.as_ref().map(|v| v.len()).unwrap_or(0);
+            let orh = px(38.0);
+            let mut oy = g.ow_panel.top + px(26.0);
+            for _ in 0..n {
+                if oy + orh > g.ow_panel.bottom {
+                    break;
+                }
+                g.ow_rows.push(RECT { left: g.ow_panel.left, top: oy, right: g.ow_panel.right, bottom: oy + orh });
+                oy += orh + px(4.0);
+            }
+            g.rows = system_rows(app, &g.sys_panel);
+        }
+        crate::app::SETTINGS_TAB_UI => {
             let dock_h = px(84.0);
             g.dock = RECT {
                 left: content.left,
@@ -468,7 +534,7 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
             let list_bottom = g.dock.top - px(12.0);
             let card_h = px(38.0);
             let gap = px(6.0);
-            let ids: Vec<u32> = if app.settings_tab == crate::app::SETTINGS_TAB_UI {
+            let ids: Vec<u32> = if true {
                 app.ui_settings.ui_order.iter().map(|i| *i as u32).collect()
             } else {
                 app.ui_settings.menu_order.iter().map(|i| *i as u32).collect()
@@ -483,7 +549,7 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
                 y += card_h + gap;
             }
             // 「更多」里的被隐藏项：横向流式排布，排满换行（超出的裁掉）
-            let hidden: Vec<u32> = if app.settings_tab == crate::app::SETTINGS_TAB_UI {
+            let hidden: Vec<u32> = if true {
                 app.ui_settings.ui_hidden.iter().map(|i| *i as u32).collect()
             } else {
                 app.ui_settings.menu_hidden.iter().map(|i| *i as u32).collect()
@@ -569,6 +635,16 @@ pub fn hit(app: &App, l: &Layout, x: i32, y: i32) -> Option<Hit> {
     for (i, r) in g.chips.iter().enumerate() {
         if inside(r, x, y) {
             return Some(Hit::Chip(i));
+        }
+    }
+    for (i, r) in g.menu_rows.iter().enumerate() {
+        if inside(r, x, y) {
+            return Some(Hit::MenuRow(i));
+        }
+    }
+    for (i, r) in g.ow_rows.iter().enumerate() {
+        if inside(r, x, y) {
+            return Some(Hit::OpenWith(i));
         }
     }
     for (i, r) in g.tree_rows.iter().enumerate() {
@@ -763,9 +839,10 @@ pub fn paint(app: &mut App, hdc: HDC, l: &Layout) {
     }
 
     match app.settings_tab {
-        crate::app::SETTINGS_TAB_UI | crate::app::SETTINGS_TAB_MENU => {
+        crate::app::SETTINGS_TAB_UI => {
             paint_editor(app, hdc, &g, th, s);
         }
+        crate::app::SETTINGS_TAB_MENU => paint_menu_tab(app, hdc, &g, th, s),
         crate::app::SETTINGS_TAB_ADVANCED
         | crate::app::SETTINGS_TAB_PLUGIN
         | crate::app::SETTINGS_TAB_HOTKEY => {
@@ -1261,6 +1338,269 @@ fn draw_slider(app: &App, hdc: HDC, r: &RECT, th: Theme, s: f32) {
     rr(hdc, &kn, (d / 2) as u32, th.text, None);
 }
 
+
+// ================================================================ 右键菜单页
+
+/// 预览用的菜单条目：**走真实构建函数**，不是照着菜单再摆一份假条目。
+/// 于是设置页里排的顺序/显隐，当场就能看出来。
+fn menu_preview_entries(app: &App) -> Vec<crate::menu::MenuEntry> {
+    // 样本在切进这一页时算好存起来了（`App::menu_preview_items`）——
+    // 设置页自己是虚拟标签，照它渲染只能得到"空白处右键"的 6 行短菜单，
+    // 而这里要展示的是"对文件右键"那一整套。
+    let items: Vec<std::path::PathBuf> = app.menu_preview_items.clone().unwrap_or_default();
+    crate::app::own_menu_rows(app, &items)
+}
+
+/// 当前**可见**的菜单条目 id，顺序即渲染顺序。
+///
+/// 渲染出来的第 n 条（分隔线不算）就对应这里的第 n 个 —— 于是"在实时菜单里
+/// 把第 3 条拖到第 1 条"可以直接换算成排布表里的位置交换。
+pub fn visible_menu_ids(app: &App) -> Vec<u16> {
+    app.ui_settings
+        .menu_order
+        .iter()
+        .copied()
+        .filter(|i| !app.ui_settings.menu_hidden.contains(i))
+        .collect()
+}
+
+/// 「打开方式」那一块下面真正的候选程序（程序名 + 图标句柄）。
+fn ow_list(app: &App) -> Vec<(String, isize)> {
+    app.openwith_preview.clone().unwrap_or_default()
+}
+
+/// 系统集成的两行开关。
+fn system_rows(app: &App, r: &RECT) -> Vec<paint::SettingRow> {
+    let s = app.metrics.scale;
+    let rh = (34.0 * s).round() as i32;
+    let mut out = Vec::new();
+    let mut y = r.top;
+    for (i, label) in ["文件右键菜单里加入「用 ZenFile 打开」", "文件夹右键菜单里加入「用 ZenFile 打开」"]
+        .iter()
+        .enumerate()
+    {
+        out.push(row(
+            RECT { left: r.left, top: y, right: r.right, bottom: y + rh },
+            label,
+            String::new(),
+            3000 + i as u32,
+            Some(system_menu_enabled(i)),
+        ));
+        y += rh + (4.0 * s).round() as i32;
+    }
+    // 说明：写的是 HKCU，不需要管理员，也随时能在这页关掉
+    out.push(row(
+        RECT { left: r.left, top: y, right: r.right, bottom: y + rh },
+        "写在 HKEY_CURRENT_USER（不用管理员；关掉开关即撤销）",
+        String::new(),
+        0,
+        None,
+    ));
+    out
+}
+
+fn paint_menu_tab(app: &App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
+    // —— 左：真实渲染的右键菜单 ——
+    let entries = menu_preview_entries(app);
+    let row_h = (30.0 * s).round() as i32;
+    let w = g.menu_panel.right - g.menu_panel.left;
+    let h = g.menu_panel.bottom - g.menu_panel.top;
+    if w > 0 && h > 0 {
+        unsafe {
+            // 菜单渲染器内部会 IntersectClipRect —— 记忆 DC 是全窗口共享的，
+            // 必须 SaveDC/RestoreDC 包住，否则后面画「打开方式」那块会被裁掉。
+            let _saved = windows::Win32::Graphics::Gdi::SaveDC(hdc);
+            crate::menu::paint_menu_into(
+                hdc,
+                &entries,
+                w,
+                h,
+                row_h,
+                s,
+                &th,
+                app.settings_hover_menu,
+                g.menu_panel.left,
+                g.menu_panel.top,
+            );
+            // 面板边框：和真菜单一样有一圈边，不然看不出"这是一块弹出的菜单"
+            let p = windows::Win32::Graphics::Gdi::CreatePen(
+                windows::Win32::Graphics::Gdi::PS_SOLID,
+                1,
+                th.border,
+            );
+            let op = SelectObject(hdc, p.into());
+            let _ = windows::Win32::Graphics::Gdi::Rectangle(
+                hdc,
+                g.menu_panel.left,
+                g.menu_panel.top,
+                g.menu_panel.right,
+                g.menu_panel.bottom,
+            );
+            SelectObject(hdc, op);
+            let _ = DeleteObject(p.into());
+            let _ = windows::Win32::Graphics::Gdi::RestoreDC(hdc, -1);
+        }
+    }
+
+    // —— 右上：「打开方式」的真实程序列表 ——
+    fill_rect(hdc, &g.ow_panel, th.surface);
+    let hdr = RECT {
+        left: g.ow_panel.left + (10.0 * s).round() as i32,
+        top: g.ow_panel.top + (4.0 * s).round() as i32,
+        right: g.ow_panel.right,
+        bottom: g.ow_panel.top + (26.0 * s).round() as i32,
+    };
+    set_color(hdc, th.text);
+    paint::draw_text(
+        hdc,
+        "打开方式（当前目录里那个文件的真实候选）",
+        hdr,
+        DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS,
+    );
+    let list = ow_list(app);
+    let isz = (24.0 * s).round() as i32;
+    for (i, r) in g.ow_rows.iter().enumerate() {
+        let Some((name, icon)) = list.get(i) else { break };
+        let hover = app.settings_hover_menu.is_none() && false;
+        let _ = hover;
+        fill_rect(hdc, r, th.surface_alt);
+        let ix = r.left + (8.0 * s).round() as i32;
+        let iy = (r.top + r.bottom - isz) / 2;
+        if *icon != 0 {
+            app.icons.draw(hdc, windows::Win32::UI::WindowsAndMessaging::HICON(*icon as *mut _), ix, iy, isz);
+        }
+        let mut tr = *r;
+        tr.left = ix + isz + (8.0 * s).round() as i32;
+        tr.right -= (8.0 * s).round() as i32;
+        set_color(hdc, th.text);
+        paint::draw_text(
+            hdc,
+            name,
+            tr,
+            DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS,
+        );
+    }
+
+    // —— 右下：系统集成 ——
+    for r in &g.rows {
+        paint_row(app, hdc, r, th, s);
+    }
+}
+
+// ================================================================ 系统右键菜单
+
+/// 两类目标：0 = 文件（`*`），1 = 文件夹（`Directory`）。
+fn sys_menu_path(kind: usize) -> &'static str {
+    if kind == 0 {
+        r"Software\Classes\*\shell\ZenFile"
+    } else {
+        r"Software\Classes\Directory\shell\ZenFile"
+    }
+}
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+pub fn system_menu_enabled(kind: usize) -> bool {
+    use windows::Win32::System::Registry::{RegCloseKey, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, KEY_READ};
+    unsafe {
+        let p = wide(sys_menu_path(kind));
+        let mut hk = HKEY::default();
+        let ok = RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            windows::core::PCWSTR(p.as_ptr()),
+            Some(0),
+            KEY_READ,
+            &mut hk,
+        )
+        .is_ok();
+        if ok {
+            let _ = RegCloseKey(hk);
+        }
+        ok
+    }
+}
+
+fn reg_set_sz(hk: windows::Win32::System::Registry::HKEY, name: Option<&str>, val: &str) {
+    use windows::Win32::System::Registry::{RegSetValueExW, REG_SZ};
+    let n = name.map(wide);
+    let mut v: Vec<u16> = wide(val);
+    let bytes =
+        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2) };
+    let _ = unsafe {
+        RegSetValueExW(
+            hk,
+            n.as_ref()
+                .map(|x| windows::core::PCWSTR(x.as_ptr()))
+                .unwrap_or(windows::core::PCWSTR::null()),
+            Some(0),
+            REG_SZ,
+            Some(bytes),
+        )
+    };
+    let _ = v.len();
+}
+
+/// 在 Windows 资源管理器的右键菜单里加入 / 移除「用 ZenFile 打开」。
+///
+/// 只写 `HKCU\Software\Classes`：① 不需要管理员；② 不影响系统级条目；
+/// ③ 这页的开关一关就整棵删掉，随时可撤。
+pub fn set_system_menu(kind: usize, on: bool) {
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, HKEY, HKEY_CURRENT_USER, KEY_WRITE,
+        REG_OPTION_NON_VOLATILE,
+    };
+    let p = wide(sys_menu_path(kind));
+    unsafe {
+        if !on {
+            let _ = RegDeleteTreeW(HKEY_CURRENT_USER, windows::core::PCWSTR(p.as_ptr()));
+            return;
+        }
+        let mut hk = HKEY::default();
+        if RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            windows::core::PCWSTR(p.as_ptr()),
+            Some(0),
+            None,
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            None,
+            &mut hk,
+            None,
+        )
+        .is_err()
+        {
+            return;
+        }
+        let exe = std::env::current_exe()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        reg_set_sz(hk, None, "用 ZenFile 打开(&Z)");
+        reg_set_sz(hk, Some("Icon"), &format!("\"{exe}\""));
+        let mut ck = HKEY::default();
+        let sub = wide("command");
+        if RegCreateKeyExW(
+            hk,
+            windows::core::PCWSTR(sub.as_ptr()),
+            Some(0),
+            None,
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            None,
+            &mut ck,
+            None,
+        )
+        .is_ok()
+        {
+            reg_set_sz(ck, None, &format!("\"{exe}\" \"%1\""));
+            let _ = RegCloseKey(ck);
+        }
+        let _ = RegCloseKey(hk);
+    }
+}
+
+
 // ---------------------------------------------------------------- 小工具
 
 fn fill_rect(hdc: HDC, r: &RECT, color: COLORREF) {
@@ -1320,6 +1660,14 @@ pub fn begin_drag(app: &mut App, l: &Layout, hit: &Hit, x: i32, y: i32) -> bool 
             (Some(id), Some(r)) => (*id, *r, true),
             _ => return false,
         },
+        // 「右键菜单」页里那块**真实渲染的菜单**：直接拖条目改顺序
+        Hit::MenuRow(i) => {
+            let id = visible_menu_ids(app).get(*i).copied().unwrap_or(0) as u32;
+            match g.menu_rows.get(*i) {
+                Some(r) => (id, *r, false),
+                None => return false,
+            }
+        }
         _ => return false,
     };
     app.settings_drag = Some(SettingsDrag {
@@ -1353,6 +1701,18 @@ pub fn finish_drag(app: &mut App, l: &Layout, x: i32, y: i32) {
     }
     if in_dock {
         hide(app, d.tab, d.id);
+        return;
+    }
+    // 「右键菜单」页：落点按**渲染出来的菜单行**算（那里没有 cards）
+    if d.tab == crate::app::SETTINGS_TAB_MENU {
+        let mut target = g.menu_rows.len();
+        for (i, r) in g.menu_rows.iter().enumerate() {
+            if y < (r.top + r.bottom) / 2 {
+                target = i;
+                break;
+            }
+        }
+        reorder(app, d.tab, d.id, target);
         return;
     }
     let mut target = g.cards.len();

@@ -617,6 +617,19 @@ pub struct App {
     pub settings_radius_drag: bool,
     /// 「快捷键」：正在等一个新按键组合的动作名（`None` = 没在录）。
     pub hotkey_capture: Option<String>,
+    /// 设置页「右键菜单」右上那块「打开方式」的真实候选程序（程序名 + 图标）。
+    ///
+    /// 只在切到那一页时算一次：`openwith::candidates()` 要去注册表和 Shell
+    /// 问一圈，每帧重算会把设置页拖慢。
+    pub openwith_preview: Option<Vec<(String, isize)>>,
+    /// 「右键菜单」页里喂给实时菜单渲染的"样本文件"。
+    ///
+    /// 设置页自己是个虚拟标签（`entries` 是空的），照它渲染出来的会是"空白处
+    /// 右键"那种 6 行的短菜单；而用户真正想调的是"对着文件右键"那一整套。
+    /// 所以切进那一页时挑一个**真实存在的文件**存下来，菜单就按它长。
+    pub menu_preview_items: Option<Vec<PathBuf>>,
+    /// 「右键菜单」页里鼠标悬停在第几条菜单项上（下标对应 `own_menu_rows` 的输出）。
+    pub settings_hover_menu: Option<usize>,
     /// 排布编辑器里正在拖的卡片。
     pub settings_drag: Option<crate::settings::SettingsDrag>,
     /// 「界面 / 右键菜单」的排布（顺序 + 被收进「更多」的那些）。
@@ -1014,6 +1027,9 @@ impl App {
             settings_hover_tree: None,
             settings_radius_drag: false,
             hotkey_capture: None,
+            openwith_preview: None,
+            menu_preview_items: None,
+            settings_hover_menu: None,
             fast_mode: false,
             xfer: None,
             io_tx,
@@ -1304,6 +1320,63 @@ impl App {
             }
         }
         out.join(" 丨 ")
+    }
+
+    /// 算一次「打开方式」的真实候选程序（供设置页那一块显示）。
+    ///
+    /// 取当前目录里第一个**文件**的扩展名去问；一个文件都没有就退回 `.txt` ——
+    /// 空目录里也要能看到"打开方式长什么样"，不然那一块永远是空的。
+    /// 切进「右键菜单」页时算一次：① 实时菜单要用的样本文件；② 「打开方式」
+    /// 的候选程序（按该样本的真实扩展名去问 Shell）。
+    ///
+    /// 两样都只算一次存起来 —— `openwith::candidates()` 要翻注册表和 Shell，
+    /// 每帧重算会把设置页拖得很慢。
+    pub fn ensure_openwith_preview(&mut self) {
+        if self.openwith_preview.is_some() && self.menu_preview_items.is_some() {
+            return;
+        }
+        let sample = self.menu_preview_sample();
+        let ext = sample
+            .first()
+            .and_then(|p| p.extension().map(|x| x.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "txt".to_string());
+        let list = crate::openwith::candidates(&ext)
+            .into_iter()
+            .map(|c| (c.name, c.icon.0 as isize))
+            .collect::<Vec<_>>();
+        self.openwith_preview = Some(list);
+        self.menu_preview_items = Some(sample);
+    }
+
+    /// 给设置页的实时菜单挑一个"右键它"的样本。
+    ///
+    /// 优先级：① 当前标签真的选中的东西；② 当前目录里第一个文件；
+    /// ③ 设置页是虚拟标签，就退回**上一个真实标签**的目录里第一个文件；
+    /// ④ 都没有才用自己这个 exe（一定存在，于是「打开方式」那行也在）。
+    fn menu_preview_sample(&self) -> Vec<PathBuf> {
+        if !self.tab().selected.is_empty() {
+            return self.tab().selected_paths();
+        }
+        if let Some(e) = self.tab().entries.iter().find(|e| !e.is_dir()) {
+            return vec![e.path.clone()];
+        }
+        let dir = self
+            .panes
+            .iter()
+            .flat_map(|p| p.tabs.iter())
+            .find(|t| !t.settings && !t.recycle && !t.home)
+            .map(|t| t.path.clone());
+        if let Some(d) = dir {
+            if let Ok(rd) = std::fs::read_dir(&d) {
+                for ent in rd.flatten() {
+                    let p = ent.path();
+                    if p.is_file() {
+                        return vec![p];
+                    }
+                }
+            }
+        }
+        std::env::current_exe().map(|p| vec![p]).unwrap_or_default()
     }
 
     /// 某个圆角项当前的值（DIP）。没在配置里出现过就用树上的默认值 ——
@@ -4011,7 +4084,7 @@ pub fn submenu_row(text: &str, glyph: Option<&'static str>, children: Vec<menu::
 /// 第 19 轮：条目的**顺序与显隐由设置页「右键菜单」标签决定**（拖出来的排布存在
 /// `ui_settings.json`）。所以这里先按 id 收进一张表，最后再按排布吐出去 ——
 /// 而不是像以前那样写死一串 push。id 与 `settings::MENU_ITEM_NAMES` 一一对应。
-fn own_menu_rows(app: &App, items: &[PathBuf]) -> Vec<menu::MenuEntry> {
+pub fn own_menu_rows(app: &App, items: &[PathBuf]) -> Vec<menu::MenuEntry> {
     let mut tagged: Vec<(u16, menu::MenuEntry)> = Vec::new();
     let mut push = |id: u16, e: menu::MenuEntry| tagged.push((id, e));
 
