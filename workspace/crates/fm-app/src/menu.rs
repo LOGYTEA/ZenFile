@@ -16,11 +16,13 @@ use windows::core::{HSTRING, PCWSTR};
 use windows::core::Interface as _;
 use windows::Win32::Foundation::{LPARAM, LRESULT, RECT, WPARAM, HWND};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
+    BeginPaint, CreateCompatibleBitmap, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint,
+    FillRect, GetMonitorInfoW, GetPixel,
     IntersectClipRect, MonitorFromWindow, SelectObject, SetBkMode, SetTextColor, SetWindowOrgEx,
-    DT_CALCRECT, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, TRANSPARENT,
+    DT_CALCRECT, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
 };
+use windows::Win32::Graphics::Gdi::{BitBlt, CreateCompatibleDC, DeleteDC};
 use windows::Win32::Foundation::POINT;
 use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use windows::Win32::Graphics::Gdi::InvalidateRect;
@@ -89,6 +91,8 @@ pub enum Command {
     SortAscending,
     /// 只把方向设成降序，不动当前排序列
     SortDescending,
+    /// 表头右键：按语义列号排序并给定方向（0=名称 1=修改日期 2=类型 3=大小）
+    HeaderSort(u8, bool),
     ToggleSidebar,
     ToggleStatusbar,
     /// 导航窗格"跟随展开到当前文件夹"
@@ -103,6 +107,16 @@ pub enum Command {
     ToggleExtensions,
     /// 循环切换"大小"列的默认单位
     CycleSizeUnit,
+    /// 设置页下拉：直接选中第 n 档大小单位（不再循环）
+    SetSizeUnitIdx(usize),
+    /// 设置页下拉：true = 暗色
+    SetThemeDark(bool),
+    /// 设置页下拉：直接选中第 n 个默认视图（DEFAULT_VIEW_CYCLE 的下标）
+    SetDefaultViewIdx(usize),
+    /// 表头筛选：按列号 + 桶序号过滤。桶 0 = 全部（等价于清除筛选）
+    ColFilter(usize, usize),
+    /// 表头筛选：按具体类型名过滤（"类型"列）
+    ColFilterKind(String),
     /// 循环切换明暗主题
     CycleTheme,
     /// 循环切换新标签的默认视图模式
@@ -131,8 +145,13 @@ pub fn strip_accel(text: &str) -> String {
     while let Some(c) = chars.next() {
         if c == '&' {
             match chars.next() {
+                // `&&` 是转义后的一个真 `&`（文件名里真的有 & 的情况）
                 Some('&') => out.push('&'),
-                Some(_) => {}
+                // 只吃掉 `&` 本身，助记字符**要留着**：Windows 把 "打开(&O)"
+                // 渲染成 "打开(O)"（O 带下划线），不是 "打开()"。早先这里连 O
+                // 一起吞了，于是菜单里每一项都拖着一对空括号 —— "打开()"、
+                // "剪切()"、"复制到()"，就是"括号里是空的"那条反馈。
+                Some(other) => out.push(other),
                 None => {}
             }
         } else {
@@ -140,6 +159,28 @@ pub fn strip_accel(text: &str) -> String {
         }
     }
     out
+}
+
+/// 菜单文本的**比较键**：剥掉助记键标记，再剥掉它带来的一对括号。
+///
+/// Shell 的字符串是 "打开(&O)"，我们自己的条目是 "打开"。只剥 `&` 的话前者是
+/// "打开(O)"、后者是 "打开"，两者照样不相等 —— Shell 那个「打开」就会混进来，
+/// 菜单上一屏出现两个「打开」（用户报过的重复项）。去重必须比这个键。
+pub fn menu_key(text: &str) -> String {
+    let s = strip_accel(text);
+    let t = s.trim_end();
+    for (open, close) in [('(', ')'), ('（', '）')] {
+        if !t.ends_with(close) {
+            continue;
+        }
+        if let Some(i) = t.rfind(open) {
+            let inner = &t[i + open.len_utf8()..t.len() - close.len_utf8()];
+            if inner.chars().count() == 1 {
+                return t[..i].trim_end().to_lowercase();
+            }
+        }
+    }
+    t.to_lowercase()
 }
 
 #[derive(Clone, Debug)]
@@ -476,6 +517,13 @@ struct MenuWindow {
     open_pos: Option<(i32, i32)>,
     /// 本窗口里已经有条目被真正执行（用于决定销毁时是否级联关闭父菜单）。
     activated: bool,
+    /// 弹出本窗口的那一次点击是**左键按下**（按钮/下拉那种）。
+    ///
+    /// 这类菜单是在 `WM_LBUTTONDOWN` 里弹的，随后那一下 `WM_LBUTTONUP` 会被
+    /// 本窗口的 capture 接住；照常处理就等于"刚弹出就被点了一下" —— 菜单立刻
+    /// 关掉，于是必须**按住不放**才能看见它（"批量重命名按钮要按住才展开"）。
+    /// 这里把那一次抬起吞掉（只吞一次，之后的抬起照常算点击）。
+    swallow_up: bool,
 }
 
 pub fn register_menu_class() {
@@ -505,6 +553,8 @@ pub fn open_menu(
     scale: f32,
     theme: Theme,
     parent_menu: Option<HWND>,
+    // 本菜单是否由一次**左键按下**弹出（按钮/下拉）。见 `MenuWindow::swallow_up`。
+    from_left_down: bool,
 ) -> Option<HWND> {
     let cls = HSTRING::from("ZenFileMenu");
     if entries.is_empty() {
@@ -560,6 +610,7 @@ pub fn open_menu(
         opened_by: None,
         open_pos: None,
         activated: false,
+        swallow_up: from_left_down,
     }));
 
     let hwnd = unsafe {
@@ -709,7 +760,28 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut ps);
-            paint_menu(hdc, state);
+            // 双缓冲：整块先画进内存 DC，最后一次 BitBlt 贴上去。
+            // 直接对着窗口 DC 逐行画时，鼠标在条目之间快速移动能看到画到一半的
+            // 那一帧 —— 尤其是带 Shell 位图的那些行（每行的位图都要做一次透明
+            // 混合）。合成完再贴，中间帧就不会被用户看见。
+            let mem = CreateCompatibleDC(Some(hdc));
+            let bmp = CreateCompatibleBitmap(hdc, state.width.max(1), state.view_h.max(1));
+            if !mem.is_invalid() && !bmp.is_invalid() {
+                let old = SelectObject(mem, bmp.into());
+                paint_menu(mem, state);
+                let _ = BitBlt(hdc, 0, 0, state.width, state.view_h, Some(mem), 0, 0, SRCCOPY);
+                SelectObject(mem, old);
+                let _ = DeleteObject(bmp.into());
+                let _ = DeleteDC(mem);
+            } else {
+                paint_menu(hdc, state);
+                if !mem.is_invalid() {
+                    let _ = DeleteDC(mem);
+                }
+                if !bmp.is_invalid() {
+                    let _ = DeleteObject(bmp.into());
+                }
+            }
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
@@ -838,6 +910,18 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         WM_LBUTTONUP => {
             let y = (lparam.0 >> 16) as i16 as i32;
             let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            // 弹出本窗口的那一次"按下"的抬起：只吞掉这一次。
+            // 不吞的话菜单刚弹出就被自己关掉 —— 用户必须一直按住才看得见它。
+            if state.swallow_up {
+                state.swallow_up = false;
+                // 顺便按真实光标位置把高亮算出来（补发的那条 MOUSEMOVE 可能已被丢弃）
+                let idx = if inside_popup(state, x, y) { entry_at(state, y) } else { None };
+                if idx != state.hover {
+                    state.hover = idx;
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                return LRESULT(0);
+            }
             // 关键：因为有 SetCapture，屏幕任意位置的点击都会投递到这里。
             // 落在弹出菜单之外时只能关闭菜单，绝不能触发任何条目 ——
             // 之前缺这个判断，导致每条选项的点击热区在水平方向上等同于整块屏幕。
@@ -964,6 +1048,7 @@ fn open_submenu_at(state: &mut MenuWindow, hwnd: HWND, index: usize) {
         state.scale,
         state.theme,
         Some(hwnd),
+        false,
     );
     match sub {
         Some(s) => {
@@ -1025,18 +1110,31 @@ fn activate(state: &mut MenuWindow, hwnd: HWND, entry: &MenuEntry) {
 ///
 /// 直接 BitBlt 会把位图的背景一起贴出来 —— 条目图标边上出现一个方块。
 /// 菜单位图的惯例是左下角像素即背景色，以此作为透明色走 TransparentBlt。
+///
+/// 透明色按位图句柄缓存：句柄在整条菜单的生命周期里不变，而 `GetPixel` 是 GDI
+/// 里最慢的调用之一 —— 每重画一次（鼠标每移动一行就是一次）都为每个 Shell 条目
+/// 问一遍，二十来项叠起来正好是"在条目间快速移动时闪那么几毫秒"。
+static BMP_KEY: std::sync::Mutex<Vec<(isize, u32)>> = std::sync::Mutex::new(Vec::new());
+
 unsafe fn draw_bmp(hdc: HDC, hbmp: isize, x: i32, y: i32, size: i32) {
-    use windows::Win32::Graphics::Gdi::{
-        BitBlt, CreateCompatibleDC, DeleteDC, GetPixel, SelectObject, TransparentBlt, HBITMAP,
-        SRCCOPY,
-    };
+    use windows::Win32::Graphics::Gdi::{SelectObject, TransparentBlt, HBITMAP};
     let mem = CreateCompatibleDC(Some(hdc));
     if mem.is_invalid() {
         return;
     }
     let old = SelectObject(mem, HBITMAP(hbmp as *mut core::ffi::c_void).into());
-    let key = GetPixel(mem, 0, size.saturating_sub(1));
-    let ok = TransparentBlt(hdc, x, y, size, size, mem, 0, 0, size, size, key.0).as_bool();
+    let key = match BMP_KEY.lock() {
+        Ok(mut g) => match g.iter().find(|(h, _)| *h == hbmp).map(|(_, k)| *k) {
+            Some(k) => k,
+            None => {
+                let k = GetPixel(mem, 0, size.saturating_sub(1)).0;
+                g.push((hbmp, k));
+                k
+            }
+        },
+        Err(_) => GetPixel(mem, 0, size.saturating_sub(1)).0,
+    };
+    let ok = TransparentBlt(hdc, x, y, size, size, mem, 0, 0, size, size, key).as_bool();
     if !ok {
         let _ = BitBlt(hdc, x, y, size, size, Some(mem), 0, 0, SRCCOPY);
     }

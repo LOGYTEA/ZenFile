@@ -557,50 +557,17 @@ fn paint_drag_overlay(app: &mut App, hdc: HDC, l: &Layout) {
             SelectObject(hdc, ob);
         }
 
-        // 3) 拖拽影像：跟着光标的一张小卡片（图标 + 名字），半透明。
+        // 3) 拖拽影像：**一张**卡片，把"拎着什么"和"要放到哪"都写在同一张上。
         //
-        // 没有它的时候，按住文件拖只看见一个写着"移动 3 项到 xx"的文字条，
-        // 完全不像"把东西拎起来了" —— 用户问"拖动效果呢"就是这个。
+        // 之前卡片和"移动 3 项到 下载"的提示牌各画各的、都挂在光标右下 12~14px，
+        // 于是两块矩形叠在一起（"两个叠一起了"）。合并成一张后，卡片上半是图标
+        // + 名字，下半只有真的悬到投放目标上时才多出一行"移动到 X"。
         if kind == crate::app::DragKind::Items && !items.is_empty() {
-            draw_drag_image(app, hdc, cur, &items, copy);
-        }
-        // 4) 跟着光标的提示牌："移动 3 项到 下载"
-        if kind == crate::app::DragKind::Items {
-            let text = match &target_name {
-                Some(nm) => format!("{} {} 项到 {}", if copy { "复制" } else { "移动" }, items_n, nm),
-                None => format!("{} {} 项", if copy { "复制" } else { "移动" }, items_n),
+            let hint = match &target_name {
+                Some(nm) => Some(format!("{}到 {}", if copy { "复制" } else { "移动" }, nm)),
+                None => None,
             };
-            let font = ui_font(s);
-            let old_font = SelectObject(hdc, font.into());
-            let w = text_width(hdc, font, &text) + (16.0 * s) as i32;
-            let h = (24.0 * s) as i32;
-            let r = RECT {
-                left: cur.0 + (14.0 * s) as i32,
-                top: cur.1 + (14.0 * s) as i32,
-                right: cur.0 + (14.0 * s) as i32 + w,
-                bottom: cur.1 + (14.0 * s) as i32 + h,
-            };
-            // 与自绘菜单的悬停项、列表选中行同一套语言：hover 底色 + 行首
-            // 强调竖线 + accent 描边。之前是 surface 底 + 一圈线，三种"高亮"
-            // 三种配色，看着像三个软件拼起来的。
-            let bg = CreateSolidBrush(t.hover_bg);
-            FillRect(hdc, &r, bg);
-            let _ = DeleteObject(bg.into());
-            let bw = (3.0 * s).round().max(2.0) as i32;
-            let bar = CreateSolidBrush(t.accent);
-            FillRect(hdc, &RECT { left: r.left, top: r.top, right: r.left + bw, bottom: r.bottom }, bar);
-            let _ = DeleteObject(bar.into());
-            MoveToEx(hdc, r.left, r.top, None);
-            LineTo(hdc, r.right - 1, r.top);
-            LineTo(hdc, r.right - 1, r.bottom - 1);
-            LineTo(hdc, r.left, r.bottom - 1);
-            LineTo(hdc, r.left, r.top);
-            SetBkMode(hdc, TRANSPARENT);
-            // 文字起点让开那条竖线，否则"移"字会压在竖线上
-            let tr = RECT { left: r.left + bw, top: r.top, right: r.right, bottom: r.bottom };
-            SetTextColor(hdc, t.text);
-            draw_text(hdc, &text, tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-            SelectObject(hdc, old_font);
+            draw_drag_image(app, hdc, cur, &items, copy, hint.as_deref(), items_n);
         }
 
         SelectObject(hdc, old_brush);
@@ -659,7 +626,15 @@ fn alpha_fill_rect(hdc: HDC, r: &RECT, color: COLORREF, alpha: u8) {
 ///
 /// 位置在光标右下 12px 处（资源管理器同款），整体按 80% 不透明度压上去 ——
 /// 拖拽影像必须能透出底下内容，否则松手前看不见自己待会儿要落在哪。
-fn draw_drag_image(app: &mut App, hdc: HDC, cur: (i32, i32), items: &[std::path::PathBuf], copy: bool) {
+fn draw_drag_image(
+    app: &mut App,
+    hdc: HDC,
+    cur: (i32, i32),
+    items: &[std::path::PathBuf],
+    copy: bool,
+    hint: Option<&str>,
+    items_n: usize,
+) {
     let s = app.metrics.scale;
     let icon_s = (32.0 * s).round() as i32;
     let pad = (8.0 * s).round() as i32;
@@ -671,16 +646,29 @@ fn draw_drag_image(app: &mut App, hdc: HDC, cur: (i32, i32), items: &[std::path:
         format!("{} 项", items.len())
     };
     let font = ui_font(s);
+    let sub_font = ui_font(s);
+    // 第二行（"移动到 X"）只有真的悬到投放目标上时才出现，卡片因此会长一截
+    let line_h = (16.0 * s).round() as i32;
+    let hint_h = if hint.is_some() { line_h } else { 0 };
     let tw = unsafe {
         let old = SelectObject(hdc, font.into());
         let w = text_width(hdc, font, &name);
         SelectObject(hdc, old);
         w
     };
+    let hint_w = match hint {
+        Some(t) => unsafe {
+            let old = SelectObject(hdc, sub_font.into());
+            let w = text_width(hdc, sub_font, t);
+            SelectObject(hdc, old);
+            w
+        },
+        None => 0,
+    };
     // 多项时把第二枚图标错开一点，做出"一叠"的感觉
     let stack = if items.len() > 1 { (6.0 * s).round() as i32 } else { 0 };
-    let w = pad * 2 + icon_s + stack + gap + tw;
-    let h = pad * 2 + icon_s.max((16.0 * s).round() as i32);
+    let w = (pad * 2 + icon_s + stack + gap + tw).max(pad * 2 + hint_w) + (4.0 * s) as i32;
+    let h = pad * 2 + icon_s.max((16.0 * s).round() as i32) + hint_h;
     let x = cur.0 + (12.0 * s).round() as i32;
     let y = cur.1 + (12.0 * s).round() as i32;
     // 卡片先画进离屏图（底色/accent 边/图标/文字），整张再半透明压上去
@@ -724,13 +712,31 @@ fn draw_drag_image(app: &mut App, hdc: HDC, cur: (i32, i32), items: &[std::path:
         let of = SelectObject(mem, font.into());
         SetBkMode(mem, TRANSPARENT);
         SetTextColor(mem, app.theme.text);
+        // 上半行：图标那一段的高度里放名字（和图标竖着居中）
+        let top_h = h - hint_h;
         let mut n: Vec<u16> = name.encode_utf16().collect();
         DrawTextW(
             mem,
             &mut n,
-            &mut RECT { left: pad + icon_s + stack + gap, top: 0, right: w - pad, bottom: h },
+            &mut RECT { left: pad + icon_s + stack + gap, top: 0, right: w - pad, bottom: top_h },
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
         );
+        // 下半行：真悬到投放目标上才出现的"移动到 X"
+        if let Some(t) = hint {
+            SetTextColor(mem, app.theme.text_dim);
+            let label = if items_n > 1 {
+                format!("{t} · {items_n} 项")
+            } else {
+                t.to_string()
+            };
+            let mut nn: Vec<u16> = label.encode_utf16().collect();
+            DrawTextW(
+                mem,
+                &mut nn,
+                &mut RECT { left: pad, top: top_h, right: w - pad, bottom: h },
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+            );
+        }
         SelectObject(mem, of);
         // 复制时左上角挂一个小 "+"：这是资源管理器区分移动/复制的唯一视觉信号
         if copy {
@@ -1286,6 +1292,16 @@ fn paint_toolbar(app: &mut App, hdc: HDC, l: &Layout) {
         let g = glyph_font(app.metrics.scale);
         let old_g = SelectObject(hdc, g.into());
         SetBkMode(hdc, TRANSPARENT);
+        // 三个导航按钮：悬停要给一层底色，否则它们看着是三个图标而不是三个按钮。
+        // 配色沿用列表行的那一套（悬停 row_hover、不可用则不亮）。
+        for (i, r) in [(1u8, l.back), (2, l.forward), (3, l.up)] {
+            if app.hover_nav != i {
+                continue;
+            }
+            let hb = CreateSolidBrush(t.row_hover);
+            FillRect(hdc, &r, hb);
+            let _ = DeleteObject(hb.into());
+        }
         SetTextColor(hdc, if app.can_back() { t.text } else { t.text_dim });
         draw_text(hdc, "\u{E72B}", l.back, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_CENTER);
         SetTextColor(hdc, if app.can_forward() { t.text } else { t.text_dim });
@@ -1487,6 +1503,41 @@ pub fn draw_tree_chevron(hdc: HDC, r: &RECT, color: COLORREF, down: bool) {
     }
 }
 
+/// 表头上的排序指示：**朝上/朝下**的一对实心三角。
+///
+/// 之前直接拿树形箭头来画，而树形箭头的两种形态是"朝右/朝下" —— 于是升序那
+/// 一下画出来的是一个**横着的**箭头（"有一个箭头变成侧的了"就是这么来的）。
+/// 排序只有上下两个方向，必须是一对专门的上/下三角。
+pub fn draw_sort_arrow(hdc: HDC, r: &RECT, color: COLORREF, descending: bool) {
+    let cx = (r.left + r.right) / 2;
+    let cy = (r.top + r.bottom) / 2;
+    let a = ((r.right - r.left) * 6 / 16).max(3);
+    let pts = if descending {
+        // ▼
+        [
+            POINT { x: cx - a, y: cy - a / 2 },
+            POINT { x: cx + a, y: cy - a / 2 },
+            POINT { x: cx, y: cy + a / 2 + 1 },
+        ]
+    } else {
+        // ▲
+        [
+            POINT { x: cx - a, y: cy + a / 2 },
+            POINT { x: cx + a, y: cy + a / 2 },
+            POINT { x: cx, y: cy - a / 2 - 1 },
+        ]
+    };
+    unsafe {
+        let brush = CreateSolidBrush(color);
+        let old = SelectObject(hdc, brush.into());
+        let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+        let _ = Polygon(hdc, &pts);
+        SelectObject(hdc, old_pen);
+        SelectObject(hdc, old);
+        let _ = DeleteObject(brush.into());
+    }
+}
+
 fn paint_sidebar(app: &mut App, hdc: HDC, l: &Layout) {
     let t = app.theme;
     let scale = app.metrics.scale;
@@ -1528,6 +1579,14 @@ fn paint_sidebar(app: &mut App, hdc: HDC, l: &Layout) {
                 crate::app::SidebarIcon::Stock(siid) => icons[i] = crate::icons::stock_icon(*siid, true),
             }
         }
+
+        // 整棵树的绘制裁剪在导航窗格矩形内。
+        //
+        // 之前只跳过"整行都在窗格之上"的那些行，**横跨上沿的那一行照画**，
+        // 于是滚动时最上面那一行会有一截画到工具栏上去 —— 正好压在"返回/
+        // 前进/向上"三个按钮上（用户看到的"侧栏溢出到三个按钮上"）。
+        let _ = SaveDC(hdc);
+        let _ = IntersectClipRect(hdc, l.sidebar.left, l.sidebar.top, l.sidebar.right, l.sidebar.bottom);
 
         for (i, row) in rows.iter().enumerate() {
             // 分组之间的空行：只占位、不画也不参与命中（见 `SidebarRow.spacer`）
@@ -1620,6 +1679,7 @@ fn paint_sidebar(app: &mut App, hdc: HDC, l: &Layout) {
 
         // （原导航窗格右上角的折叠按钮已按用户要求删除：折叠走标题栏最左那个开关，
         //  窗格里再放一个既占位又容易误点）
+        let _ = RestoreDC(hdc, -1);
     }
 }
 
@@ -1654,6 +1714,84 @@ pub fn header_splits(app: &App, l: &Layout) -> Vec<(usize, i32)> {
         (2, cols.size),
         (3, cols.size + cols.size_w),
     ]
+}
+
+/// 光标落在表头的哪一列上（0=名称，搜索态 1=位置，其后 修改日期/类型/大小）。
+///
+/// 绘制与命中共用 `detail_cols` 同一份列几何。表头的"筛选下拉"和右键菜单都
+/// 靠它定位：各自去数一遍列的话，拖过一次列宽就对不上了。
+pub fn header_col_hit(app: &App, l: &Layout, x: i32, y: i32) -> Option<usize> {
+    if app.tab().view_mode != fm_core::ViewMode::Details {
+        return None;
+    }
+    let header_h = (26.0 * app.metrics.scale) as i32;
+    if y < l.view.top || y >= l.view.top + header_h || x < l.view.left || x >= l.view.right {
+        return None;
+    }
+    let icon_size = (16.0 * app.metrics.scale) as i32;
+    let cols = detail_cols(app, l, icon_size);
+    let mut list: Vec<(i32, i32)> = vec![(cols.name, cols.name_w)];
+    if let Some(p) = cols.path {
+        list.push((p, cols.path_w));
+    }
+    list.push((cols.date, cols.date_w));
+    list.push((cols.kind, cols.kind_w));
+    list.push((cols.size, cols.size_w));
+    for (i, (x0, w)) in list.iter().enumerate() {
+        let right = (*x0 + w).min(l.view.right);
+        if x >= *x0 && x < right.max(*x0) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// 表头里"筛选下拉"那个小三角的矩形（悬停时才画）。绘制与命中共用。
+pub fn header_filter_rect(app: &App, l: &Layout, col: usize) -> RECT {
+    let s = app.metrics.scale;
+    let icon_size = (16.0 * s) as i32;
+    let cols = detail_cols(app, l, icon_size);
+    let mut list: Vec<(i32, i32)> = vec![(cols.name, cols.name_w)];
+    if let Some(p) = cols.path {
+        list.push((p, cols.path_w));
+    }
+    list.push((cols.date, cols.date_w));
+    list.push((cols.kind, cols.kind_w));
+    list.push((cols.size, cols.size_w));
+    let (x0, w) = list.get(col).copied().unwrap_or((l.view.left, 0));
+    let right = (x0 + w).min(l.view.right);
+    let aw = (16.0 * s) as i32;
+    RECT {
+        left: (right - aw).max(x0),
+        top: l.view.top,
+        right,
+        bottom: l.view.top + (26.0 * s) as i32,
+    }
+}
+
+/// 把 `header_col_hit` 给出的**显示序号**翻译成语义列号：
+/// 0=名称 1=修改日期 2=类型 3=大小 4=位置。
+///
+/// 搜索态会在名称后面插一列"位置"，于是显示序号和语义列号不再是同一个东西
+/// —— 筛选和排序认的是语义列号，各自在调用点手写一遍这个映射迟早错位。
+pub fn header_col_semantic(app: &App, i: usize) -> u8 {
+    let searching = app.tab().search_root.is_some();
+    if searching {
+        match i {
+            0 => 0,
+            1 => 4,
+            2 => 1,
+            3 => 2,
+            _ => 3,
+        }
+    } else {
+        match i {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            _ => 3,
+        }
+    }
 }
 
 /// 光标落在哪条分隔线上（带 4px 容差）。
@@ -1701,6 +1839,12 @@ pub fn sidebar_hit(
     scale: f32,
 ) -> Option<(usize, bool)> {
     let scroll = app.sidebar_scroll;
+    // 光标不在导航窗格的**可见范围**里就直接不算命中。
+    // 少了这一句，滚出窗格上沿的那些行（画的时候被裁掉了）依然点得中，
+    // 于是"在工具栏三个按钮上点一下"会命中看不见的导航行。
+    if y < l.sidebar.top || y >= l.sidebar.bottom || x < l.sidebar.left || x >= l.sidebar.right {
+        return None;
+    }
     let rows = app.sidebar_rows();
     for (i, r) in rows.iter().enumerate() {
         // 分组空行不参与命中：点在它上面不该选中任何东西
@@ -2259,6 +2403,12 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
             if dragged.contains(&path.to_string_lossy().to_lowercase()) {
                 alpha = alpha.min(90);
             }
+            // 剪切过的条目同样要虚掉：它已经"不在原地"了，只是还没落下去。
+            // 不画这一层的话，剪切和复制在界面上长得一模一样，看不出差别。
+            let low = path.to_string_lossy().to_lowercase();
+            if app.cut_set.contains(&low) {
+                alpha = alpha.min(130);
+            }
             icon_alpha.push(alpha);
             let ext = path
                 .extension()
@@ -2316,7 +2466,17 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
                         g.tile_w,
                     )
                 }
-                None => (l.view.left, list_top + i as i32 * row_h - scroll, l.view.right - l.view.left),
+                // 行式布局的选中/悬停条**只到最后一列的右沿**为止。
+                // 铺满整行的话，鼠标扫过表头右侧那一片空白也会亮起一条，
+                // 而那片地方其实不属于任何一列（资源管理器就是截止在最右列）。
+                None => {
+                    let w = if mode == fm_core::ViewMode::Details {
+                        ((cols.size + cols.size_w).min(l.view.right) - l.view.left).max(10)
+                    } else {
+                        l.view.right - l.view.left
+                    };
+                    (l.view.left, list_top + i as i32 * row_h - scroll, w)
+                }
             };
             if y > l.view.bottom || y + tile_h < list_top {
                 continue;
@@ -2437,32 +2597,52 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
                 all.push(path_hdr);
             }
             all.extend_from_slice(&cols_hdr[1..]);
-            for (label, key, x0, w) in all {
+            for (ci, (label, key, x0, w)) in all.iter().enumerate() {
+                let label: &str = *label;
                 let _ = &mut cols_hdr;
                 // 列名一律**夹在自己那一列的宽度里**：不夹的话列宽拖窄之后，
                 // 列名会一路画到右边那一列的头上（"列拖不动/看着乱"的观感来源）。
                 let right = (x0 + w).min(l.view.right);
-                let rr = RECT { left: x0, top: l.view.top, right: right.max(x0), bottom: l.view.top + header_h };
-                SetTextColor(hdc, if sort.key == key { t.text } else { t.text_dim });
+                let rr = RECT { left: *x0, top: l.view.top, right: right.max(*x0), bottom: l.view.top + header_h };
+                let active = sort.key == *key;
+                SetTextColor(hdc, if active { t.text } else { t.text_dim });
+                // 列名在**自己这一列里居中**（资源管理器 Win11 表头就是这样）：
+                // 贴着左沿画的时候，它紧贴上一列的分隔线，看着像那一列的尾巴。
+                let tw = unsafe { text_width(hdc, hf, label) };
+                let arrow_w = if active { (14.0 * app.metrics.scale) as i32 } else { 0 };
+                let block_w = tw + arrow_w;
+                let bx = *x0 + ((rr.right - rr.left) - block_w) / 2;
+                let tr = RECT { left: bx, top: rr.top, right: bx + tw, bottom: rr.bottom };
                 draw_text(
                     hdc,
                     label,
-                    rr,
+                    tr,
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
                 );
-                // 排序指示：与侧栏**同一个**实心三角，不再用 ▼/▲ 字符 ——
-                // 那两个字符是等宽字形，字号一大就顶出列宽，还带一圈抗锯齿灰边。
-                if sort.key == key {
-                    let tw = unsafe { text_width(hdc, hf, label) };
+                // 排序指示：上/下**一对**实心三角（不是侧栏那套"右/下"箭头 ——
+                // 那会让升序画成一个横着的箭头）。
+                if active {
                     let ar = RECT {
-                        left: x0 + tw + (4.0 * app.metrics.scale) as i32,
-                        top: l.view.top,
-                        right: x0 + tw + (16.0 * app.metrics.scale) as i32,
-                        bottom: l.view.top + header_h,
+                        left: bx + tw,
+                        top: rr.top,
+                        right: bx + tw + arrow_w,
+                        bottom: rr.bottom,
                     };
                     if ar.left < rr.right {
-                        draw_tree_chevron(hdc, &ar, t.text_dim, sort.descending);
+                        draw_sort_arrow(hdc, &ar, t.text, sort.descending);
                     }
+                }
+                // 悬停在这一列上时，右端露出一个"筛选"小箭头（资源管理器同款）：
+                // 点它下拉出这一列的筛选项。没有它用户不知道表头还能筛。
+                if app.hover_header == Some(ci) {
+                    let aw = (16.0 * app.metrics.scale) as i32;
+                    let fr = RECT {
+                        left: (rr.right - aw).max(rr.left),
+                        top: rr.top,
+                        right: rr.right,
+                        bottom: rr.bottom,
+                    };
+                    draw_tree_chevron(hdc, &fr, t.text, true);
                 }
             }
             // 列分隔竖线：告诉用户"这条可以拖"。没有它，表头就是一行光秃秃的
@@ -2881,6 +3061,17 @@ pub fn recycle_columns(app: &App, l: &Layout) -> [RECT; 4] {
     ]
 }
 
+/// 光标落在回收站表头的哪一列上（0=名称 1=原位置 2=删除时间 3=大小）。
+pub fn recycle_header_hit(app: &App, l: &Layout, x: i32, y: i32) -> Option<usize> {
+    let s = app.metrics.scale;
+    let top = l.view.top + recycle_toolbar_h(s);
+    if y < top || y >= top + recycle_header_h(s) {
+        return None;
+    }
+    let cols = recycle_columns(app, l);
+    cols.iter().position(|c| x >= c.left && x < c.right)
+}
+
 /// 回收站视图命中测试：返回条目下标。
 pub fn recycle_hit(app: &App, l: &Layout, y: i32) -> Option<usize> {
     let row_h = recycle_row_h(app.metrics.scale);
@@ -2963,16 +3154,35 @@ fn paint_recycle(app: &mut App, hdc: HDC, l: &Layout) {
         let hb = CreateSolidBrush(t.surface_alt);
         FillRect(hdc, &hr, hb);
         let _ = DeleteObject(hb.into());
-        SetTextColor(hdc, t.text_dim);
+        // 列头可以点：点一下按这一列排，再点一次换方向（和资源管理器一样）。
+        // 之前回收站的表头只是一行字，"快速排序"根本没接上。
+        let (scol, sdesc) = app.recycle_sort;
+        let hfont = header_font(s);
+        let old_hf = SelectObject(hdc, hfont.into());
         for (i, label) in ["名称", "原位置", "删除时间", "大小"].iter().enumerate() {
             let c = cols[i];
+            let rr = RECT { left: c.left, top: hr.top, right: c.right, bottom: hr.bottom };
+            SetTextColor(hdc, if scol == i { t.text } else { t.text_dim });
+            let tw = text_width(hdc, hfont, label);
+            let aw = if scol == i { (14.0 * s) as i32 } else { 0 };
+            let bx = c.left + ((c.right - c.left) - (tw + aw)) / 2;
             draw_text(
                 hdc,
                 label,
-                RECT { left: c.left, top: hr.top, right: c.right, bottom: hr.bottom },
+                RECT { left: bx.max(c.left), top: hr.top, right: (bx + tw).min(c.right), bottom: hr.bottom },
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
             );
+            if scol == i {
+                draw_sort_arrow(
+                    hdc,
+                    &RECT { left: bx + tw, top: hr.top, right: bx + tw + aw, bottom: hr.bottom },
+                    t.text,
+                    sdesc,
+                );
+            }
         }
+        SelectObject(hdc, old_hf);
+        SetTextColor(hdc, t.text_dim);
         let sep = CreateSolidBrush(t.border);
         FillRect(hdc, &RECT { left: hr.left, top: hr.bottom - 1, right: hr.right, bottom: hr.bottom }, sep);
         let _ = DeleteObject(sep.into());
@@ -3095,7 +3305,7 @@ fn format_date(ft: i64) -> String {
     format!("{y:04}/{m:02}/{d:02}")
 }
 
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = (z - era * 146097) as i64;
@@ -3151,29 +3361,55 @@ pub fn status_view_hit(l: &Layout, m: &Metrics, x: i32, y: i32) -> Option<fm_cor
 
 /// 两个按钮的图标是**手绘**的：不用 Segoe MDL2 的字形码（不同系统版本的码位
 /// 不一致，容易画出一个空白方框）。2×2 方块 = 大图标；三条横线 = 详细信息。
+/// 状态栏右下角那两个布局按钮的图标。
+///
+/// 之前"大图标"是四个实心方块、"详细信息"是三条横线 —— 三个像素条读不出
+/// "这是什么意思"，用户只能靠猜。重做成一看就懂的两个：
+///   * 大图标 = 2×2 的**方格子**（外框 + 内部留白，像缩略图格子）
+///   * 详细信息 = 一个**表格**：顶部一条表头线 + 若干行，行里还有列分隔
 unsafe fn draw_view_glyph(hdc: HDC, r: &RECT, grid: bool, color: COLORREF) {
     let brush = CreateSolidBrush(color);
+    let w = r.right - r.left;
+    let h = r.bottom - r.top;
     if grid {
-        let cell = ((r.bottom - r.top - 8) / 2).max(2);
-        let x0 = r.left + ((r.right - r.left) - (cell * 2 + 2)) / 2;
-        let y0 = r.top + ((r.bottom - r.top) - (cell * 2 + 2)) / 2;
+        // 2×2 格子：每格画成空心方框（描边），比实心块更像"图标视图"
+        let cell = ((h.min(w) - 10) / 2).max(3);
+        let gap = 2;
+        let x0 = r.left + (w - (cell * 2 + gap)) / 2;
+        let y0 = r.top + (h - (cell * 2 + gap)) / 2;
         for gy in 0..2 {
             for gx in 0..2 {
-                let l = x0 + gx * (cell + 2);
-                let t = y0 + gy * (cell + 2);
-                let _ = FillRect(hdc, &RECT { left: l, top: t, right: l + cell, bottom: t + cell }, brush);
+                let l = x0 + gx * (cell + gap);
+                let t = y0 + gy * (cell + gap);
+                // 方框：四条 1px 边（上/下/左/右）
+                let _ = FillRect(hdc, &RECT { left: l, top: t, right: l + cell, bottom: t + 1 }, brush);
+                let _ = FillRect(hdc, &RECT { left: l, top: t + cell - 1, right: l + cell, bottom: t + cell }, brush);
+                let _ = FillRect(hdc, &RECT { left: l, top: t, right: l + 1, bottom: t + cell }, brush);
+                let _ = FillRect(hdc, &RECT { left: l + cell - 1, top: t, right: l + cell, bottom: t + cell }, brush);
             }
         }
     } else {
+        // 表格：一条表头线（略粗）+ 3 行，行里用一条竖线分出列
+        let rows = 3;
         let line_h = 2;
         let gap = 3;
-        let total = line_h * 3 + gap * 2;
-        let y0 = r.top + ((r.bottom - r.top) - total) / 2;
-        let w = r.right - r.left - 12;
-        for k in 0..3 {
-            let t = y0 + k * (line_h + gap);
-            let _ = FillRect(hdc, &RECT { left: r.left + 6, top: t, right: r.left + 6 + w, bottom: t + line_h }, brush);
+        let head_h = 2;
+        let total = head_h + 2 + rows * line_h + (rows - 1) * gap;
+        let x0 = r.left + 6;
+        let bw = (w - 12).max(6);
+        let y0 = r.top + (h - total) / 2;
+        let _ = FillRect(hdc, &RECT { left: x0, top: y0, right: x0 + bw, bottom: y0 + head_h }, brush);
+        let mut y = y0 + head_h + 2;
+        for _k in 0..rows {
+            let _ = FillRect(hdc, &RECT { left: x0, top: y, right: x0 + bw, bottom: y + line_h }, brush);
+            // 列分隔：第一行之后那一段竖线，做出"表格有列"的样子
+            y += line_h + gap;
         }
+        let _ = FillRect(
+            hdc,
+            &RECT { left: x0 + bw * 3 / 5, top: y0 + head_h + 2, right: x0 + bw * 3 / 5 + 1, bottom: y - gap },
+            brush,
+        );
     }
     let _ = DeleteObject(brush.into());
 }
@@ -3426,6 +3662,7 @@ pub fn create_rename_editor(app: &mut App, select_stem: bool) {
         .unwrap_or_default();
     let edit_class = HSTRING::from("EDIT");
     let row_h = app.metrics.row_height_for(app.tab().view_mode);
+    let font = ui_font(app.metrics.scale);
     let l = compute_layout(
         app.last_size.0,
         app.last_size.1,
@@ -3439,15 +3676,35 @@ pub fn create_rename_editor(app: &mut App, select_stem: bool) {
         0
     };
     let y = l.view.top + header_h + app.tab().focus_row as i32 * row_h - app.tab().scroll;
+    // 编辑框宽度跟着名字长度走，但**最长不得超过"名称"这一列的右沿**：
+    // 以前写死 300px，短名字后面拖一条空框、长名字又顶出列外压到"修改日期"上。
+    let x = l.view.left + (30.0 * app.metrics.scale) as i32;
+    let max_right = if app.tab().view_mode == fm_core::ViewMode::Details {
+        let cols = detail_cols(app, &l, (16.0 * app.metrics.scale) as i32);
+        (cols.name + cols.name_w).min(l.view.right)
+    } else {
+        l.view.right - (8.0 * app.metrics.scale) as i32
+    };
+    let tw = unsafe {
+        let hdc = GetDC(Some(app.hwnd));
+        let old = SelectObject(hdc, font.into());
+        let w = text_width(hdc, font, &initial);
+        SelectObject(hdc, old);
+        let _ = ReleaseDC(Some(app.hwnd), hdc);
+        w
+    };
+    let w = (tw + (28.0 * app.metrics.scale) as i32)
+        .max((90.0 * app.metrics.scale) as i32)
+        .min((max_right - x).max((70.0 * app.metrics.scale) as i32));
     unsafe {
         let hwnd = CreateWindowExW(
             WS_EX_CLIENTEDGE,
             windows::core::PCWSTR(edit_class.as_ptr()),
             windows::core::PCWSTR::null(),
             WS_CHILD | WS_VISIBLE | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
-            l.view.left + (30.0 * app.metrics.scale) as i32,
+            x,
             y,
-            (300.0 * app.metrics.scale) as i32,
+            w,
             row_h,
             Some(app.hwnd),
             Some(HMENU(ID_RENAME as *mut core::ffi::c_void)),

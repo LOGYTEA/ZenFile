@@ -534,6 +534,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 _ => {
                     if app.drag_split.is_some() || app.hover_split.is_some() {
                         IDC_SIZEWE
+                    } else if over_text_input(app, hwnd) {
+                        // 地址栏/搜索框上要出 I 形光标：它们平时是画在父窗口上的
+                        // 面包屑/装饰（真正的 EDIT 只在编辑态才建），没有子窗口来
+                        // 替我们设光标，于是"移到输入框上光标却没变化"。
+                        IDC_IBEAM
                     } else {
                         IDC_ARROW
                     }
@@ -695,6 +700,23 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             } else {
                 None
             };
+            // 工具栏「后退/前进/向上」三个导航按钮的悬停。
+            // 它们本质是按钮，不给底色就只像三个浮着的图标。
+            let hover_nav = if inside(&l.back, x, y) {
+                1u8
+            } else if inside(&l.forward, x, y) {
+                2u8
+            } else if inside(&l.up, x, y) {
+                3u8
+            } else {
+                0u8
+            };
+            // 表头列的悬停：悬停时才在最右端露出筛选下拉的箭头
+            let hover_header = if app.tab().recycle {
+                paint::recycle_header_hit(app, &l, x, y)
+            } else {
+                paint::header_col_hit(app, &l, x, y)
+            };
             // 导航窗格悬停行
             let hover_sidebar = if app.cfg.ui.sidebar_visible {
                 paint::sidebar_hit(app, &l, x, y, app.metrics.scale).map(|(i, _)| i)
@@ -731,9 +753,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 || hover_split != app.hover_split
                 || hover_bulk != app.hover_bulk
                 || hover_row != app.hover_row
+                || hover_nav != app.hover_nav
+                || hover_header != app.hover_header
                 || hover_rec != app.hover_recycle
                 || hover_rec_btn != app.hover_recycle_btn
             {
+                app.hover_nav = hover_nav;
+                app.hover_header = hover_header;
                 app.hover_recycle = hover_rec;
                 app.hover_recycle_btn = hover_rec_btn;
                 app.hover_bulk = hover_bulk;
@@ -878,17 +904,40 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 let _ = InvalidateRect(Some(hwnd), None, true);
                 return LRESULT(0);
             }
-            // 设置页：点一行就切换/循环对应开关
+            // 导航窗格的命中**必须排在设置页/回收站之前**：那两个分支处理完就
+            // 直接 return，于是"进了设置/回收站就没办法对侧栏操作"（点盘符
+            // 想换个目录，点了没反应，只能先切回去）。
+            if app.cfg.ui.sidebar_visible && x < l.sidebar.right && y > l.sidebar.top {
+                if sidebar_click(app, x, y) {
+                    // 必须重画：点箭头只改树的状态，不像 navigate 那样自己会触发
+                    // 重绘。少了这一句，展开/收起看起来就是"点了没反应"。
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                    return LRESULT(0);
+                }
+            }
+            // 设置页：开关点一下就切；**多选项点一下展开下拉**（不再循环切换）
             if app.tab().settings {
                 if let Some(action) = paint::settings_hit(app, &l, x, y) {
-                    if let Some(cmd) = settings_command(action) {
+                    if matches!(action, paint::SET_THEME | paint::SET_UNIT | paint::SET_VIEW) {
+                        show_setting_dropdown(hwnd, app, &l, action);
+                    } else if let Some(cmd) = settings_command(action) {
                         app.run_command(cmd);
                     }
                 }
                 return LRESULT(0);
             }
-            // 回收站视图：先判顶部三个按钮，再判条目
+            // 回收站视图：**先判列头**（它在顶部工具条下面、条目区上面），
+            // 再判三个按钮，最后才是条目。
+            //
+            // 列头判定曾经写在下面的"表头"那一节里，而回收站的这一整段是
+            // `return LRESULT(0)` 收尾的 —— 那段代码永远到不了，于是"回收站
+            // 用表头排序"是个死的。点列头反而落进了"空白处 → 清选中 + 拉框选"。
             if app.tab().recycle {
+                if let Some(col) = paint::recycle_header_hit(app, &l, x, y) {
+                    app.sort_recycle_by(col);
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                    return LRESULT(0);
+                }
                 let btns = paint::recycle_buttons(app, &l);
                 if inside(&btns[0], x, y) {
                     app.run_command(menu::Command::RecycleRestore);
@@ -967,14 +1016,6 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 show_bulk_rename_menu(hwnd, app, &l);
                 return LRESULT(0);
             }
-            if app.cfg.ui.sidebar_visible && x < l.sidebar.right && y > l.sidebar.top {
-                if sidebar_click(app, x, y) {
-                    // 必须重画：点箭头只改树的状态，不像 navigate 那样自己会触发
-                    // 重绘。少了这一句，展开/收起看起来就是"点了没反应"。
-                    let _ = InvalidateRect(Some(hwnd), None, true);
-                    return LRESULT(0);
-                }
-            }
             // 首页是平铺布局，行列式命中在这里不适用
             if app.tab().home && y >= l.view.top {
                 let hit = home_select(app, &l, x, y);
@@ -992,6 +1033,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let header_h = header_height(app);
             let view_top = l.view.top + header_h;
             if y >= l.view.top && y < view_top && app.tab().view_mode == fm_core::ViewMode::Details {
+                // 先判列最右端那个「筛选」小三角：它压在列里，先判整列的话
+                // 点三角永远只会变成"再排一次序"。
+                if let Some(col) = paint::header_col_hit(app, &l, x, y) {
+                    if inside(&paint::header_filter_rect(app, &l, col), x, y) {
+                        show_header_filter_menu(hwnd, app, &l, col);
+                        return LRESULT(0);
+                    }
+                }
                 header_click(app, &l, x);
                 return LRESULT(0);
             }
@@ -1197,6 +1246,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                         tab.selected.insert(crate::app::key_of(e));
                     }
                 }
+                // Alt+双击 = 属性（资源管理器同款）。Alt 不按就是打开。
+                // 放在选中之后：属性窗口要作用在刚选中的那一项上。
+                if GetKeyState(0x12) < 0 {
+                    app.context_targets = Some(app.tab().selected_paths());
+                    app.run_command(menu::Command::Properties);
+                    app.context_targets = None;
+                    return LRESULT(0);
+                }
                 app.open_focused();
                 paint::sync_address(app);
             }
@@ -1243,13 +1300,35 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 app.show_recycle_menu(pt.x, pt.y);
                 LRESULT(0)
             } else {
+                // 表头右键 = 排序/筛选菜单，不是文件右键。放在取 target 之前
+                // 拦下来，否则它会落进"清空选中 + 弹目录菜单"那条路。
+                if app.tab().view_mode == fm_core::ViewMode::Details
+                    && y >= l.view.top
+                    && y < view_top
+                    && x >= l.view.left
+                    && x < l.view.right
+                {
+                    if let Some(col) = paint::header_col_hit(app, &l, x, y) {
+                        show_header_context_menu(hwnd, app, &l, col, x, y);
+                        return LRESULT(0);
+                    }
+                }
                 // 先把"这一次要作用在哪些条目上"算出来存进 App，
                 // 菜单里绝不能再调 selected_paths() —— 它在选中为空时会退回焦点行，
                 // 那正是"空白处右键却判定到条目上"的根因。
                 let targets: Vec<PathBuf> = if app.tab().home {
-                    if y >= l.view.top && x >= l.view.left {
-                        home_select(app, &l, x, y);
-                        app.tab().selected_paths()
+                    if y >= l.view.top && x >= l.view.left && x < l.view.right {
+                        if home_select(app, &l, x, y) {
+                            app.tab().selected_paths()
+                        } else {
+                            // 主页空白处：必须清掉选中再给空目标。之前不管命中
+                            // 与否都取 selected_paths()，于是"在主页空白处右键"
+                            // 弹出来的是上一次选中那个文件的菜单 —— 这就是
+                            // 主页右键判定飘忽的真因。
+                            app.tab_mut().selected.clear();
+                            app.focus_visible = false;
+                            Vec::new()
+                        }
                     } else {
                         Vec::new()
                     }
@@ -1447,6 +1526,7 @@ fn show_bulk_rename_menu(hwnd: HWND, app: &mut App, l: &paint::Layout) {
         app.metrics.scale,
         app.theme,
         None,
+        true, // 由一次左键按下弹出：那一次的抬起要吞掉
     ) {
         app.menu_hwnd = Some(h);
     }
@@ -1623,6 +1703,209 @@ unsafe fn run_caption(hwnd: HWND, which: u8) {
 }
 
 /// 设置页里某一行的点击翻译成命令。
+/// 设置页里多选项（主题 / 大小单位 / 默认视图）的下拉。
+///
+/// 之前这三项是"点一下循环到下一档"，选项一多就得连点好几下，而且点下去
+/// 会变成什么完全靠猜。改成下拉：一次看全，点哪个就是哪个。
+fn show_setting_dropdown(hwnd: HWND, app: &mut App, l: &paint::Layout, action: u32) {
+    let entries: Vec<menu::MenuEntry> = match action {
+        paint::SET_THEME => {
+            let dark = app.cfg.core.theme != "light";
+            vec![
+                crate::app::pick_row("暗色", menu::Command::SetThemeDark(true), dark),
+                crate::app::pick_row("亮色", menu::Command::SetThemeDark(false), !dark),
+            ]
+        }
+        paint::SET_UNIT => {
+            let cur = fm_core::SizeUnit::parse(&app.cfg.files.view.size_unit);
+            fm_core::SizeUnit::ALL
+                .iter()
+                .enumerate()
+                .map(|(i, u)| {
+                    crate::app::pick_row(u.label(), menu::Command::SetSizeUnitIdx(i), *u == cur)
+                })
+                .collect()
+        }
+        paint::SET_VIEW => {
+            let cur = app.cfg.files.view.default_mode.clone();
+            crate::app::DEFAULT_VIEW_CYCLE
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    crate::app::pick_row(
+                        crate::app::default_view_label(s),
+                        menu::Command::SetDefaultViewIdx(i),
+                        *s == cur,
+                    )
+                })
+                .collect()
+        }
+        _ => return,
+    };
+    // 锚点：那一行右侧"当前值 ▾"按钮的左下角 —— 菜单从按钮底下长出来
+    let row = paint::settings_rows(app, l).into_iter().find(|r| r.action == action);
+    let r = match row {
+        Some(r) => paint::setting_value_rect(&r, app.metrics.scale),
+        None => l.view,
+    };
+    let mut pt = POINT { x: r.left, y: r.bottom };
+    let _ = unsafe { ClientToScreen(hwnd, &mut pt) };
+    let app_ptr = app as *mut App;
+    if let Some(h) = menu::open_menu(
+        app_ptr,
+        hwnd,
+        entries,
+        pt.x,
+        pt.y,
+        app.metrics.scale,
+        app.theme,
+        None,
+        true, // 由一次左键按下弹出：那一次的抬起要吞掉
+    ) {
+        app.menu_hwnd = Some(h);
+    }
+}
+
+/// 某一列的"筛选"下拉里都有些什么。
+///
+/// 名称/日期/大小用固定分桶（与资源管理器"按…分组"的口径一致），类型是**当前
+/// 目录里真实出现过的类型** —— 静态列一份"文件夹/文本文档/…"必然漏类型。
+fn header_filter_rows(app: &App, sem: u8) -> Vec<menu::MenuEntry> {
+    let cur = app.tab().col_filter.clone();
+    let bucket = |want: u8| -> usize {
+        match &cur {
+            Some(app::ColFilter::Name(b)) if want == 0 => *b,
+            Some(app::ColFilter::Date(b)) if want == 1 => *b,
+            Some(app::ColFilter::Size(b)) if want == 3 => *b,
+            _ => 0,
+        }
+    };
+    match sem {
+        0 => app::NAME_BUCKETS
+            .iter()
+            .enumerate()
+            .map(|(i, s)| app::pick_row(s, menu::Command::ColFilter(0, i), bucket(0) == i))
+            .collect(),
+        1 => app::DATE_BUCKETS
+            .iter()
+            .enumerate()
+            .map(|(i, s)| app::pick_row(s, menu::Command::ColFilter(1, i), bucket(1) == i))
+            .collect(),
+        3 => app::SIZE_BUCKETS
+            .iter()
+            .enumerate()
+            .map(|(i, s)| app::pick_row(s, menu::Command::ColFilter(3, i), bucket(3) == i))
+            .collect(),
+        2 => {
+            let mut kinds: Vec<String> = app.tab().entries.iter().map(|e| e.type_label()).collect();
+            kinds.sort();
+            kinds.dedup();
+            let active = matches!(&cur, Some(app::ColFilter::Kind(k)) if kinds.contains(k));
+            let mut rows = vec![app::pick_row(
+                "全部",
+                menu::Command::ColFilterKind(String::new()),
+                !active,
+            )];
+            for k in kinds {
+                let on = matches!(&cur, Some(app::ColFilter::Kind(c)) if *c == k);
+                let label = k.clone();
+                rows.push(app::pick_row(&k, menu::Command::ColFilterKind(label), on));
+            }
+            rows
+        }
+        // 「位置」列没有可筛的东西（搜索态专有，本身就是一层筛选）
+        _ => Vec::new(),
+    }
+}
+
+/// 点表头最右端的「筛选 ▾」：菜单从三角底下长出来。
+fn show_header_filter_menu(hwnd: HWND, app: &mut App, l: &paint::Layout, col: usize) {
+    let sem = paint::header_col_semantic(app, col);
+    let entries = header_filter_rows(app, sem);
+    if entries.is_empty() {
+        return;
+    }
+    let r = paint::header_filter_rect(app, l, col);
+    let mut pt = POINT { x: r.left, y: r.bottom };
+    let _ = unsafe { ClientToScreen(hwnd, &mut pt) };
+    let app_ptr = app as *mut App;
+    if let Some(h) = menu::open_menu(
+        app_ptr,
+        hwnd,
+        entries,
+        pt.x,
+        pt.y,
+        app.metrics.scale,
+        app.theme,
+        None,
+        true, // 由一次左键按下弹出：那一次的抬起要吞掉
+    ) {
+        app.menu_hwnd = Some(h);
+    }
+}
+
+/// 表头右键：排序方向 + 按这一列筛选（资源管理器同款）。
+fn show_header_context_menu(hwnd: HWND, app: &mut App, l: &paint::Layout, col: usize, x: i32, y: i32) {
+    let sem = paint::header_col_semantic(app, col);
+    let label = match sem {
+        0 => "名称",
+        1 => "修改日期",
+        2 => "类型",
+        3 => "大小",
+        _ => "位置",
+    };
+    let desc = app.tab().sort.descending;
+    let cur_col = match app.tab().sort.key {
+        fm_core::SortKey::Name => 0u8,
+        fm_core::SortKey::Modified => 1,
+        fm_core::SortKey::Type => 2,
+        _ => 3,
+    };
+    let on_this = cur_col == sem;
+    let mut entries: Vec<menu::MenuEntry> = Vec::new();
+    // 列与方向一次到位：只给"方向"的话，右键 大小 选递增却仍在按名称排，
+    // 看着就像这一项没生效。
+    entries.push(app::pick_row(
+        &format!("按{}递增排序", label),
+        menu::Command::HeaderSort(sem, false),
+        on_this && !desc,
+    ));
+    entries.push(app::pick_row(
+        &format!("按{}递减排序", label),
+        menu::Command::HeaderSort(sem, true),
+        on_this && desc,
+    ));
+    let filters = header_filter_rows(app, sem);
+    if !filters.is_empty() {
+        entries.push(menu::MenuEntry::sep());
+        entries.push(crate::app::submenu_row("筛选", None, filters));
+    }
+    if app.tab().col_filter.is_some() {
+        entries.push(menu::MenuEntry::sep());
+        entries.push(crate::app::pick_row(
+            "清除筛选",
+            menu::Command::ColFilterKind(String::new()),
+            false,
+        ));
+    }
+    let mut pt = POINT { x, y };
+    let _ = unsafe { ClientToScreen(hwnd, &mut pt) };
+    let app_ptr = app as *mut App;
+    if let Some(h) = menu::open_menu(
+        app_ptr,
+        hwnd,
+        entries,
+        pt.x,
+        pt.y,
+        app.metrics.scale,
+        app.theme,
+        None,
+        false,
+    ) {
+        app.menu_hwnd = Some(h);
+    }
+}
+
 fn settings_command(action: u32) -> Option<menu::Command> {
     use paint::{
         SET_EXT, SET_FOLLOW, SET_HIDDEN, SET_SIDEBAR, SET_STATUS, SET_SYSTEM, SET_THEME,
@@ -1645,6 +1928,27 @@ fn settings_command(action: u32) -> Option<menu::Command> {
 
 fn inside(r: &RECT, x: i32, y: i32) -> bool {
     x >= r.left && x < r.right && y >= r.top && y < r.bottom
+}
+
+/// 此刻光标是不是停在"能打字的地方"上（地址栏 / 搜索框）。
+///
+/// WM_SETCURSOR 不带坐标，只能反过来问系统鼠标在哪。地址栏在编辑态才是真 EDIT
+/// （那时 EDIT 自己会设 I 形），非编辑态是父窗口画的面包屑，得由这里补上。
+fn over_text_input(app: &App, hwnd: HWND) -> bool {
+    let mut pt = POINT::default();
+    if unsafe { GetCursorPos(&mut pt) }.is_err() {
+        return false;
+    }
+    let _ = unsafe { ScreenToClient(hwnd, &mut pt) };
+    let l = paint::compute_layout(
+        app.last_size.0,
+        app.last_size.1,
+        &app.metrics,
+        app.cfg.ui.sidebar_visible,
+        app.cfg.ui.statusbar_visible,
+    );
+    // 编辑态下地址栏里已经是一个真 EDIT，父窗口不该再抢它的光标
+    (!app.addr_editing && inside(&l.address, pt.x, pt.y)) || inside(&l.search, pt.x, pt.y)
 }
 
 fn client_xy(hwnd: HWND, lparam: LPARAM) -> (i32, i32) {
@@ -1675,19 +1979,49 @@ unsafe fn handle_hit_test(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     let (w, h) = app.last_size;
     let l = paint::compute_layout(w, h, &app.metrics, app.cfg.ui.sidebar_visible, app.cfg.ui.statusbar_visible);
     let border = (4.0 * app.metrics.scale).round() as i32;
+    let plus = l.new_tab_rect(app.tabs.len(), &app.metrics);
+    // 标题栏上的自有控件（侧栏开关 / 更多菜单 / 新建标签 / 三大金刚键）所在
+    // 的位置一律不算边框 —— 它们本来就压在窗口最外侧那几像素上。
+    let on_caption_ctrl = inside(&l.sidebar_toggle, pt.x, pt.y)
+        || inside(&l.menu_btn, pt.x, pt.y)
+        || inside(&l.min_btn, pt.x, pt.y)
+        || inside(&l.max_btn, pt.x, pt.y)
+        || inside(&l.close_btn, pt.x, pt.y)
+        || (0..app.tabs.len()).any(|i| inside(&l.tab_rect(i, app.tabs.len(), &app.metrics), pt.x, pt.y))
+        || (plus.right < l.tabs.right && inside(&plus, pt.x, pt.y));
 
-        if pt.y < l.title.bottom {
-        let plus = l.new_tab_rect(app.tabs.len(), &app.metrics);
+    // 四边 + 四角。**必须放在标题栏判定之前**：标题栏占着窗口顶上那一长条，
+    // 先判标题栏的话顶边永远拿不到 HTTOP。
+    // 之前这一节有三个错叠在一起：左右两边多带了 `pt.y > l.view.top`（顶边那一
+    // 截直接漏成 HTCLIENT），上边拿 `l.sidebar.top`（**窗格**的上沿）当窗口上沿，
+    // 四角又完全没判 —— 于是四面只有底边那 4px 能拉伸。
+    if !on_caption_ctrl {
+        let on_left = pt.x < border;
+        let on_right = pt.x >= w - border;
+        let on_top = pt.y < border;
+        let on_bottom = pt.y >= h - border;
+        match (on_top, on_bottom, on_left, on_right) {
+            (true, _, true, _) => return LRESULT(13),  // HTTOPLEFT
+            (true, _, _, true) => return LRESULT(14),  // HTTOPRIGHT
+            (_, true, true, _) => return LRESULT(16),  // HTBOTTOMLEFT
+            (_, true, _, true) => return LRESULT(17),  // HTBOTTOMRIGHT
+            (true, _, _, _) => return LRESULT(12),     // HTTOP
+            (_, true, _, _) => return LRESULT(15),     // HTBOTTOM
+            (_, _, true, _) => return LRESULT(10),     // HTLEFT
+            (_, _, _, true) => return LRESULT(11),     // HTRIGHT
+            _ => {}
+        }
+    }
+
+    if pt.y < l.title.bottom {
         // 标题栏上的自有按钮（侧栏开关 / 更多菜单 / 新建标签）要能收到
         // WM_LBUTTONUP，必须判为 HTCLIENT，否则系统把它当标题栏拖拽吞掉。
         // 标签本身也必须判 HTCLIENT：之前整条标签栏都返回 HTCAPTION，
         // 系统把按下当成"拖窗口"直接吞掉，窗口永远收不到 WM_LBUTTONDOWN
         // —— 表现就是"标签点不动、切不了"。标签之间的空白仍留给拖拽。
-        let on_tab = (0..app.tabs.len())
-            .any(|i| inside(&l.tab_rect(i, app.tabs.len(), &app.metrics), pt.x, pt.y));
         if inside(&l.sidebar_toggle, pt.x, pt.y)
             || inside(&l.menu_btn, pt.x, pt.y)
-            || on_tab
+            || (0..app.tabs.len()).any(|i| inside(&l.tab_rect(i, app.tabs.len(), &app.metrics), pt.x, pt.y))
             || (plus.right < l.tabs.right && inside(&plus, pt.x, pt.y))
         {
             return LRESULT(1); // HTCLIENT
@@ -1702,19 +2036,6 @@ unsafe fn handle_hit_test(hwnd: HWND, lparam: LPARAM) -> LRESULT {
             return LRESULT(20); // HTCLOSE
         }
         return LRESULT(2); // HTCAPTION
-    }
-    let top = pt.y >= l.sidebar.top && pt.y <= l.sidebar.top + border;
-    if top {
-        return LRESULT(12); // HTTOP
-    }
-    if pt.x < border && pt.y > l.view.top {
-        return LRESULT(10); // HTLEFT
-    }
-    if pt.x > w - border && pt.y > l.view.top {
-        return LRESULT(11); // HTRIGHT
-    }
-    if pt.y > h - border {
-        return LRESULT(15); // HTBOTTOM
     }
     LRESULT(1) // HTCLIENT
 }

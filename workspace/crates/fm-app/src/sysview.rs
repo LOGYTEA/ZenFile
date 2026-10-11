@@ -676,6 +676,30 @@ pub fn selftest() -> Vec<(&'static str, bool, String)> {
         format!("{} 项：{}", tpls.len(), list.join(", ")),
     ));
 
+    // 菜单文本：助记键 `&` 只该吃掉它自己，助记字符要留下（"打开(&O)" → "打开(O)"）。
+    // 早先连 O 一起吞掉，于是右键菜单里每一项都拖着一对空括号 —— "打开()"。
+    let s1 = crate::menu::strip_accel("打开(&O)");
+    out.push((
+        "菜单文本去助记键后括号里不是空的",
+        s1 == "打开(O)",
+        format!("打开(&O) -> {s1}"),
+    ));
+    let s2 = crate::menu::strip_accel("a&&b");
+    out.push((
+        "两个 && 还原成一个真 &",
+        s2 == "a&b",
+        format!("a&&b -> {s2}"),
+    ));
+    // 去重必须认得出 Shell 的"打开(&O)"和我们自己的"打开"是同一条。
+    // 认不出来的话菜单里就会同时出现两个「打开」。
+    let k1 = crate::menu::menu_key("打开(&O)");
+    let k2 = crate::menu::menu_key("打开");
+    out.push((
+        "Shell 条目与自有条目的去重键一致",
+        k1 == k2 && k1 == "打开",
+        format!("{k1} == {k2}"),
+    ));
+
     // 只读扫一次注册表：允许一个 bag 都没有（干净机器 / CI），但不许崩
     let cnt = debug_slot_count();
     out.push((

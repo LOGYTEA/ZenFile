@@ -96,6 +96,113 @@ pub fn home_entries() -> Vec<FileEntry> {
     out
 }
 
+/// 表头下拉里的"按这一列筛选"（资源管理器同款）。
+///
+/// 载荷一律用"桶序号"，菜单里第 0 项是"全部"（= 不筛选），所以
+/// `桶 0` 等价于 `None`。
+#[derive(Clone, Debug, PartialEq)]
+pub enum ColFilter {
+    /// 名称按首字母分桶：0 全部 / 1 `#` / 2 A–H / 3 I–P / 4 Q–T / 5 U–Z / 6 其它
+    Name(usize),
+    /// 修改日期：0 全部 / 1 今天 / 2 昨天 / 3 本周 / 4 本月 / 5 今年 / 6 更早
+    Date(usize),
+    /// 类型：具体某一个类型名
+    Kind(String),
+    /// 大小：0 全部 / 1 空 / 2 极小 / 3 小 / 4 中 / 5 大 / 6 巨大
+    Size(usize),
+}
+
+pub const NAME_BUCKETS: [&str; 7] = ["全部", "#", "A–H", "I–P", "Q–T", "U–Z", "其它"];
+pub const DATE_BUCKETS: [&str; 7] = ["全部", "今天", "昨天", "本周", "本月", "今年", "更早"];
+pub const SIZE_BUCKETS: [&str; 7] = [
+    "全部",
+    "空（0 B）",
+    "极小（< 16 KB）",
+    "小（16 KB – 1 MB）",
+    "中（1 – 128 MB）",
+    "大（128 MB – 1 GB）",
+    "巨大（> 1 GB）",
+];
+
+/// 今天的"日序号"（1970-01-01 = 0）。日期分桶全靠它，没它就得引 chrono。
+fn today_days() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64 / 86400)
+        .unwrap_or(0)
+}
+
+impl ColFilter {
+    /// 这一项是不是通过了筛选。
+    pub fn matches(&self, e: &fm_core::FileEntry) -> bool {
+        match self {
+            ColFilter::Name(b) => {
+                let c = e.name.chars().next().unwrap_or(' ').to_ascii_uppercase();
+                let got = if !c.is_ascii_alphanumeric() {
+                    1
+                } else if c.is_ascii_digit() {
+                    1
+                } else if ('A'..='H').contains(&c) {
+                    2
+                } else if ('I'..='P').contains(&c) {
+                    3
+                } else if ('Q'..='T').contains(&c) {
+                    4
+                } else if ('U'..='Z').contains(&c) {
+                    5
+                } else {
+                    6
+                };
+                *b == 0 || got == *b
+            }
+            ColFilter::Date(b) => {
+                if *b == 0 {
+                    return true;
+                }
+                if e.modified <= 0 {
+                    return *b == 6;
+                }
+                let d = (e.modified / 10_000_000 - 11_644_473_600) / 86400;
+                let today = today_days();
+                // 星期一 = 0，和资源管理器"本周"的口径一致
+                let wd = (today + 3) % 7;
+                let week_start = today - wd;
+                let (y, m, _) = crate::paint::civil_from_days(d);
+                let (ty, tm, _) = crate::paint::civil_from_days(today);
+                match b {
+                    1 => d == today,
+                    2 => d == today - 1,
+                    3 => d >= week_start,
+                    4 => y == ty && m == tm,
+                    5 => y == ty,
+                    _ => d < week_start - 7 && y < ty,
+                }
+            }
+            ColFilter::Kind(k) => e.type_label() == *k,
+            ColFilter::Size(b) => {
+                let s = e.size;
+                let got = match s {
+                    0 => 1,
+                    ..=15_999 => 2,
+                    ..=1_048_575 => 3,
+                    ..=134_217_727 => 4,
+                    ..=1_073_741_823 => 5,
+                    _ => 6,
+                };
+                *b == 0 || got == *b
+            }
+        }
+    }
+
+    /// 菜单上这一组里哪一项是勾上的（`pick_row` 用）。
+    pub fn bucket(&self) -> usize {
+        match self {
+            ColFilter::Name(b) | ColFilter::Date(b) | ColFilter::Size(b) => *b,
+            ColFilter::Kind(_) => usize::MAX,
+        }
+    }
+}
+
 pub struct Tab {
     pub path: PathBuf,
     pub title: String,
@@ -119,6 +226,8 @@ pub struct Tab {
     pub history: Vec<PathBuf>,
     pub history_pos: usize,
     pub filter: String,
+    /// 表头下拉里选的"按列筛选"。`None` = 不筛选。
+    pub col_filter: Option<ColFilter>,
     pub search_root: Option<PathBuf>,
 }
 
@@ -151,6 +260,7 @@ impl Tab {
             history: vec![path],
             history_pos: 0,
             filter: String::new(),
+            col_filter: None,
             search_root: None,
         }
     }
@@ -174,6 +284,12 @@ impl Tab {
 
     pub fn recompute_filter(&mut self, show_hidden: bool, show_system: bool) {
         self.visible = filter_entries(&self.entries, &self.filter, show_hidden, show_system);
+        // 表头下拉里选的"按列筛选"再叠一层：它是"在这一列上只留某一档"，
+        // 和目录栏里的名字过滤是两件事，各自独立生效。
+        if let Some(f) = &self.col_filter {
+            let f = f.clone();
+            self.visible.retain(|&i| self.entries.get(i).map(|e| f.matches(e)).unwrap_or(false));
+        }
         if self.focus_row >= self.visible.len() {
             self.focus_row = self.visible.len().saturating_sub(1);
         }
@@ -287,6 +403,18 @@ pub struct App {
     pub hover_row: Option<usize>,
     /// 鼠标是不是悬在导航窗格右上角的折叠按钮上。
     pub hover_sidebar_collapse: bool,
+    /// 工具栏左上三个导航按钮的悬停位：0=无，1=返回，2=前进，3=向上。
+    ///
+    /// 这三个按钮以前只有"可用/不可用"两种字色，鼠标移上去毫无反馈，
+    /// 看着像三个图标而不是三个按钮。
+    pub hover_nav: u8,
+    /// 鼠标悬在表头的哪一列上（用于画"筛选"小箭头）。
+    pub hover_header: Option<usize>,
+    /// 已被"剪切"的那些条目的路径（小写）。
+    ///
+    /// 资源管理器里剪切过的东西在原地是**虚掉**的：它已经不在原来的位置上了，
+    /// 只是还没落下去。不画这一层，剪切和复制在界面上长得一模一样。
+    pub cut_set: HashSet<String>,
     /// 导航窗格的滚动偏移（像素）。树比窗格长时才非 0。
     pub sidebar_scroll: i32,
     /// 焦点行要不要**画**出来。
@@ -332,6 +460,9 @@ pub struct App {
     /// 回收站枚举的世代号。切走又切回来时，上一趟的迟到结果要丢掉，
     /// 否则会把别的视图的显示数据顶掉。
     pub recycle_gen: u64,
+    /// 回收站的排序：`(列序号, 是否降序)`。列序号同 `recycle_columns`：
+    /// 0=名称 1=原位置 2=删除时间 3=大小。点列头就切这一列，再点一次换方向。
+    pub recycle_sort: (usize, bool),
     /// 鼠标悬停的回收站条目下标（`recycle_items` 的下标）。
     pub hover_recycle: Option<usize>,
     /// 回收站顶部三个按钮的悬停位：0=无，1=还原，2=彻底删除，3=清空回收站。
@@ -688,6 +819,9 @@ impl App {
             sidebar_hover: None,
             hover_row: None,
             hover_sidebar_collapse: false,
+            hover_nav: 0,
+            hover_header: None,
+            cut_set: HashSet::new(),
             sidebar_scroll: 0,
             display_names: HashMap::new(),
             focus_visible: false,
@@ -702,6 +836,7 @@ impl App {
             recycle_sel: HashSet::new(),
             recycle_rx: None,
             recycle_gen: 0,
+            recycle_sort: (2, true),
             hover_recycle: None,
             hover_recycle_btn: 0,
             settings_hover: None,
@@ -1468,6 +1603,25 @@ impl App {
         self.invalidate();
     }
 
+    /// 表头右键：直接按某一列排序并给定方向（列与方向一次到位）。
+    /// `sem` 是 `paint::header_col_semantic` 的语义列号。
+    pub fn header_sort(&mut self, sem: u8, descending: bool) {
+        let key = match sem {
+            0 => SortKey::Name,
+            1 => SortKey::Modified,
+            2 => SortKey::Type,
+            _ => SortKey::Size,
+        };
+        let (show_hidden, show_system) = (self.show_hidden, self.show_system);
+        let tab = self.tab_mut();
+        tab.sort.key = key;
+        tab.sort.descending = descending;
+        tab.sort.sort(&mut tab.entries);
+        tab.recompute_filter(show_hidden, show_system);
+        tab.scroll = 0;
+        self.invalidate();
+    }
+
     /// 只改排序方向，排序列保持不变。
     pub fn set_sort_direction(&mut self, descending: bool) {
         let (show_hidden, show_system) = (self.show_hidden, self.show_system);
@@ -1728,7 +1882,15 @@ impl App {
         }
         if let Err(e) = clipboard::set_files(&items, mode, self.hwnd.0 as isize) {
             report(self.hwnd, &format!("剪贴板写入失败：{e}"));
+            return;
         }
+        // 剪切的条目要在原地虚掉（见 `cut_set`）；复制的不动。
+        // 这一份清单只服务于视觉 —— 真正的"拿走什么"在剪贴板里。
+        self.cut_set = match mode {
+            ClipMode::Move => items.iter().map(|p| p.to_string_lossy().to_lowercase()).collect(),
+            ClipMode::Copy => HashSet::new(),
+        };
+        self.invalidate();
     }
 
     pub fn paste(&mut self) {
@@ -1744,6 +1906,8 @@ impl App {
                     return;
                 }
                 let label = if mode == ClipMode::Move { "粘贴（移动）" } else { "粘贴（复制）" };
+                // 东西已经落下去了，原处那层"虚化"必须跟着撤掉
+                self.cut_set.clear();
                 if self.fast_mode || self.cfg.files.operations.fast_mode {
                     self.transfer = Some(transfer_async(
                         if mode == ClipMode::Move { TransferKind::Move } else { TransferKind::Copy },
@@ -1900,7 +2064,7 @@ impl App {
         }
         if done {
             // 分批到达时每批内部有序、批与批之间没有，最后统一排一次
-            self.recycle_items.sort_by(|a, b| b.deleted.cmp(&a.deleted));
+            self.sort_recycle_items();
             let tab = self.tab_mut();
             tab.generation += 1;
             tab.entries.clear();
@@ -1909,6 +2073,46 @@ impl App {
         } else {
             self.recycle_rx = Some(rx);
         }
+    }
+
+    /// 按当前 `recycle_sort` 重排回收站条目。
+    fn sort_recycle_items(&mut self) {
+        let (col, desc) = self.recycle_sort;
+        self.recycle_items.sort_by(|a, b| {
+            let ord = match col {
+                0 => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                1 => a.original.to_string_lossy().to_lowercase().cmp(&b.original.to_string_lossy().to_lowercase()),
+                2 => a.deleted.cmp(&b.deleted),
+                _ => a.size.cmp(&b.size),
+            };
+            if desc { ord.reverse() } else { ord }
+        });
+    }
+
+    /// 点回收站列头：切到这一列；再点一次换方向。
+    pub fn sort_recycle_by(&mut self, col: usize) {
+        if self.recycle_sort.0 == col {
+            self.recycle_sort.1 = !self.recycle_sort.1;
+        } else {
+            // 新列默认方向：时间/大小从大到小更符合"先看最近的"，其余升序
+            self.recycle_sort = (col, matches!(col, 2 | 3));
+        }
+        self.sort_recycle_items();
+        self.invalidate();
+    }
+
+    /// 设置/清除"按列筛选"，并立刻重算可见项。
+    pub fn set_col_filter(&mut self, f: Option<ColFilter>) {
+        self.tab_mut().col_filter = f;
+        let (hidden, system) = (self.show_hidden, self.show_system);
+        if self.tab().search_root.is_some() {
+            self.tab_mut().recompute_visibility(hidden, system);
+        } else {
+            self.tab_mut().recompute_filter(hidden, system);
+        }
+        self.tab_mut().scroll = 0;
+        self.focus_visible = false;
+        self.invalidate();
     }
 
     /// 拖拽落地：把 `items` 放进 `dest`。
@@ -1998,8 +2202,8 @@ impl App {
             let mut system = menu::entries_from_bridge(bridge);
             // 去掉与自有条目重名的一级项：Shell 菜单里也有"打开/剪切/复制/重命名/
             // 删除/属性"，全列出来就是两个"打开"，看着像 bug。
-            let owned: Vec<String> = entries.iter().map(|e| menu::strip_accel(&e.text)).collect();
-            system.retain(|e| !owned.iter().any(|o| *o == menu::strip_accel(&e.text)));
+            let owned: Vec<String> = entries.iter().map(|e| menu::menu_key(&e.text)).collect();
+            system.retain(|e| !owned.iter().any(|o| *o == menu::menu_key(&e.text)));
             if !system.is_empty() {
                 entries.push(menu::MenuEntry::sep());
                 entries.extend(system);
@@ -2020,6 +2224,7 @@ impl App {
             self.metrics.scale,
             self.theme,
             None, // 顶层菜单：没有父级菜单窗口
+            false, // 右键弹出：不存在"同一次点击的抬起"
         ) {
             self.menu_hwnd = Some(hwnd_menu);
         }
@@ -2047,6 +2252,7 @@ impl App {
             self.metrics.scale,
             self.theme,
             None,
+            false,
         ) {
             self.menu_hwnd = Some(h);
         }
@@ -2174,6 +2380,23 @@ impl App {
             Command::ToggleSystem => self.toggle_system(),
             Command::ToggleExtensions => self.toggle_extensions(),
             Command::CycleSizeUnit => self.cycle_size_unit(),
+            Command::SetSizeUnitIdx(i) => self.set_size_unit(i),
+            Command::SetThemeDark(dark) => self.set_theme(dark),
+            Command::SetDefaultViewIdx(i) => self.set_default_view(i),
+            Command::ColFilter(col, bucket) => self.set_col_filter(if bucket == 0 {
+                None
+            } else {
+                match col {
+                    0 => Some(ColFilter::Name(bucket)),
+                    1 => Some(ColFilter::Date(bucket)),
+                    3 => Some(ColFilter::Size(bucket)),
+                    _ => None,
+                }
+            }),
+            Command::HeaderSort(sem, desc) => self.header_sort(sem, desc),
+            Command::ColFilterKind(k) => {
+                self.set_col_filter(if k.is_empty() { None } else { Some(ColFilter::Kind(k)) })
+            }
             Command::CycleTheme => self.cycle_theme(),
             Command::CycleDefaultView => self.cycle_default_view(),
             Command::OpenSettings => self.open_settings(),
@@ -2260,6 +2483,34 @@ impl App {
     }
 
     /// 切换"大小"列的默认单位：自动 → B → KB → MB → GB → TB → PB 循环。
+    /// 设置页下拉里**直接选中**某一档（不再"点一下循环到下一个"）。
+    ///
+    /// 循环切换在只有两三个选项时还能用，选项一多（大小单位 7 档）就得连点
+    /// 好几下才能到想要的那一档，而且不知道点下去会变成什么。下拉菜单一次看全。
+    pub fn set_size_unit(&mut self, idx: usize) {
+        let u = fm_core::SizeUnit::ALL.get(idx).copied().unwrap_or(fm_core::SizeUnit::Auto);
+        self.cfg.files.view.size_unit = u.name().to_string();
+        self.persist_view_pref();
+        self.invalidate();
+    }
+
+    pub fn set_theme(&mut self, dark: bool) {
+        let next = if dark { "dark" } else { "light" };
+        self.cfg.core.theme = next.to_string();
+        self.theme = if dark { theme::dark() } else { theme::light() };
+        let _ = fm_core::config::Config::save_user_patch(&serde_json::json!({
+            "core": { "theme": next }
+        }));
+        self.invalidate();
+    }
+
+    pub fn set_default_view(&mut self, idx: usize) {
+        let next = DEFAULT_VIEW_CYCLE.get(idx).copied().unwrap_or("system");
+        self.cfg.files.view.default_mode = next.to_string();
+        self.persist_view_pref();
+        self.invalidate();
+    }
+
     pub fn cycle_size_unit(&mut self) {
         let cur = fm_core::SizeUnit::parse(&self.cfg.files.view.size_unit);
         let i = fm_core::SizeUnit::ALL.iter().position(|u| *u == cur).unwrap_or(0);
@@ -2465,6 +2716,11 @@ impl App {
             self.metrics.scale,
             self.theme,
             None, // 顶层菜单：没有父级菜单窗口
+            // **不能**吞抬起：这个菜单是在宿主的 `WM_LBUTTONUP` 里弹出来的，
+            // 那一次抬起已经处理完了，之后收到的第一个 up 就是用户真正的点击。
+            // 设成 true 的话菜单会把用户第一次点击整个吞掉 —— 表现是「更多」
+            // 菜单弹出来之后怎么点都没反应（实测点「设置」毫无动静）。
+            false,
         ) {
             self.menu_hwnd = Some(hwnd_menu);
         }
@@ -2713,9 +2969,27 @@ impl App {
     /// 渲染与命中测试共用这一份排列：不存在"看得见却点不到"的行。
     pub fn sidebar_rows(&mut self) -> Vec<SidebarRow> {
         let mut rows = Vec::new();
-        // 第一项就是"此电脑"（资源管理器没有单独的"主页"入口：主页那一格
-        // 是"主页"，但点开后落在快速访问；这里按用户要求直接并到"此电脑"，
-        // 少一层只会更快到盘符）。展开 = 本机全部驱动器（含 U 盘、光驱）。
+        // 顺序按用户要的来：**常用文件夹在最上面**，然后是"此电脑 + 盘符"，
+        // 回收站垫底。之前"此电脑"排第一，于是每次开软件第一眼看到的是盘符，
+        // 而真正高频的桌面/下载被挤到中间去了。
+        for (label, path) in user_folders() {
+            rows.push(SidebarRow {
+                label: label.to_string(),
+                target: path.clone(),
+                depth: 0,
+                expandable: false,
+                expanded: false,
+                key: String::new(),
+                icon: SidebarIcon::Path(PathBuf::from(path)),
+                guides: Vec::new(),
+                last_child: false,
+                has_parent: false,
+                spacer: false,
+            });
+        }
+        // 常用文件夹与"此电脑"这一组之间留一格
+        rows.push(SidebarRow::spacer());
+        // "此电脑"：展开 = 本机全部驱动器（含 U 盘、光驱）。
         let thispc = self.is_expanded(SIDEBAR_THISPC);
         rows.push(SidebarRow {
             label: "此电脑".to_string(),
@@ -2763,24 +3037,7 @@ impl App {
                 }
             }
         }
-        // "此电脑 + 盘符"这一组和常用文件夹之间留一格
-        rows.push(SidebarRow::spacer());
-        for (label, path) in user_folders() {
-            rows.push(SidebarRow {
-                label: label.to_string(),
-                target: path.clone(),
-                depth: 0,
-                expandable: false,
-                expanded: false,
-                key: String::new(),
-                icon: SidebarIcon::Path(PathBuf::from(path)),
-                guides: Vec::new(),
-                last_child: false,
-                has_parent: false,
-                spacer: false,
-            });
-        }
-        // 常用文件夹和回收站之间同样留一格
+        // "此电脑 + 盘符"这一组和回收站之间同样留一格
         rows.push(SidebarRow::spacer());
 
         // 回收站：空 / 满用不同的系统库存图标，和资源管理器一样一眼能分辨
@@ -2967,7 +3224,7 @@ pub fn shell_row(text: &str, glyph: Option<&'static str>, cmd: Command) -> menu:
 /// 之前用 `● 名称` 的圆点标记，两处别扭：圆点挤在文字前面让同级项对不齐，
 /// 而且它和"鼠标正悬停"的反馈完全是两套语言。改成 `selected`：渲染层会在行首
 /// 画一条**橙色竖线**，形状与悬停高亮一致、颜色区分开。
-fn pick_row(text: &str, cmd: Command, on: bool) -> menu::MenuEntry {
+pub fn pick_row(text: &str, cmd: Command, on: bool) -> menu::MenuEntry {
     let mut r = shell_row(text, None, cmd);
     r.selected = on;
     r
@@ -3057,7 +3314,7 @@ fn new_rows() -> Vec<menu::MenuEntry> {
 
 /// 带下级菜单的条目。资源管理器的右键菜单本来就是分层的（新建/查看/排序方式都有
 /// 下拉），做成平铺会把"悬停展开"这条交互整个丢掉。
-fn submenu_row(text: &str, glyph: Option<&'static str>, children: Vec<menu::MenuEntry>) -> menu::MenuEntry {
+pub fn submenu_row(text: &str, glyph: Option<&'static str>, children: Vec<menu::MenuEntry>) -> menu::MenuEntry {
     menu::MenuEntry {
         text: text.to_string(),
         glyph,
@@ -3148,7 +3405,7 @@ fn dedupe_rows(rows: Vec<menu::MenuEntry>) -> Vec<menu::MenuEntry> {
             out.push(e);
             continue;
         }
-        let key = menu::strip_accel(&e.text).trim().to_lowercase();
+        let key = menu::menu_key(&e.text);
         if seen.contains(&key) {
             continue;
         }
@@ -3250,7 +3507,7 @@ fn view_name(m: ViewMode) -> &'static str {
 }
 
 /// 设置页"默认视图"这一行的循环次序。`system` = 跟随资源管理器。
-const DEFAULT_VIEW_CYCLE: [&str; 5] = ["system", "details", "list", "medium", "large"];
+pub const DEFAULT_VIEW_CYCLE: [&str; 5] = ["system", "details", "list", "medium", "large"];
 
 pub fn default_view_label(s: &str) -> &'static str {
     match s {
