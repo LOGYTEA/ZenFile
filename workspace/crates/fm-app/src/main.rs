@@ -16,6 +16,7 @@ mod openwith;
 mod rename;
 mod paint;
 mod props;
+mod sysview;
 mod theme;
 
 use std::path::PathBuf;
@@ -57,13 +58,36 @@ const TIMER_DRAIN: usize = 1;
 const TIMER_BUSY: usize = 2;
 const HOTKEY_MAIN: i32 = 1;
 
+/// fm-app 自己的自检项（`fm-core::selftest` 碰不到 UI 层这边的模块）。
+fn app_selftest() -> i32 {
+    let cases = crate::sysview::selftest();
+    let mut pass = 0usize;
+    println!("\n—— fm-app 附加自检 ——");
+    for (name, ok, detail) in &cases {
+        if *ok {
+            pass += 1;
+            if detail.is_empty() {
+                println!("  [OK]   {name}");
+            } else {
+                println!("  [OK]   {name} — {detail}");
+            }
+        } else {
+            println!("  [FAIL] {name} — {detail}");
+        }
+    }
+    println!("通过 {}/{} 项", pass, cases.len());
+    if pass == cases.len() { 0 } else { 1 }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if args.iter().any(|a| a == "--selftest" || a == "--self-test") {
         // Windows 子系统下 CRT 的 stdout 是空的，先把父进程的控制台挂回来
         unsafe { attach_console() };
-        std::process::exit(fm_core::selftest::run());
+        let rc = fm_core::selftest::run();
+        let rc2 = app_selftest();
+        std::process::exit(if rc != 0 || rc2 != 0 { 1 } else { 0 });
     }
     if args.iter().any(|a| a == "--version") {
         unsafe { attach_console() };
@@ -585,6 +609,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             } else {
                 None
             };
+            let hover_collapse = app.cfg.ui.sidebar_visible
+                && paint::sidebar_collapse_hit(&l, app.metrics.scale, x, y);
             // 地址栏面包屑悬停：只在非编辑态、且光标确实落在地址框里时算
             let hover_addr = if !app.addr_editing && inside(&l.address, x, y) {
                 let bar = paint::address_bar(app, &l);
@@ -600,7 +626,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 || hover_sidebar != app.sidebar_hover
                 || hover_addr != app.addr_hover
                 || hover_split != app.hover_split
+                || hover_collapse != app.hover_sidebar_collapse
             {
+                app.hover_sidebar_collapse = hover_collapse;
                 app.hover_split = hover_split;
                 app.hovering_close = in_close;
                 app.hover_chrome = chrome;
@@ -796,6 +824,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             if inside(&l.up, x, y) {
                 app.go_up();
                 paint::sync_address(app);
+                return LRESULT(0);
+            }
+            // 导航窗格右上角的折叠按钮：压在首行之上那条预留带里，先判它
+            if app.cfg.ui.sidebar_visible && paint::sidebar_collapse_hit(&l, app.metrics.scale, x, y) {
+                app.toggle_sidebar();
+                let _ = InvalidateRect(Some(hwnd), None, true);
                 return LRESULT(0);
             }
             if app.cfg.ui.sidebar_visible && x < l.sidebar.right && y > l.sidebar.top {
@@ -1450,17 +1484,20 @@ fn header_click(app: &mut App, l: &paint::Layout, x: i32) {
         (("类型"), fm_core::SortKey::Type),
         (("大小"), fm_core::SortKey::Size),
     ];
-    // 列宽与 paint_view 同源，否则点击命中的列和看到的列错位
+    // 列宽与 paint_view 同源（用户拖过的宽度也在这里生效），
+    // 否则点击命中的列和看到的列错位
+    let w = app.col_widths();
+    let widths = [
+        (w[0] as f32 * app.metrics.scale) as i32,
+        (w[1] as f32 * app.metrics.scale) as i32,
+        (w[2] as f32 * app.metrics.scale) as i32,
+        (w[3] as f32 * app.metrics.scale) as i32,
+    ];
     let mut cursor = l.view.left;
-    for (_, key) in columns {
-        let width = match key {
-            fm_core::SortKey::Name => (274.0 * app.metrics.scale) as i32,
-            fm_core::SortKey::Modified => (144.0 * app.metrics.scale) as i32,
-            fm_core::SortKey::Type => (120.0 * app.metrics.scale) as i32,
-            fm_core::SortKey::Size => (80.0 * app.metrics.scale) as i32,
-        };
+    for (i, (_, key)) in columns.iter().enumerate() {
+        let width = widths[i];
         if x >= cursor && x < cursor + width {
-            app.sort_column(key);
+            app.sort_column(*key);
             return;
         }
         cursor += width;
@@ -1509,8 +1546,10 @@ fn handle_key(app: &mut App, key: i32) {
         _ if ctrl && !shift && key == 0x41 => app.select_all(),
         _ if ctrl && key == 0x43 => app.clipboard_write(fm_core::clipboard::ClipMode::Copy),
         _ if ctrl && key == 0x58 => app.clipboard_write(fm_core::clipboard::ClipMode::Move),
-        _ if ctrl && key == 0x56 => app.paste(),
-        _ if ctrl && key == 0x46 => paint::focus_edit(app.hwnd_search),
+        // 必须带 !shift：否则 Ctrl+Shift+V（循环视图）会被这一条截胡 ——
+        // match 是按书写顺序匹配的，粘贴排在前面就永远轮不到下面那行。
+        _ if ctrl && !shift && key == 0x56 => app.paste(),
+        _ if ctrl && !shift && key == 0x46 => paint::focus_edit(app.hwnd_search),
         // Ctrl+L / F4 / Alt+D：地址栏。Win11 下这三个键都是"切到可输入的地址栏"，
         // 所以不能只 focus 那个平时藏着的 EDIT，得先把它显示出来。
         _ if ctrl && key == 0x4C => paint::begin_address_edit(app),

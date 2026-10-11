@@ -360,6 +360,7 @@ fn make_edit(parent: HWND, id: u16, r: &RECT, text: &str, scale: f32) -> HWND {
         let _ = SetWindowLongPtrW(h, GWLP_USERDATA, parent.0 as isize);
         EDIT_OLD = SetWindowLongPtrW(h, GWLP_WNDPROC, (edit_proc as *const ()) as isize);
         crate::paint::set_edit_font(h, scale);
+        crate::paint::set_edit_margins(h, scale, 6, 6);
         h
     }
 }

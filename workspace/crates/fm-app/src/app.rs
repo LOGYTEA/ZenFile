@@ -124,7 +124,7 @@ pub struct Tab {
 impl Tab {
     pub fn new(path: PathBuf) -> Self {
         let title = if is_home_path(&path) {
-            "主页".to_string()
+            "此电脑".to_string()
         } else if is_recycle_path(&path) {
             "回收站".to_string()
         } else if is_settings_path(&path) {
@@ -271,6 +271,8 @@ pub struct App {
     pub sidebar_children: HashMap<String, Vec<PathBuf>>,
     /// 鼠标悬停的导航行下标（用于 hover 反馈）。
     pub sidebar_hover: Option<usize>,
+    /// 鼠标是不是悬在导航窗格右上角的折叠按钮上。
+    pub hover_sidebar_collapse: bool,
     /// 导航窗格的滚动偏移（像素）。树比窗格长时才非 0。
     pub sidebar_scroll: i32,
     /// 焦点行要不要**画**出来。
@@ -335,6 +337,12 @@ pub struct App {
     pub drag_split: Option<SplitDrag>,
     /// 鼠标正悬停在哪条分隔线上（只为了把光标换成左右箭头）。
     pub hover_split: Option<Split>,
+    /// 用户在 ZenFile 里手动改过的视图：路径(小写,无尾斜杠) -> 视图。
+    ///
+    /// 优先级高于资源管理器那套 bag。原因很实在：bag 只有在资源管理器
+    /// **去过**这个文件夹时才存在，写不进去的时候（没去过 / 解析不出节点）
+    /// 至少本进程里来回切换不该被默认值吃掉。
+    pub view_overrides: HashMap<String, ViewMode>,
 }
 
 /// 哪一条分隔线。
@@ -600,6 +608,7 @@ impl App {
             sidebar_expanded: HashSet::new(),
             sidebar_children: HashMap::new(),
             sidebar_hover: None,
+            hover_sidebar_collapse: false,
             sidebar_scroll: 0,
             display_names: HashMap::new(),
             focus_visible: false,
@@ -624,6 +633,7 @@ impl App {
             hover_split: None,
             drag: None,
             drop_target: None,
+            view_overrides: HashMap::new(),
         }
     }
 
@@ -687,8 +697,16 @@ impl App {
                 self.sidebar_expanded.insert(SIDEBAR_THISPC.to_string());
             }
         }
-        let mut tab = Tab::new(path);
+        let mut tab = Tab::new(path.clone());
         tab.view_mode = parse_view(&self.cfg.files.view.default_mode);
+        // 同上：新标签也要按"这个文件夹自己的视图"来
+        if self.cfg.files.view.default_mode == "system" {
+            if let Some(m) = self.view_overrides.get(&norm_key(&path)).copied() {
+                tab.view_mode = m;
+            } else if let Some(m) = crate::sysview::system_view(&path) {
+                tab.view_mode = m;
+            }
+        }
         tab.sort = SortSpec { key: parse_sort(&self.cfg.files.view.sort_key), descending: self.cfg.files.view.sort_descending };
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
@@ -728,7 +746,7 @@ impl App {
         // 标签标题也走本地化显示名：资源管理器里 `C:\Users` 的标签写的是"用户"，
         // 直接显示盘上真名会让人对不上号。
         let title = if is_home_path(&path) {
-            "主页".to_string()
+            "此电脑".to_string()
         } else if is_recycle_path(&path) {
             "回收站".to_string()
         } else if is_settings_path(&path) {
@@ -767,6 +785,9 @@ impl App {
         // 漏一个就表现为"点了面包屑看着没反应"（其实目录已经切了，只是地址栏
         // 还写着旧路径）。刷新放在导航里，调用方就不可能忘。
         crate::paint::sync_address(self);
+        // 视图要在这个目录上重新定一次：资源管理器就是"每个文件夹各记一套"，
+        // 从大图标的文件夹走进详细信息文件夹，视图跟着变才是对的。
+        self.apply_view_for(&path);
         self.reload();
         self.invalidate();
     }
@@ -805,7 +826,7 @@ impl App {
         tab.home = is_home_path(target);
         tab.path = target.to_path_buf();
         tab.title = if tab.home {
-            "主页".to_string()
+            "此电脑".to_string()
         } else {
             display_title(target)
         };
@@ -815,6 +836,8 @@ impl App {
         tab.filter.clear();
         self.pending_select = select;
         self.focus_visible = false;
+        // 前进/后退也是换目录，视图同样要按目标文件夹重定一次
+        self.apply_view_for(target);
         self.reload();
         self.try_pending_select();
         self.invalidate();
@@ -1381,15 +1404,36 @@ impl App {
     }
 
     pub fn cycle_view(&mut self) {
-        let tab = self.tab_mut();
-        tab.view_mode = tab.view_mode.next();
+        let next = self.tab().view_mode.next();
+        self.set_view(next);
+    }
+
+    /// 直接切到指定视图（Ctrl+1..4 / 右键"查看" / 设置页）。
+    ///
+    /// 改完要**回写给资源管理器**（尽力而为，见 `sysview`）：用户在 ZenFile 里
+    /// 把某文件夹切成大图标，回到资源管理器里打开它也应该还是大图标。
+    pub fn set_view(&mut self, mode: ViewMode) {
+        let path = self.tab().path.clone();
+        self.tab_mut().view_mode = mode;
+        // 记进内存覆盖表：bag 可能写不进去（资源管理器从没去过这个文件夹），
+        // 那样至少在本进程里来回切换不该被默认值吃掉。
+        self.view_overrides.insert(norm_key(&path), mode);
+        crate::sysview::write_system_view(&path, mode);
         self.invalidate();
     }
 
-    /// 直接切到指定视图（Ctrl+1..4）
-    pub fn set_view(&mut self, mode: ViewMode) {
+    /// 进目录时决定用哪种视图：
+    ///   1. 本进程里手动改过的（最高优先级）
+    ///   2. 资源管理器给这个文件夹记的（default_mode=system 时）
+    ///   3. 配置里的默认视图
+    pub fn apply_view_for(&mut self, path: &Path) {
+        let key = norm_key(path);
+        let mut mode = self.view_overrides.get(&key).copied();
+        if mode.is_none() && self.cfg.files.view.default_mode == "system" {
+            mode = crate::sysview::system_view(path);
+        }
+        let mode = mode.unwrap_or_else(|| parse_view(&self.cfg.files.view.default_mode));
         self.tab_mut().view_mode = mode;
-        self.invalidate();
     }
 
     /// 标签页循环切换（Ctrl+Tab / Ctrl+Shift+Tab）
@@ -1918,9 +1962,13 @@ impl App {
     }
 
     /// 切换默认视图模式（设置页用）。
+    ///
+    /// 注意存的是**配置名**（`details`/`system`…）而不是中文标签 —— 早先存标签
+    /// 进去，`parse_view` 认不出来，于是每次循环都退回"详细信息"，看着像点了没反应。
     pub fn cycle_default_view(&mut self) {
-        let cur = parse_view(&self.cfg.files.view.default_mode);
-        self.cfg.files.view.default_mode = cur.next().label().to_string();
+        let cur = self.cfg.files.view.default_mode.as_str();
+        let i = DEFAULT_VIEW_CYCLE.iter().position(|s| *s == cur).unwrap_or(0);
+        self.cfg.files.view.default_mode = DEFAULT_VIEW_CYCLE[(i + 1) % DEFAULT_VIEW_CYCLE.len()].to_string();
         self.persist_view_pref();
         self.invalidate();
     }
@@ -2379,14 +2427,18 @@ impl App {
     /// 渲染与命中测试共用这一份排列：不存在"看得见却点不到"的行。
     pub fn sidebar_rows(&mut self) -> Vec<SidebarRow> {
         let mut rows = Vec::new();
+        // 第一项就是"此电脑"（资源管理器没有单独的"主页"入口：主页那一格
+        // 是"主页"，但点开后落在快速访问；这里按用户要求直接并到"此电脑"，
+        // 少一层只会更快到盘符）。展开 = 本机全部驱动器（含 U 盘、光驱）。
+        let thispc = self.is_expanded(SIDEBAR_THISPC);
         rows.push(SidebarRow {
-            label: "主页".to_string(),
+            label: "此电脑".to_string(),
             target: HOME_PATH.to_string(),
             depth: 0,
-            expandable: false,
-            expanded: false,
-            key: String::new(),
-            icon: SidebarIcon::Glyph("\u{E80F}"),
+            expandable: true,
+            expanded: thispc,
+            key: SIDEBAR_THISPC.to_string(),
+            icon: SidebarIcon::Stock(windows::Win32::UI::Shell::SIID_DESKTOPPC.0),
         });
         for (label, path) in user_folders() {
             rows.push(SidebarRow {
@@ -2400,17 +2452,6 @@ impl App {
             });
         }
 
-        // 此电脑：展开就是本机全部驱动器（含 U 盘、光驱、网络盘）
-        let thispc = self.is_expanded(SIDEBAR_THISPC);
-        rows.push(SidebarRow {
-            label: "此电脑".to_string(),
-            target: HOME_PATH.to_string(),
-            depth: 0,
-            expandable: true,
-            expanded: thispc,
-            key: SIDEBAR_THISPC.to_string(),
-            icon: SidebarIcon::Glyph("\u{F158}"),
-        });
         if thispc {
             let mut all: Vec<_> = self.drives.values().cloned().collect();
             all.sort_by(|a, b| a.letter.cmp(&b.letter));
@@ -2516,7 +2557,7 @@ impl App {
             )
         };
         if home {
-            return vec![Crumb { label: "主页".into(), target: None, ellipsis: false }];
+            return vec![Crumb { label: "此电脑".into(), target: None, ellipsis: false }];
         }
         if recycle {
             return vec![Crumb { label: "回收站".into(), target: None, ellipsis: false }];
@@ -2745,6 +2786,36 @@ fn parse_view(s: &str) -> ViewMode {
         "medium" | "medium_icons" => ViewMode::MediumIcons,
         "large" | "large_icons" => ViewMode::LargeIcons,
         _ => ViewMode::Details,
+    }
+}
+
+/// 归一化成"视图覆盖表"的键：小写、去掉 `\\?\`、去掉尾斜杠。
+fn norm_key(p: &Path) -> String {
+    let s = fm_core::paths::strip_verbatim(p).to_string_lossy().replace('/', "\\");
+    let s = s.trim_end_matches('\\').to_lowercase();
+    s.to_string()
+}
+
+/// 视图模式 -> 配置文件里存的名字（`default_mode`）。
+fn view_name(m: ViewMode) -> &'static str {
+    match m {
+        ViewMode::Details => "details",
+        ViewMode::List => "list",
+        ViewMode::MediumIcons => "medium",
+        ViewMode::LargeIcons => "large",
+    }
+}
+
+/// 设置页"默认视图"这一行的循环次序。`system` = 跟随资源管理器。
+const DEFAULT_VIEW_CYCLE: [&str; 5] = ["system", "details", "list", "medium", "large"];
+
+pub fn default_view_label(s: &str) -> &'static str {
+    match s {
+        "details" => "详细信息",
+        "list" => "列表",
+        "medium" => "中等图标",
+        "large" => "大图标",
+        _ => "跟随系统",
     }
 }
 

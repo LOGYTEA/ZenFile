@@ -45,7 +45,7 @@
   },
   "files": {
     "view": {
-      "default_mode": "details",
+      "default_mode": "system",
       "show_hidden": false,
       "show_system": false,
       "show_extensions": true,
