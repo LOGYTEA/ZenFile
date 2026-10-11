@@ -218,12 +218,14 @@ pub fn run() -> i32 {
     );
 
     // 13. 回收站：能枚举到条目就至少要保证条目自身可解析（$I/$R 成对）
+    let t0 = std::time::Instant::now();
     let items = crate::recycle::list();
+    let listed_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let paired = items.iter().all(|i| i.r_path.exists() && i.i_path.exists());
     h.check(
         "recycle::list",
         items.iter().all(|i| !i.name.is_empty()) && paired,
-        &format!("{} 项，$I/$R 均成对", items.len()),
+        &format!("{} 项，$I/$R 均成对，枚举 {:.0} ms", items.len(), listed_ms),
     );
 
     // 14. 驱动器清单：类型、卷标、容量必须能从 Win32 一路读出来
