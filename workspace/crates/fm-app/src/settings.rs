@@ -38,6 +38,72 @@ pub const UI_PART_GLYPHS: [&str; 9] = [
 /// 固定组件：不允许拖进「更多」（没有它们这个窗口就不成立了）。
 pub const UI_PART_FIXED: [bool; 9] = [true, false, false, false, false, false, true, false, false];
 
+// ---------------------------------------------------------------- 组件表
+//
+// 「界面」页不再是"卡片列表"，而是**这个软件窗口的实时预览**，组件按长短
+// 分三条带围在预览四周：
+//   · 上面：文字只有几个字的**小组件**（按钮）—— 新建 / 剪切 / 复制 / 标签…
+//   · 右边：长一点的 —— 侧栏那些横条、地址栏、详情页属性行
+//   · 最下面：**最长的整条** —— 标题栏 / 工具栏 / 状态栏
+// 三条整条里装的东西就是"组件里的子组件"，能拖进来、拖出去、拖着换位置，
+// 中间的预览当场跟着变。
+
+pub struct Widget {
+    pub name: &'static str,
+    pub glyph: &'static str,
+    /// 自然宽度（DIP）
+    pub w: f32,
+    /// 0 = 从左往右排；1 = 靠右排（最小化 / 最大化 / 关闭这类）
+    pub align: u8,
+    /// false = 短组件（画成按钮）；true = 长组件（画成横条）
+    pub long: bool,
+}
+
+const fn wg(name: &'static str, glyph: &'static str, wd: f32, align: u8, long: bool) -> Widget {
+    Widget { name, glyph, w: wd, align, long }
+}
+
+pub const WIDGETS: [Widget; 26] = [
+    wg("标签", "\u{E8A7}", 56.0, 0, false),
+    wg("新建标签", "\u{E710}", 26.0, 0, false),
+    wg("最小化", "\u{E921}", 24.0, 1, false),
+    wg("最大化", "\u{E922}", 24.0, 1, false),
+    wg("关闭", "\u{E8BB}", 24.0, 1, false),
+    wg("返回", "\u{E72B}", 26.0, 0, false),
+    wg("前进", "\u{E72A}", 26.0, 0, false),
+    wg("上级", "\u{E7BA}", 26.0, 0, false),
+    wg("新建", "\u{E8F4}", 56.0, 0, false),
+    wg("剪切", "\u{E8C6}", 56.0, 0, false),
+    wg("复制", "\u{E8C8}", 56.0, 0, false),
+    wg("粘贴", "\u{E77F}", 56.0, 0, false),
+    wg("重命名", "\u{E8AC}", 56.0, 0, false),
+    wg("删除", "\u{E74D}", 44.0, 0, false),
+    wg("视图", "\u{E7B3}", 56.0, 0, false),
+    wg("排序", "\u{E8CB}", 56.0, 0, false),
+    wg("更多", "\u{E712}", 26.0, 0, false),
+    wg("地址面包屑", "\u{E8B7}", 46.0, 0, true),
+    wg("地址输入框", "\u{E8B7}", 120.0, 0, true),
+    wg("搜索框", "\u{E721}", 120.0, 0, true),
+    wg("侧栏分组标题", "\u{E8B7}", 120.0, 0, true),
+    wg("侧栏条目", "\u{E8B7}", 120.0, 0, true),
+    wg("详情属性行", "\u{E9E9}", 120.0, 0, true),
+    wg("项目数", "\u{E75B}", 56.0, 0, true),
+    wg("已选大小", "\u{E762}", 64.0, 0, true),
+    wg("容量条", "\u{E7F1}", 96.0, 0, true),
+];
+
+/// 最下面那三条最长的带。
+pub const BAR_NAMES: [&str; 3] = ["标题栏", "工具栏", "状态栏"];
+
+/// 三条带出厂时各装什么。
+pub fn default_bars() -> Vec<Vec<u16>> {
+    vec![
+        vec![0, 1, 2, 3, 4],                             // 标题栏：标签 / + / 三键
+        vec![5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16], // 工具栏：导航 + 常用动作
+        vec![23, 24, 25],                                // 状态栏：项目数 / 已选 / 容量
+    ]
+}
+
 /// 右键菜单条目。下标即 id。
 pub const MENU_ITEM_NAMES: [&str; 14] = [
     "打开", "打开方式", "剪切", "复制", "粘贴", "重命名", "批量重命名", "删除", "新建", "全选",
@@ -272,6 +338,12 @@ pub struct Settings {
     pub ui_order: Vec<u8>,
     /// 被拖进「更多」的组件
     pub ui_hidden: Vec<u8>,
+    /// 三条最长的带（标题栏 / 工具栏 / 状态栏）各自装了哪些组件。
+    ///
+    /// 存的是 `WIDGETS` 的下标。一个组件只能待在一处 —— 拖进另一条就等于
+    /// 从原来那条里挪走。
+    #[serde(default = "default_bars")]
+    pub bars: Vec<Vec<u16>>,
     /// 「右键菜单」里可见条目的排列顺序
     pub menu_order: Vec<u16>,
     /// 被拖进「更多」的菜单条目
@@ -283,6 +355,7 @@ impl Default for Settings {
         Self {
             ui_order: (0..UI_PART_NAMES.len() as u8).collect(),
             ui_hidden: Vec::new(),
+            bars: default_bars(),
             menu_order: (0..MENU_ITEM_NAMES.len() as u16).collect(),
             menu_hidden: Vec::new(),
         }
@@ -302,6 +375,16 @@ impl Settings {
         self.ui_hidden.retain(|i| *i < n && !self.ui_order.contains(i));
         self.ui_hidden.sort_unstable();
         self.ui_hidden.dedup();
+
+        // 三条整条：条数不对就整份复位；越界的、重复的（一个组件只能待一处）丢掉
+        if self.bars.len() != BAR_NAMES.len() {
+            self.bars = default_bars();
+        }
+        let wn = WIDGETS.len() as u16;
+        let mut seen = std::collections::HashSet::new();
+        for b in self.bars.iter_mut() {
+            b.retain(|v| *v < wn && seen.insert(*v));
+        }
 
         let m = MENU_ITEM_NAMES.len() as u16;
         self.menu_order.retain(|i| *i < m && !self.menu_hidden.contains(i));
@@ -374,6 +457,16 @@ pub struct Geom {
     pub menu_idx: Vec<usize>,
     /// 「右键菜单」：右上「打开方式」面板
     pub ow_panel: RECT,
+    /// 界面页：上面那条（小组件）
+    pub ui_top: RECT,
+    /// 界面页：右边那条（长组件）
+    pub ui_right: RECT,
+    /// 界面页：中间的窗口实时预览
+    pub ui_preview: RECT,
+    /// 界面页：最下面三条最长的带
+    pub ui_bars: [RECT; 3],
+    /// 界面页：三条带里各自的条目矩形
+    pub ui_bar_items: [Vec<RECT>; 3],
     /// 打开方式里每一条候选程序
     pub ow_rows: Vec<RECT>,
     /// 「右键菜单」：右下系统集成开关
@@ -475,6 +568,11 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
         ow_panel: RECT::default(),
         ow_rows: Vec::new(),
         sys_panel: RECT::default(),
+        ui_top: RECT::default(),
+        ui_right: RECT::default(),
+        ui_preview: RECT::default(),
+        ui_bars: [RECT::default(); 3],
+        ui_bar_items: [Vec::new(), Vec::new(), Vec::new()],
     };
 
     match app.settings_tab {
@@ -524,53 +622,91 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
             g.rows = system_rows(app, &g.sys_panel);
         }
         crate::app::SETTINGS_TAB_UI => {
-            let dock_h = px(84.0);
-            g.dock = RECT {
+            // 中间是这个窗口的**实时预览**，组件按长短分三条带围在它四周。
+            let gap = px(10.0);
+            let h_top = px(84.0);
+            let h_bot = px(150.0);
+            g.ui_top = RECT {
                 left: content.left,
-                top: content.bottom - dock_h,
+                top: content.top,
                 right: content.right,
-                bottom: content.bottom,
+                bottom: content.top + h_top,
             };
-            let list_bottom = g.dock.top - px(12.0);
-            let card_h = px(38.0);
-            let gap = px(6.0);
-            let ids: Vec<u32> = if true {
-                app.ui_settings.ui_order.iter().map(|i| *i as u32).collect()
-            } else {
-                app.ui_settings.menu_order.iter().map(|i| *i as u32).collect()
+            let mid_top = g.ui_top.bottom + gap;
+            let mid_bot = content.bottom - h_bot - gap;
+            let pw = (content.right - content.left) * 58 / 100;
+            g.ui_preview = RECT {
+                left: content.left,
+                top: mid_top,
+                right: content.left + pw,
+                bottom: mid_bot,
             };
-            let mut y = content.top;
-            for id in &ids {
-                if y + card_h > list_bottom {
+            g.ui_right = RECT {
+                left: g.ui_preview.right + gap,
+                top: mid_top,
+                right: content.right,
+                bottom: mid_bot,
+            };
+
+            // —— 上面：小组件，横向流式排布，排满换行 ——
+            let mut tx = g.ui_top.left;
+            let mut ty = g.ui_top.top + px(16.0);
+            let sh = px(28.0);
+            for (i, wd) in WIDGETS.iter().enumerate() {
+                if wd.long {
+                    continue;
+                }
+                let ww = px(wd.w).max(px(28.0));
+                if tx + ww > g.ui_top.right {
+                    tx = g.ui_top.left;
+                    ty += sh + px(4.0);
+                }
+                if ty + sh > g.ui_top.bottom {
                     break;
                 }
-                g.cards.push(RECT { left: content.left, top: y, right: content.right, bottom: y + card_h });
-                g.card_ids.push(*id);
-                y += card_h + gap;
+                g.cards.push(RECT { left: tx, top: ty, right: tx + ww, bottom: ty + sh });
+                g.card_ids.push(i as u32);
+                tx += ww + px(4.0);
             }
-            // 「更多」里的被隐藏项：横向流式排布，排满换行（超出的裁掉）
-            let hidden: Vec<u32> = if true {
-                app.ui_settings.ui_hidden.iter().map(|i| *i as u32).collect()
-            } else {
-                app.ui_settings.menu_hidden.iter().map(|i| *i as u32).collect()
-            };
-            let cw = px(120.0);
-            let ch = px(28.0);
-            let cg = px(8.0);
-            let mut cx = g.dock.left + px(12.0);
-            let mut cy = g.dock.top + px(30.0);
-            for id in hidden {
-                if cx + cw > g.dock.right - px(12.0) {
-                    cx = g.dock.left + px(12.0);
-                    cy += ch + cg;
+
+            // —— 右边：长组件，竖着一条条排 ——
+            let mut ry = g.ui_right.top + px(16.0);
+            let rh = px(30.0);
+            for (i, wd) in WIDGETS.iter().enumerate() {
+                if !wd.long {
+                    continue;
                 }
-                if cy + ch > g.dock.bottom - px(6.0) {
+                if ry + rh > g.ui_right.bottom {
                     break;
                 }
-                g.chips.push(RECT { left: cx, top: cy, right: cx + cw, bottom: cy + ch });
-                g.chip_ids.push(id);
-                cx += cw + cg;
+                g.cards.push(RECT { left: g.ui_right.left, top: ry, right: g.ui_right.right, bottom: ry + rh });
+                g.card_ids.push(i as u32);
+                ry += rh + px(4.0);
             }
+
+            // —— 最下面：三条最长的带 ——
+            let bh = px(30.0);
+            let mut by = content.bottom - h_bot;
+            for bi in 0..3 {
+                let br = RECT { left: content.left, top: by + px(16.0), right: content.right, bottom: by + px(16.0) + bh };
+                g.ui_bars[bi] = br;
+                by += px(16.0) + bh + px(6.0);
+            }
+            for bi in 0..3 {
+                for (r, wid) in layout_bar(app, bi, &g.ui_bars[bi], s) {
+                    g.ui_bar_items[bi].push(r);
+                    // id 高位标出"来自第几条带的第几格"，低位才是组件下标
+                    g.cards.push(r);
+                    g.card_ids.push(
+                        0x8000_0000u32
+                            | ((bi as u32) << 16)
+                            | ((g.ui_bar_items[bi].len() as u32 - 1) << 8)
+                            | (wid as u32),
+                    );
+                }
+            }
+            // 这一页没有「更多」区了：拖出整条就是拿掉，不需要第二个框
+            g.dock = RECT::default();
         }
         crate::app::SETTINGS_TAB_LOOK => {
             // 左 44% 是三级树，右边是**实时预览**（上半）+ 圆角滑杆（下半）。
@@ -840,7 +976,7 @@ pub fn paint(app: &mut App, hdc: HDC, l: &Layout) {
 
     match app.settings_tab {
         crate::app::SETTINGS_TAB_UI => {
-            paint_editor(app, hdc, &g, th, s);
+            paint_ui_tab(app, hdc, &g, th, s);
         }
         crate::app::SETTINGS_TAB_MENU => paint_menu_tab(app, hdc, &g, th, s),
         crate::app::SETTINGS_TAB_ADVANCED
@@ -882,12 +1018,295 @@ pub fn paint(app: &mut App, hdc: HDC, l: &Layout) {
             right: base.right + dx,
             bottom: base.bottom + dy,
         };
-        let (name, glyph) = label_of(d.tab, d.id);
-        draw_card(hdc, &r, &name, &glyph, th, s, true, false);
+        if d.tab == crate::app::SETTINGS_TAB_UI {
+            draw_widget(app, hdc, &r, (d.id & 0xFF) as usize, th, s, false, true);
+        } else {
+            let (name, glyph) = label_of(d.tab, d.id);
+            draw_card(hdc, &r, &name, &glyph, th, s, true, false);
+        }
     }
 }
 
-/// 排布编辑器：卡片列表 + 底部「更多」区。
+// ---------------------------------------------------------------- 界面页
+
+/// 界面页：中间是这个软件窗口的实时预览，四周三条组件带。
+fn paint_ui_tab(app: &App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
+    // —— 中间：整窗预览 ——
+    draw_window_preview(app, hdc, &g.ui_preview, th, s);
+
+    // —— 上面：小组件 ——
+    band_title(hdc, &g.ui_top, "小组件 —— 拖到下面任意一条整条里", th, s);
+    // —— 右边：长组件 ——
+    band_title(hdc, &g.ui_right, "长组件 —— 侧栏、地址栏那些", th, s);
+
+    // —— 最下面：三条最长的整条 ——
+    for bi in 0..3 {
+        let mut tr = g.ui_bars[bi];
+        tr.top -= (16.0 * s).round() as i32;
+        tr.bottom = g.ui_bars[bi].top;
+        band_title(hdc, &tr, BAR_NAMES[bi], th, s);
+        let bg = match bi {
+            0 => th.title_bg,
+            1 => th.chrome_bg,
+            _ => th.status_bg,
+        };
+        rr(hdc, &g.ui_bars[bi], app.radius_of("toolbar.button"), bg, None);
+        for (k, r) in g.ui_bar_items[bi].iter().enumerate() {
+            let wid = app
+                .ui_settings
+                .bars
+                .get(bi)
+                .and_then(|v| v.get(k))
+                .copied()
+                .unwrap_or(0) as usize;
+            let id = 0x8000_0000u32 | ((bi as u32) << 16) | ((k as u32) << 8) | (wid as u32);
+            let dragging = matches!(&app.settings_drag, Some(d) if d.id == id);
+            let hover = app.settings_hover_card == Some(id) && !dragging;
+            draw_widget(app, hdc, r, wid, th, s, hover, dragging);
+        }
+    }
+
+    // —— 两条调色板里的组件 ——
+    for (i, r) in g.cards.iter().enumerate() {
+        let id = g.card_ids[i];
+        if id & 0x8000_0000 != 0 {
+            continue; // 整条里的上面画过了
+        }
+        let wid = (id & 0xFF) as usize;
+        let dragging = matches!(&app.settings_drag, Some(d) if d.id == id);
+        let hover = app.settings_hover_card == Some(id) && !dragging;
+        draw_widget(app, hdc, r, wid, th, s, hover, dragging);
+    }
+}
+
+fn band_title(hdc: HDC, r: &RECT, name: &str, th: Theme, s: f32) {
+    let mut t = *r;
+    t.bottom = t.top + (16.0 * s).round() as i32;
+    set_color(hdc, th.text_dim);
+    let f = paint::ui_font(s);
+    unsafe {
+        SelectObject(hdc, f.into());
+    }
+    paint::draw_text(hdc, name, t, DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
+}
+
+/// 一个组件画成**它实际的样子**：按钮就是按钮，横条就是横条，圆角取外观页
+/// 里那一套（于是改圆角当场看得见）。
+fn draw_widget(
+    app: &App,
+    hdc: HDC,
+    r: &RECT,
+    wid: usize,
+    th: Theme,
+    s: f32,
+    hover: bool,
+    dragged: bool,
+) {
+    let Some(wd) = WIDGETS.get(wid) else { return };
+    let rid = if wd.long {
+        "sidebar.item"
+    } else if wd.align == 1 {
+        "title.button"
+    } else {
+        "toolbar.button"
+    };
+    let fill = if dragged {
+        th.accent
+    } else if hover {
+        th.hover_bg
+    } else if wd.long {
+        th.surface_alt
+    } else {
+        th.surface
+    };
+    rr(
+        hdc,
+        r,
+        app.radius_of(rid),
+        fill,
+        if hover && !dragged { Some(th.accent) } else { None },
+    );
+    let gw = (22.0 * s).round() as i32;
+    let mut gr = *r;
+    gr.right = gr.left + gw;
+    set_color(hdc, if dragged { th.selection_text } else { th.text_dim });
+    let gf = paint::glyph_font(s);
+    unsafe {
+        SelectObject(hdc, gf.into());
+    }
+    paint::draw_text(hdc, wd.glyph, gr, DT_SINGLELINE | DT_NOPREFIX | DT_CENTER | DT_VCENTER);
+    if r.right - r.left > (36.0 * s).round() as i32 {
+        let f = paint::ui_font(s);
+        unsafe {
+            SelectObject(hdc, f.into());
+        }
+        let mut tr = *r;
+        tr.left += gw;
+        tr.right -= (4.0 * s).round() as i32;
+        set_color(hdc, if dragged { th.selection_text } else { th.text });
+        paint::draw_text(
+            hdc,
+            wd.name,
+            tr,
+            DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS,
+        );
+    }
+}
+
+/// 一条带里的内容怎么摆：靠左的从左往右，靠右的（最小化/最大化/关闭）整组贴右。
+///
+/// 带子里和窗口预览里用的是同一份，于是"在带子里把关闭拖到最小化前面"，
+/// 预览里的三个键当场跟着换。
+fn layout_bar(app: &App, bar: usize, host: &RECT, s: f32) -> Vec<(RECT, usize)> {
+    let mut out = Vec::new();
+    let empty: Vec<u16> = Vec::new();
+    let items: &[u16] = app.ui_settings.bars.get(bar).map(|v| v.as_slice()).unwrap_or(&empty);
+    let pad = (2.0 * s).round() as i32;
+    let top = host.top + pad;
+    let bot = host.bottom - pad;
+    let mut lx = host.left + pad;
+    // 靠右那组先量总宽，再整组贴右，这样它们的左右顺序不会被放反
+    let mut rtotal = 0;
+    for wid in items {
+        if let Some(wd) = WIDGETS.get(*wid as usize) {
+            if wd.align == 1 {
+                rtotal += (wd.w * s).round() as i32 + pad;
+            }
+        }
+    }
+    let mut rx = host.right - pad - rtotal;
+    for wid in items {
+        let Some(wd) = WIDGETS.get(*wid as usize) else { continue };
+        let ww = (wd.w * s).round() as i32;
+        if wd.align == 1 {
+            if rx < lx {
+                break;
+            }
+            out.push((RECT { left: rx, top, right: rx + ww, bottom: bot }, *wid as usize));
+            rx += ww + pad;
+        } else {
+            if lx + ww > host.right - pad {
+                break;
+            }
+            out.push((RECT { left: lx, top, right: lx + ww, bottom: bot }, *wid as usize));
+            lx += ww + pad;
+        }
+    }
+    out
+}
+
+/// 中间那块：整个窗口按比例实时渲染。标题栏 / 工具栏 / 状态栏画的是**带子里
+/// 真的装了什么**，所以上面拖一下这里就跟着变。
+fn draw_window_preview(app: &App, hdc: HDC, r: &RECT, th: Theme, s: f32) {
+    if r.right <= r.left || r.bottom <= r.top {
+        return;
+    }
+    fill_rect(hdc, r, th.window_bg);
+    let pad = (6.0 * s).round() as i32;
+    let l = r.left + pad;
+    let t = r.top + pad;
+    let rt = r.right - pad;
+    let bt = r.bottom - pad;
+
+    let title_h = (26.0 * s).round() as i32;
+    let bar_h = (22.0 * s).round() as i32;
+    let st_h = (18.0 * s).round() as i32;
+
+    // 标题栏
+    let title = RECT { left: l, top: t, right: rt, bottom: t + title_h };
+    fill_rect(hdc, &title, th.title_bg);
+    for (wr, wid) in layout_bar(app, 0, &title, s) {
+        draw_widget(app, hdc, &wr, wid, th, s, false, false);
+    }
+
+    // 地址栏：面包屑 + 输入框（固定结构，不进带子）
+    let mut y = title.bottom + pad;
+    let ad = RECT { left: l, top: y, right: rt, bottom: y + bar_h };
+    fill_rect(hdc, &ad, th.chrome_bg);
+    let cw = (30.0 * s).round() as i32;
+    for k in 0..3 {
+        let c = RECT {
+            left: l + pad + k * (cw + pad),
+            top: y + pad,
+            right: l + pad + k * (cw + pad) + cw,
+            bottom: y + bar_h - pad,
+        };
+        rr(hdc, &c, app.radius_of("address.crumb"), th.surface, None);
+    }
+    let ed = RECT {
+        left: l + pad + 3 * (cw + pad),
+        top: y + pad,
+        right: rt - pad,
+        bottom: y + bar_h - pad,
+    };
+    rr(hdc, &ed, app.radius_of("address.edit"), th.window_bg, None);
+
+    // 工具栏
+    y = ad.bottom + pad;
+    let tb = RECT { left: l, top: y, right: rt, bottom: y + bar_h };
+    fill_rect(hdc, &tb, th.chrome_bg);
+    for (wr, wid) in layout_bar(app, 1, &tb, s) {
+        draw_widget(app, hdc, &wr, wid, th, s, false, false);
+    }
+
+    // 主体：侧栏 + 内容区
+    y = tb.bottom + pad;
+    let body_b = bt - st_h - pad;
+    let sb_w = ((rt - l) * 26 / 100).max((56.0 * s).round() as i32);
+    let sb = RECT { left: l, top: y, right: l + sb_w, bottom: body_b };
+    fill_rect(hdc, &sb, th.chrome_bg);
+    let n = 4;
+    let rh = ((body_b - y - (n + 1) * pad) / n).max(4);
+    for k in 0..n {
+        let it = RECT {
+            left: sb.left + pad,
+            top: y + pad + k * (rh + pad),
+            right: sb.right - pad,
+            bottom: y + pad + k * (rh + pad) + rh,
+        };
+        let (id, fill) = match k {
+            0 => ("sidebar.group", th.surface),
+            1 => ("sidebar.item", th.surface_alt),
+            2 => ("sidebar.hover", th.hover_bg),
+            _ => ("sidebar.selected", th.selection_bg),
+        };
+        rr(hdc, &it, app.radius_of(id), fill, None);
+    }
+    let ct = RECT { left: l + sb_w + pad, top: y, right: rt, bottom: body_b };
+    fill_rect(hdc, &ct, th.window_bg);
+    let hh = (14.0 * s).round() as i32;
+    let hd = RECT { left: ct.left + pad, top: ct.top + pad, right: ct.right - pad, bottom: ct.top + pad + hh };
+    rr(hdc, &hd, app.radius_of("content.header"), th.surface, None);
+    let gw = (ct.right - ct.left - 3 * pad) / 2;
+    let gh = (body_b - hd.bottom - 3 * pad) / 2;
+    for k in 0..4 {
+        let col = k % 2;
+        let row = k / 2;
+        let tl = RECT {
+            left: ct.left + pad + col * (gw + pad),
+            top: hd.bottom + pad + row * (gh + pad),
+            right: ct.left + pad + col * (gw + pad) + gw,
+            bottom: hd.bottom + pad + row * (gh + pad) + gh,
+        };
+        let (id, fill) = match k {
+            0 => ("content.tile", th.surface),
+            1 => ("content.hover", th.hover_bg),
+            2 => ("content.tile", th.surface),
+            _ => ("content.selected", th.selection_bg),
+        };
+        rr(hdc, &tl, app.radius_of(id), fill, None);
+    }
+
+    // 状态栏
+    let st = RECT { left: l, top: body_b + pad, right: rt, bottom: bt };
+    fill_rect(hdc, &st, th.status_bg);
+    for (wr, wid) in layout_bar(app, 2, &st, s) {
+        draw_widget(app, hdc, &wr, wid, th, s, false, false);
+    }
+}
+
+/// 排布编辑器：卡片列表 + 底部「更多」区。（界面页改成了实时预览，这里留着给别的页复用。）
+#[allow(dead_code)]
 fn paint_editor(app: &App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
     for (i, r) in g.cards.iter().enumerate() {
         let id = g.card_ids[i];
@@ -922,10 +1341,11 @@ fn paint_editor(app: &App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
 
 fn label_of(tab: u8, id: u32) -> (String, &'static str) {
     if tab == crate::app::SETTINGS_TAB_UI {
-        let i = id as usize;
+        // 高位是"来自哪条带的第几格"，低位才是组件下标
+        let wd = WIDGETS.get((id & 0xFF) as usize);
         (
-            UI_PART_NAMES.get(i).unwrap_or(&"?").to_string(),
-            UI_PART_GLYPHS.get(i).copied().unwrap_or("\u{E783}"),
+            wd.map(|w| w.name).unwrap_or("?").to_string(),
+            wd.map(|w| w.glyph).unwrap_or("\u{E783}"),
         )
     } else {
         let i = id as usize;
@@ -1701,6 +2121,49 @@ pub fn finish_drag(app: &mut App, l: &Layout, x: i32, y: i32) {
     }
     if in_dock {
         hide(app, d.tab, d.id);
+        return;
+    }
+    // 「界面」页：落点按**那三条整条**算 —— 拖进去就是装进来，拖到条外面就是
+    // 拿掉，在同一条里挪就是换位置。整条里装的正是"组件里的子组件"。
+    if d.tab == crate::app::SETTINGS_TAB_UI {
+        let wid = (d.id & 0xFF) as u16;
+        let src_bar = if d.id & 0x8000_0000 != 0 {
+            Some(((d.id >> 16) & 0xFF) as usize)
+        } else {
+            None
+        };
+        let src_slot = ((d.id >> 8) & 0xFF) as usize;
+        let tol = (6.0 * app.metrics.scale).round() as i32;
+        let mut target: Option<usize> = None;
+        for (bi, br) in g.ui_bars.iter().enumerate() {
+            if x >= br.left && x < br.right && y >= br.top - tol && y < br.bottom + tol {
+                target = Some(bi);
+                break;
+            }
+        }
+        // 一个组件只能待在一处：先从所有带子里摘掉
+        for b in app.ui_settings.bars.iter_mut() {
+            b.retain(|v| *v != wid);
+        }
+        if let Some(bi) = target {
+            let mut slot = g.ui_bar_items[bi].len();
+            for (k, br) in g.ui_bar_items[bi].iter().enumerate() {
+                if x < (br.left + br.right) / 2 {
+                    slot = k;
+                    break;
+                }
+            }
+            // 从同一条里往后拖时，源槽位已经被摘掉了，插入点要跟着前移一格
+            if src_bar == Some(bi) && src_slot < slot {
+                slot -= 1;
+            }
+            let v = &mut app.ui_settings.bars[bi];
+            if slot > v.len() {
+                slot = v.len();
+            }
+            v.insert(slot, wid);
+        }
+        after_change(app);
         return;
     }
     // 「右键菜单」页：落点按**渲染出来的菜单行**算（那里没有 cards）

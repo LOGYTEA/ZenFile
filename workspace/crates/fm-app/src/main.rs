@@ -1102,6 +1102,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                         Some(settings::Hit::Tree(i)) => {
                             htree = Some(i);
                         }
+                        Some(settings::Hit::MenuRow(i)) => {
+                            app.settings_hover_menu =
+                                settings::geom(app, &l).menu_idx.get(i).copied();
+                        }
+                        Some(settings::Hit::OpenWith(_)) => {}
+                        None => {
+                            app.settings_hover_menu = None;
+                        }
                         Some(settings::Hit::RadiusSlider(_)) => {}
                         None => {}
                     }
@@ -1305,6 +1313,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             // 设置页排布编辑器：按下卡片/收纳项 → 开始拖
             if app.tab().settings {
                 if let Some(h) = settings::hit(app, &l, x, y) {
+                    // 「右键菜单」页那块实时菜单：按住就能拖着改顺序
+                    // （卡片排布那套在别的页照旧）
                     if settings::begin_drag(app, &l, &h, x, y) {
                         let _ = SetCapture(hwnd);
                         let _ = InvalidateRect(Some(hwnd), None, true);
@@ -1364,6 +1374,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     Some(settings::Hit::Tab(i)) => {
                         app.settings_tab = i;
                         app.settings_hover_card = None;
+                        // 「右键菜单」那一页要问 Shell 拿真实的"打开方式"程序，
+                        // 切进去的时候算一次，别放到每帧里。
+                        if i == crate::app::SETTINGS_TAB_MENU {
+                            app.ensure_openwith_preview();
+                        }
                         let _ = InvalidateRect(Some(hwnd), None, true);
                     }
                     Some(settings::Hit::Tree(i)) => {
@@ -1388,6 +1403,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                         let w = (g.slider.right - g.slider.left).max(1);
                         let frac = ((sx - g.slider.left) as f32 / w as f32).clamp(0.0, 1.0);
                         app.set_radius(&id, (frac * max as f32).round() as u32);
+                        let _ = InvalidateRect(Some(hwnd), None, true);
+                    }
+                    Some(settings::Hit::Row(action)) if action >= 3000 => {
+                        // 系统右键菜单开关：直接写 HKCU，写完重画（开关状态从注册表读）
+                        let kind = (action - 3000) as usize;
+                        let on = settings::system_menu_enabled(kind);
+                        settings::set_system_menu(kind, !on);
                         let _ = InvalidateRect(Some(hwnd), None, true);
                     }
                     Some(settings::Hit::Row(action)) if action >= 2000 => {

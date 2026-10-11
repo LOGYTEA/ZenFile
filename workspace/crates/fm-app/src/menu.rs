@@ -505,6 +505,11 @@ struct MenuWindow {
     view_h: i32,
     /// 内容滚动偏移
     scroll: i32,
+    /// 绘制原点（设备坐标）。真菜单是 (0,0)；设置页那块实时预览是它那块
+    /// 面板的左上角 —— 没有这个偏移的话，菜单会被自己的裁剪框（0,0,w,h）
+    /// 整块裁掉，预览区一片空白。
+    ox: i32,
+    oy: i32,
     parent_hwnd: HWND,
     submenu: Option<HWND>,
     open_submenu_for: Option<usize>,
@@ -610,6 +615,8 @@ pub fn open_menu(
         width: width.max((160.0 * scale) as i32),
         view_h,
         scroll: 0,
+        ox: 0,
+        oy: 0,
         parent_hwnd,
         submenu: None,
         open_submenu_for: None,
@@ -1149,6 +1156,47 @@ unsafe fn draw_bmp(hdc: HDC, hbmp: isize, x: i32, y: i32, size: i32) {
     let _ = DeleteDC(mem);
 }
 
+/// 把一串菜单条目画进 `hdc`（**不弹窗口**）。
+///
+/// 真菜单窗口和设置页「右键菜单」那一块的实时预览都走 `paint_menu` 同一份渲染：
+/// 预览要是另写一份，两边的行高/图标槽/箭头迟早会长歪，那就不是"预览"而是
+/// "另一张示意图"。所以这里造一个一次性的 `MenuWindow` 交进去。
+pub unsafe fn paint_menu_into(
+    hdc: HDC,
+    entries: &[MenuEntry],
+    width: i32,
+    view_h: i32,
+    row_h: i32,
+    scale: f32,
+    theme: &Theme,
+    hover: Option<usize>,
+    ox: i32,
+    oy: i32,
+) {
+    let st = MenuWindow {
+        theme: *theme,
+        entries: entries.to_vec(),
+        hover,
+        app: std::ptr::null_mut(),
+        scale,
+        row_h,
+        width,
+        view_h,
+        scroll: 0,
+        ox,
+        oy,
+        parent_hwnd: HWND(std::ptr::null_mut()),
+        submenu: None,
+        open_submenu_for: None,
+        parent_menu: None,
+        opened_by: None,
+        open_pos: None,
+        activated: false,
+        swallow_up: false,
+    };
+    paint_menu(hdc, &st);
+}
+
 unsafe fn paint_menu(hdc: HDC, state: &MenuWindow) {
     let t = &state.theme;
     let bg = CreateSolidBrush(t.surface);
@@ -1161,9 +1209,14 @@ unsafe fn paint_menu(hdc: HDC, state: &MenuWindow) {
         DeleteObject(bg.into());
 
         // 裁剪到可见区，避免超长内容画到窗口外（也会溢出到屏幕上）
-        let clip = RECT { left: 0, top: 0, right: state.width, bottom: state.view_h };
+        let clip = RECT {
+            left: state.ox,
+            top: state.oy,
+            right: state.ox + state.width,
+            bottom: state.oy + state.view_h,
+        };
         let _ = IntersectClipRect(hdc, clip.left, clip.top, clip.right, clip.bottom);
-        SetWindowOrgEx(hdc, 0, state.scroll, None);
+        SetWindowOrgEx(hdc, -state.ox, state.scroll - state.oy, None);
 
         let font = crate::paint::menu_font(state.scale);
         let old_font = SelectObject(hdc, font.into());
@@ -1241,7 +1294,7 @@ unsafe fn paint_menu(hdc: HDC, state: &MenuWindow) {
         }
 
         // 滚动指示：内容未显示完时，在顶/底画一条提示三角（画完要还原原点）
-        SetWindowOrgEx(hdc, 0, 0, None);
+        SetWindowOrgEx(hdc, -state.ox, -state.oy, None);
         let more_up = state.scroll > 0;
         let more_down = state.scroll < max_scroll(state);
         if more_up || more_down {
