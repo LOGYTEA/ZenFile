@@ -366,6 +366,52 @@ fn advanced_rows(app: &App, content: &RECT) -> Vec<paint::SettingRow> {
         );
         y += rh + (4.0 * s).round() as i32;
     }
+    // 搜索语法速查：高级语法写在搜索框里，UI 上没有任何入口的话用户永远发现不了。
+    // action = 0 → 不可点（hit() 会跳过），纯粹是说明文字。
+    y += (14.0 * s).round() as i32;
+    for (label, value) in [
+        ("搜索语法", ""),
+        ("  报告 预算", "多个词 = 同时满足"),
+        ("  \"年度 报告\"", "引号内当一个整体"),
+        ("  a OR b", "满足任一即可"),
+        ("  -草稿", "排除含「草稿」的"),
+        ("  *.txt  item?.log", "* 与 ? 通配"),
+        ("  ext:txt", "按扩展名"),
+        ("  kind:file  kind:folder", "按类型（也认 file/dir/文件/目录）"),
+        ("  size:>10mb", "> < >= <=，单位 b/kb/mb/gb/tb"),
+        ("  date:>2026-01-01", "也认 today / week"),
+        ("  path:github", "完整路径里含"),
+    ] {
+        out.push(
+            row(
+                RECT { left: content.left, top: y, right: content.right, bottom: y + rh },
+                label,
+                value.to_string(),
+                0,
+                None,
+            ),
+        );
+        y += rh + (4.0 * s).round() as i32;
+    }
+    // 卷索引状态：顺手把"秒搜"的依据摆出来
+    y += (10.0 * s).round() as i32;
+    let (label, value) = match (&app.index_state, app.index.as_ref()) {
+        (_, Some(idx)) => (
+            "卷索引",
+            format!("{} · {} 条 · 上次查询 {:.1} ms", idx.root, idx.len(), app.search_ms),
+        ),
+        (crate::app::IndexState::Building(n), _) => ("卷索引", format!("正在建立…（已扫 {n} 项）")),
+        (crate::app::IndexState::Loading, _) => ("卷索引", "正在载入缓存…".to_string()),
+        (crate::app::IndexState::Failed(why), _) => ("卷索引", format!("不可用（{why}）")),
+        _ => ("卷索引", "尚未建立（搜索时自动开始）".to_string()),
+    };
+    out.push(row(
+        RECT { left: content.left, top: y, right: content.right, bottom: y + rh },
+        label,
+        value,
+        0,
+        None,
+    ));
     out
 }
 

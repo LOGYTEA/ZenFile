@@ -868,6 +868,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             } else if wparam.0 == TIMER_DRAIN {
                 let app = &mut *app_ptr;
                 app.drain();
+                // 搜索框防抖到期：这一跳才真的去搜（见 App::tick_search）
+                if app.tick_search() {
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                }
                 // 首页是虚拟视图，拿不到目录变更通知 —— 拷完一个大文件之后
                 // 容量条会一直停在旧数值上（看着就是"条不准"）。这里做兜底刷新。
                 if app.tick_refresh_home() {
@@ -923,6 +927,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 let tab = app.tab_mut();
                 tab.filter = text;
                 tab.recompute_filter(sh, ss);
+                // 挂防抖：停手 ~200ms 后由 TIMER_DRAIN 跑真正的整卷查询。
+                // 不能在这里直接搜 —— 那样 "wind" 会变成 4 次全卷查询，
+                // 而且每敲一键都要等一次磁盘/索引往返，输入框会卡键。
+                app.on_search_text_changed();
                 let _ = InvalidateRect(Some(hwnd), None, true);
                 // 搜索框自己也必须重画：放大镜和空态提示是画在**子 EDIT** 上的，
                 // 而主窗口带了 WS_CLIPCHILDREN，父窗口重绘不再碰它那一块 ——

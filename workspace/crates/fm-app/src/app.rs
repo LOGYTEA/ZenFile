@@ -504,6 +504,14 @@ pub struct App {
     /// 用户回车搜索了，但索引还没到位：此刻列表里顶着的是"当前目录"的递归结果，
     /// 索引一到就要换成全卷结果。
     pub index_pending: bool,
+    /// 搜索框防抖：还剩几个 100ms 节拍才真的去搜。每敲一个键都重置，
+    /// 这样"wind" 不会拆成 w / wi / win / wind 四次全卷查询。
+    pub search_ticks: u8,
+    /// 防抖窗口内查询串又变过（为真才需要在归零时跑一次）。
+    pub search_dirty: bool,
+    /// 上一次整卷查询的结果条数与耗时（毫秒），给状态栏显示。
+    pub search_hits: usize,
+    pub search_ms: f64,
     /// 标题栏三大金刚键的悬停位：0=无，1=最小化，2=最大化，3=关闭。
     pub hover_caption: u8,
     /// 按下未抬起的那一个（0=无，1/2/3 同上）。
@@ -611,6 +619,10 @@ pub enum IndexState {
     /// 建不了（非 NTFS / 没权限 / UNC），搜索回退到现地递归
     Failed(String),
 }
+
+/// 边打字边搜的防抖节拍数。TIMER_DRAIN 每 100ms 一跳，2 跳 ≈ 200ms：
+/// 再短就会在用户还没停手时白跑整卷查询，再长就失去"即时"的手感。
+pub const SEARCH_DEBOUNCE_TICKS: u8 = 2;
 
 pub enum IndexMsg {
     /// 建索引过程中周期性回报已扫条目数
@@ -872,6 +884,10 @@ impl App {
             index_root: None,
             index_state: IndexState::Idle,
             index_pending: false,
+            search_ticks: 0,
+            search_dirty: false,
+            search_hits: 0,
+            search_ms: 0.0,
             index_rx: None,
             index_cancel: None,
             drag_split: None,
@@ -1298,6 +1314,14 @@ impl App {
     /// 索引在内存里就直接查（毫秒级，不再碰磁盘）；不在就后台载入/建立，
     /// 期间先跑现地递归搜索顶着，索引好了再换成全卷结果。
     pub fn begin_volume_search(&mut self) {
+        self.run_search(false);
+    }
+
+    /// 执行一次搜索。`live` = 由"边打字边搜"触发。
+    ///
+    /// 两种触发的差别只有一处：索引没就绪时，打字走**内存筛选**（EN_CHANGE
+    /// 已经筛过了，再 reload 就是每敲一键读一次盘，大目录会顿），回车才走 reload。
+    pub fn run_search(&mut self, live: bool) {
         let q = self.tab().filter.trim().to_string();
         let cur = self.tab().path.clone();
         let Some(root) = fm_core::index::volume_root(&cur) else {
@@ -1311,12 +1335,13 @@ impl App {
             let tab = self.tab_mut();
             tab.search_root = None;
             tab.filter.clear();
+            self.search_hits = 0;
+            self.search_ms = 0.0;
             self.reload();
             return;
         }
         {
             let tab = self.tab_mut();
-            tab.search_root = Some(PathBuf::from(&root));
             tab.filter = q.clone();
         }
         if self.index_root.as_deref() == Some(root.as_str()) {
@@ -1333,10 +1358,41 @@ impl App {
         {
             let tab = self.tab_mut();
             tab.search_root = Some(cur.clone());
-            tab.filter = q.clone();
         }
         self.ensure_index(&root);
-        self.reload();
+        if live {
+            let (sh, ss) = (self.show_hidden, self.show_system);
+            self.tab_mut().recompute_filter(sh, ss);
+            self.invalidate();
+        } else {
+            self.reload();
+        }
+    }
+
+    /// 搜索框内容变了：先做即时的本地筛选（零延迟手感），再挂一个防抖，
+    /// 停手 ~200ms 后才跑真正的整卷查询。
+    pub fn on_search_text_changed(&mut self) {
+        self.search_dirty = true;
+        self.search_ticks = SEARCH_DEBOUNCE_TICKS;
+    }
+
+    /// 由 100ms 的 TIMER_DRAIN 驱动，返回是否真的跑了一次搜索。
+    pub fn tick_search(&mut self) -> bool {
+        if !self.search_dirty {
+            return false;
+        }
+        if self.search_ticks > 0 {
+            self.search_ticks -= 1;
+            return false;
+        }
+        self.search_dirty = false;
+        // 空的查询串不需要整卷搜：清空就完了
+        if self.tab().filter.trim().is_empty() {
+            self.run_search(true);
+            return true;
+        }
+        self.run_search(true);
+        true
     }
 
     /// 保证 `root` 这个卷的索引在后台被载入或建立好。
@@ -1356,7 +1412,12 @@ impl App {
         self.index_rx = Some(rx);
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.index_cancel = Some(cancel.clone());
-        let has_cache = fm_core::index::Index::load(root).is_some();
+        // 只判断缓存文件在不在，**绝不能在这里 Index::load()** ——
+        // 那是在 UI 线程上把几十 MB 的缓存整个反序列化一遍（实测 70ms，
+        // 盘更大时更久），用户按下回车那一下界面就是卡住的。
+        let has_cache = fm_core::index::Index::cache_path(root)
+            .map(|p| p.exists())
+            .unwrap_or(false);
         self.index_state = if has_cache {
             IndexState::Loading
         } else {
@@ -1389,7 +1450,10 @@ impl App {
     /// 用索引里的结果替换当前标签的内容。
     pub fn apply_index_hits(&mut self, idx: &fm_core::index::Index, q: &str) {
         let limit = self.cfg.files.navigation.search_limit.max(50);
+        let t0 = std::time::Instant::now();
         let hits = idx.query(q, limit);
+        self.search_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        self.search_hits = hits.len();
         let (show_hidden, show_system) = (self.show_hidden, self.show_system);
         let mut entries: Vec<FileEntry> = hits
             .into_iter()
@@ -2896,7 +2960,16 @@ impl App {
             Some(p) => {
                 let s = p.to_string_lossy().to_string();
                 if fm_core::index::volume_root(p).as_deref() == Some(s.as_str()) {
-                    " · 整卷搜索".to_string()
+                    // 把命中数与耗时摆出来：这既是"秒搜"的证据，也方便一眼看出
+                    // 是索引查的还是临时兜的。
+                    if self.search_ms > 0.0 {
+                        format!(
+                            " · 整卷「{}」{} 项 / {:.1} ms",
+                            tab.filter, self.search_hits, self.search_ms
+                        )
+                    } else {
+                        " · 整卷搜索".to_string()
+                    }
                 } else {
                     " · 仅当前目录（卷索引尚未就绪）".to_string()
                 }

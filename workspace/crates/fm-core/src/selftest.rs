@@ -308,6 +308,78 @@ pub fn run() -> i32 {
         roundtrip,
         &format!("{} 字节，还原 {} 条", bytes.len(), back.map(|b| b.len()).unwrap_or(0)),
     );
+    // 15b. 高级搜索语法：解析层（不依赖索引，纯字符串 → 结构化查询）
+    use crate::index::{Op, Query};
+    let q1 = Query::parse("ext:TXT");
+    let q2 = Query::parse("size:>1kb");
+    let q3 = Query::parse("date:>2020-01-01");
+    let q4 = Query::parse("-item3 item1");
+    let q5 = Query::parse("\"a b\" c");
+    let q6 = Query::parse("a OR b");
+    let q7 = Query::parse("kind:folder path:dir1 size:<=10mb");
+    let syntax_ok = q1.ext.as_deref() == Some("txt")
+        && q2.size == Some((Op::Gt, 1024))
+        && matches!(q3.date, Some((Op::Gt, v)) if v > 0)
+        && q4.not == vec!["item3".to_string()]
+        && q4.texts == vec!["item1".to_string()]
+        && q5.texts == vec!["a b".to_string(), "c".to_string()]
+        && q6.any == vec!["a".to_string(), "b".to_string()]
+        && q7.kind.as_deref() == Some("folder")
+        && q7.path.as_deref() == Some("dir1")
+        && q7.size == Some((Op::Le, 10 * 1024 * 1024));
+    h.check(
+        "index::syntax",
+        syntax_ok,
+        &format!(
+            "ext={:?} size={:?} date={:?} not={:?} quote={:?} or={:?}",
+            q1.ext, q2.size, q3.date.map(|(o, _)| o), q4.not, q5.texts, q6.any
+        ),
+    );
+    // 15c. 高级搜索语法：执行层（真的在这些条目上跑一遍）
+    let by_ext = idx.query("ext:txt", 500);
+    let folders = idx.query("kind:folder", 500);
+    let big = idx.query("size:>1b", 500);
+    let excl = idx.query("-item1", 500);
+    let inpath = idx.query("path:dir1", 500);
+    // 同一条路径不许出现两次（目录既被当子项又被当目录条目就会重复）
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let no_dup = idx
+        .query("item", 500)
+        .iter()
+        .chain(idx.query("dir", 500).iter())
+        .all(|x| seen.insert(x.path.to_string_lossy().to_lowercase()));
+    let adv_ok = by_ext.len() >= 36
+        && by_ext.iter().all(|x| x.name.to_lowercase().ends_with(".txt"))
+        && !folders.is_empty()
+        && folders.iter().all(|x| x.dir)
+        && no_dup
+        && !big.is_empty()
+        && big.iter().all(|x| x.size > 1)
+        && !excl.is_empty()
+        && excl.iter().all(|x| !x.name.to_lowercase().contains("item1"))
+        && !inpath.is_empty()
+        && inpath
+            .iter()
+            .all(|x| x.path.to_string_lossy().to_lowercase().contains("dir1"));
+    h.check(
+        "index::adv_query",
+        adv_ok,
+        &format!(
+            "ext:txt={} kind:folder={} size:>1b={} -item1={} path:dir1={} 无重复={}",
+            by_ext.len(),
+            folders.len(),
+            big.len(),
+            excl.len(),
+            inpath.len(),
+            no_dup
+        ),
+    );
+    // 空查询 / 只剩符号的查询必须退化为"无结果"，而不是返回全表
+    let blank = idx.query("   ", 50).is_empty()
+        && idx.query("-", 50).is_empty()
+        && idx.query("ext:", 50).is_empty();
+    h.check("index::adv_blank", blank, "空串 / 孤立 - / 空字段 均无结果");
+
     // 缓存路径必须落在 %LOCALAPPDATA% 下，且按盘符分文件
     let cp = crate::index::Index::cache_path("C:\\");
     let cp_ok = cp
