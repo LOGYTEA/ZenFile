@@ -577,11 +577,14 @@ pub fn dock_zone_rect(l: &Layout, z: crate::app::DockZone) -> RECT {
 /// 只高亮一块还不够 —— 用户看不见另外 7 个方向在哪，所以同时把十字分隔线
 /// 淡淡勾出来，鼠标一带就能看出分界在哪。
 pub fn paint_dock_overlay(app: &App, hdc: HDC, l: &Layout) {
-    let Some(d) = app.tab_drag.as_ref() else { return };
-    if !d.active {
-        return;
-    }
-    let Some(zone) = d.dock else { return };
+    // 两种来源：拖标签（`tab_drag`）和拖文件夹（`drag_dock`）。
+    // 画法完全一样，合成一处就不必担心两边长歪。
+    let zone = match app.tab_drag.as_ref() {
+        Some(d) if d.active => d.dock,
+        Some(_) => None,
+        None => app.drag_dock,
+    };
+    let Some(zone) = zone else { return };
     let t = app.theme;
     let pl = pane_layout(app, l, app.focus_pane);
     let r = dock_zone_rect(&pl, zone);
@@ -957,6 +960,22 @@ fn paint_title_bar(app: &mut App, hdc: HDC, l: &Layout) {
         // （见 `paint_panes`），否则同一排标签会被画两遍。
         if !app.split() {
             paint_tab_strip(app, hdc, l, app.focus_pane);
+        } else {
+            // 分栏：标题栏那块地盘改成一行「目录A 丨 目录B」。
+            // 窗格自己的标签条只有 26px 高、挤在各自角落里，一路看过去
+            // 认不出"现在到底看着哪两处"；标题栏这一行才是总览。
+            let cap = app.split_caption();
+            if !cap.is_empty() {
+                let mut r = l.tabs;
+                r.left += (8.0 * app.metrics.scale).round() as i32;
+                SetTextColor(hdc, t.text);
+                draw_text(
+                    hdc,
+                    &cap,
+                    r,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+                );
+            }
         }
         // （原"- ZenFile"字样已按用户要求删掉：标题栏右侧那块地盘留给标签）
         // 侧栏折叠开关（最左）与更多菜单（最小化左侧）

@@ -212,6 +212,9 @@ impl ColFilter {
     }
 }
 
+/// `Clone` 是为了"四等分"：多出来的格子沿用原来正在看的目录，
+/// 直接克隆当前标签（连已加载的条目一起）比重建一个再重新枚举快得多。
+#[derive(Clone)]
 pub struct Tab {
     pub path: PathBuf,
     pub title: String,
@@ -400,7 +403,9 @@ pub enum DockZone {
 
 /// 把 `r` 按 `zone` 一分为二：返回 (旧窗格留下的, 新窗格占的)。
 ///
-/// 四角不是"四等分"：真做四等分会留下两块无法用矩形表达的 L 形区域。
+/// 只服务**四边**。四角走 `dock_quarter` 做真正的 2x2 四等分 ——
+/// 早先让角落也走"一分为二"，于是旧窗格 keep 住对面那 1/2、新窗格只拿 1/4，
+/// 剩下那 1/4 谁都不属于，点也点不中（用户报的"一边的用不了点不动"）。
 /// 这里按 Windows 贴靠的实际语义处理 —— 角落贴等价于"先按左右分，
 /// 新窗格再在它那一半里占上下的一半"，于是新窗格拿到的是一个
 /// **1/4 大小的规则矩形**，旧窗格 keep 住对面那一半（1/2）。
@@ -644,6 +649,12 @@ pub struct App {
     pub tab_hover_since: Option<(usize, std::time::Instant)>,
     /// 拖拽当前悬着的可投放目标。
     pub drop_target: Option<DropTarget>,
+    /// 拖着**一个文件夹**悬在内容区边缘时算出来的贴靠方向。
+    ///
+    /// 空手落在内容区中间是"什么也不做"，落在边上则是"把这个文件夹开成一个新窗格" ——
+    /// 这就是用户说的"分栏拖进去的文件夹"。与 `drop_target` 分开存：
+    /// 前者是"搬到某个目录"，后者是"开一个新视图"，落地动作完全不同。
+    pub drag_dock: Option<DockZone>,
     /// 正在拖哪一条分隔线（导航窗格宽度 / 详细信息表头的某一列）。
     ///
     /// `None` 之外还要记住"按下时 cursor 在分隔线上的偏移"，否则拖动一开始
@@ -983,6 +994,7 @@ impl App {
             drag_origin: None,
             tab_drag: None,
             tab_hover_since: None,
+            drag_dock: None,
             fast_mode: false,
             xfer: None,
             io_tx,
@@ -1143,28 +1155,136 @@ impl App {
                 dst -= 1;
             }
         }
-        if zone == DockZone::Center {
-            // 中央 = 合进目标窗格，不做分栏
-            if src_pane == dst && self.panes.len() == 1 {
-                // 退化成"原地放回"：把标签塞回它原来的窗格
+        match zone {
+            DockZone::Center => {
+                // 中央 = 合进目标窗格，不做分栏
                 self.panes[dst].tabs.push(t);
                 self.panes[dst].active = self.panes[dst].tabs.len() - 1;
-                self.ensure_pane();
-                return true;
+                self.focus_pane = dst;
             }
-            self.panes[dst].tabs.push(t);
-            self.panes[dst].active = self.panes[dst].tabs.len() - 1;
-            self.focus_pane = dst;
-            self.ensure_pane();
-            return true;
+            DockZone::Left | DockZone::Right | DockZone::Top | DockZone::Bottom => {
+                let old = self.panes[dst].rect;
+                let (a, b) = split_rect(old, zone);
+                self.panes[dst].rect = a;
+                self.panes.insert(dst + 1, Pane { tabs: vec![t], active: 0, rect: b });
+                self.focus_pane = dst + 1;
+            }
+            _ => self.dock_quarter(dst, t, zone),
         }
-        let old = self.panes[dst].rect;
-        let (a, b) = split_rect(old, zone);
-        self.panes[dst].rect = a;
-        self.panes.insert(dst + 1, Pane { tabs: vec![t], active: 0, rect: b });
-        self.focus_pane = dst + 1;
         self.ensure_pane();
         true
+    }
+
+    /// 四角贴靠：整块切成 **2x2 四等分**，四格铺满、一格不空。
+    ///
+    /// 之前是"新窗格 1/4 + 旧窗格缩到对侧 1/2"，于是剩下一个 1/4 谁都不属于 ——
+    /// 点是点不中的（命中测试找不到窗格），看起来就是"一边用不了点不动"。
+    /// 四等分之后每格都是一个真窗格：拖进来的那个落在松手的那一格，
+    /// 原来那个挪到**对角**（离新标签最远），其余两格沿用原来正在看的目录
+    /// （VS Code 的 2x2 网格也是这个行为）。
+    fn dock_quarter(&mut self, dst: usize, dragged: Tab, zone: DockZone) {
+        let r = self.panes[dst].rect;
+        let (hw, hh) = (r.w * 0.5, r.h * 0.5);
+        let quads = [
+            RectF { x: r.x, y: r.y, w: hw, h: hh },                 // 0 左上
+            RectF { x: r.x + hw, y: r.y, w: hw, h: hh },            // 1 右上
+            RectF { x: r.x, y: r.y + hh, w: hw, h: hh },            // 2 左下
+            RectF { x: r.x + hw, y: r.y + hh, w: hw, h: hh },       // 3 右下
+        ];
+        let want = match zone {
+            DockZone::TopLeft => 0usize,
+            DockZone::TopRight => 1,
+            DockZone::BottomLeft => 2,
+            _ => 3,
+        };
+        let keep = 3 - want; // 对角
+        let fill = self.panes[dst].tabs.get(self.panes[dst].active).cloned();
+        self.panes[dst].rect = quads[keep];
+        let mut focus = dst;
+        let mut at = dst + 1;
+        for i in 0..4usize {
+            if i == keep {
+                continue;
+            }
+            let tabs = if i == want {
+                vec![dragged.clone()]
+            } else {
+                match &fill {
+                    Some(t) => vec![t.clone()],
+                    None => Vec::new(),
+                }
+            };
+            if tabs.is_empty() {
+                continue;
+            }
+            self.panes.insert(at, Pane { tabs, active: 0, rect: quads[i] });
+            if i == want {
+                focus = at;
+            }
+            at += 1;
+        }
+        self.focus_pane = focus;
+    }
+
+    /// 直接把一个目录贴成一个新窗格（把**文件夹**拖进内容区时走这里）。
+    ///
+    /// 借 `dock_tab` 的落位逻辑：先把标签塞进当前窗格，再当成"被拖的那个"贴出去。
+    pub fn open_split(&mut self, path: PathBuf, zone: DockZone) {
+        if zone == DockZone::Center {
+            self.open_tab(path);
+            return;
+        }
+        let dst = self.focus_pane.min(self.panes.len().saturating_sub(1));
+        if self.panes.is_empty() {
+            self.panes.push(Pane::default());
+        }
+        let t = Tab::new(path);
+        self.panes[dst].tabs.push(t);
+        let idx = self.panes[dst].tabs.len() - 1;
+        self.dock_tab(dst, idx, zone);
+        // 焦点已经落在新建的那个窗格上，这里把它的条目读出来
+        self.reload();
+    }
+
+    /// 分栏时窗口标题栏上那一行"目录A 丨 目录B"。
+    ///
+    /// 按**视觉顺序**排（先上后下、同行先左后右），读起来和屏幕上看到的一致。
+    pub fn split_caption(&self) -> String {
+        if self.panes.len() <= 1 {
+            return String::new();
+        }
+        let mut order: Vec<usize> = (0..self.panes.len()).collect();
+        order.sort_by(|&a, &b| {
+            let ra = self.panes[a].rect;
+            let rb = self.panes[b].rect;
+            // 上下差异超过半个窗格高才算"不同行"，避免浮点误差把同一行拆开
+            let ay = (ra.y * 100.0) as i32;
+            let by = (rb.y * 100.0) as i32;
+            if (ay - by).abs() > 5 {
+                ay.cmp(&by)
+            } else {
+                ((ra.x * 100.0) as i32).cmp(&((rb.x * 100.0) as i32))
+            }
+        });
+        let mut out: Vec<String> = Vec::new();
+        for &i in order.iter() {
+            let p = &self.panes[i];
+            let Some(t) = p.tabs.get(p.active) else { continue };
+            let name = if t.title.is_empty() {
+                t.path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| t.path.to_string_lossy().to_string())
+            } else {
+                t.title.clone()
+            };
+            // **按名字去重**：四等分会造出三个"沿用原来目录"的窗格，
+            // 不去重的话标题就变成「A 丨 A 丨 B 丨 A」这种谁也读不懂的东西。
+            if !out.iter().any(|n| *n == name) {
+                out.push(name);
+            }
+        }
+        out.join(" 丨 ")
     }
 
     /// 当前标签下标越界了就夹回来（删标签、拖走标签之后都要）。

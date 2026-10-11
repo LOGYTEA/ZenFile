@@ -984,6 +984,35 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     app.tab_hover_since = None;
                 }
                 app.drop_target = target;
+                // 拖着**一个文件夹**、又没压在任何可投放目标上，再看它是不是悬在
+                // 内容区边缘 —— 是的话这次松手要的是"开个新窗格"（分栏），不是搬文件。
+                // 只有真的悬在边缘带里才算，落在正中间仍然是"什么也不做"，
+                // 否则随手一放就分栏会让人莫名其妙。
+                app.drag_dock = None;
+                if app.drop_target.is_none() {
+                    if let Some(d) = app.drag.as_ref() {
+                        if d.active && d.items.len() == 1 && d.items[0].is_dir() {
+                            let pl = if app.split() {
+                                match paint::pane_index_at(app, &l, x, y) {
+                                    Some(pi) => paint::pane_layout(app, &l, pi),
+                                    None => l,
+                                }
+                            } else {
+                                l
+                            };
+                            if x >= pl.view.left
+                                && x < pl.view.right
+                                && y >= pl.view.top
+                                && y < pl.view.bottom
+                            {
+                                let z = paint::dock_zone_at(&pl, x, y);
+                                if z != crate::app::DockZone::Center {
+                                    app.drag_dock = Some(z);
+                                }
+                            }
+                        }
+                    }
+                }
                 let _ = InvalidateRect(Some(hwnd), None, true);
                 return LRESULT(0);
             }
@@ -2109,6 +2138,7 @@ fn finish_drag(app: &mut App, l: &paint::Layout, x: i32, y: i32) {
     let Some(drag) = app.drag.take() else {
         return;
     };
+    let dock_zone = app.drag_dock.take();
     app.drop_target = None;
     if !drag.active {
         return;
@@ -2116,6 +2146,17 @@ fn finish_drag(app: &mut App, l: &paint::Layout, x: i32, y: i32) {
     match drag.kind {
         app::DragKind::Marquee => select_marquee(app, l, &drag),
         app::DragKind::Items => {
+            // 拖着文件夹松在内容区边缘 = "把这个文件夹开成一个新窗格"。
+            // 分栏之后标题栏会显示成「A 丨 B」，所以用户拖进去的那个目录名一定看得到。
+            if let Some(zone) = dock_zone {
+                if drag.items.len() == 1 && drag.items[0].is_dir() {
+                    if let Some(pi) = paint::pane_index_at(app, l, x, y) {
+                        app.focus_pane = pi;
+                    }
+                    app.open_split(drag.items[0].clone(), zone);
+                    return;
+                }
+            }
             if let Some(t) = drop_target_at(app, l, x, y) {
                 let copy = drag.copy || app.drag_copy();
                 // **先搬，再切标签**。反过来的话 `drop_items` 里的
