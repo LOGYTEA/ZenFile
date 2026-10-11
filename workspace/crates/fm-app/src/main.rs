@@ -62,6 +62,13 @@ pub const WM_APP_RECYCLE: u32 = WM_APP + 3;
 const TIMER_DRAIN: usize = 1;
 /// 对外显示的产品名。托盘提示、窗口标题、标题栏落款共用这一份，改一处就够。
 pub const APP_TITLE: &str = "ZenFile";
+/// 对外显示的版本串。
+///
+/// Cargo.toml 里的 `version` 只能写 semver（"Demo 0.3 Daily 2026-10-11" 不是合法
+/// semver，写了 cargo 直接报错），所以"人看的那一版号"单独放这里：
+/// `ZenFile.exe --version`、窗口标题、「关于」对话框三处共用。
+/// 发新版时改这一行（0.3 → 下一段号）并把日期换成当天即可。
+pub const APP_VERSION: &str = "Demo 0.3 Daily 2026-10-11";
 /// 目录栏下沿进度条的动画节拍。一直挂着，但只有 busy() 时才真的重画。
 const TIMER_BUSY: usize = 2;
 const HOTKEY_MAIN: i32 = 1;
@@ -101,7 +108,11 @@ fn main() {
     }
     if args.iter().any(|a| a == "--version") {
         unsafe { attach_console() };
-        println!("fm-app {} (protocol {})", env!("CARGO_PKG_VERSION"), fm_core::PROTOCOL_VERSION);
+        println!(
+            "{APP_TITLE} {APP_VERSION} (pkg {} / protocol {})",
+            env!("CARGO_PKG_VERSION"),
+            fm_core::PROTOCOL_VERSION
+        );
         return;
     }
 
@@ -147,7 +158,8 @@ fn main() {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             PCWSTR(MAIN_CLASS.as_ptr()),
-            PCWSTR(HSTRING::from(APP_TITLE).as_ptr()),
+            // 窗口标题带上版本号：alt-tab / 任务栏一眼能看出跑的是哪一版
+            PCWSTR(HSTRING::from(format!("{APP_TITLE} {APP_VERSION}")).as_ptr()),
             // WS_CLIPCHILDREN 不能省：搜索框是一个子 EDIT 控件，放大镜和空态
             // 提示都是画在它**自己**的 DC 上的。父窗口每次重绘会把整条工具栏
             // （含搜索框那块矩形）刷成底色，没有这个样式就会把子控件刚画好的

@@ -3,7 +3,8 @@ members = ["crates/fm-core", "crates/fm-app", "crates/fm-taskmgr"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+# Cargo 只认 semver，对外显示的那个人类可读版本串在 `crate::APP_VERSION`（main.rs）。
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["FileManager Team"]

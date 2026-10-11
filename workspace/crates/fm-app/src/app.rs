@@ -2406,7 +2406,14 @@ impl App {
             Command::RecycleEmpty => self.empty_recycle(),
             Command::RecycleSelectAll => self.recycle_select_all(),
             Command::NewTab => self.new_tab(),
-            Command::About => report(self.hwnd, "ZenFile 轻量资源管理器\nWin32 + GDI 自绘，无 WebView2 依赖"),
+            Command::About => report(
+                self.hwnd,
+                &format!(
+                    "{} 轻量资源管理器\n{}\n\nWin32 + GDI 自绘，无 WebView2 依赖",
+                    crate::APP_TITLE,
+                    crate::APP_VERSION
+                ),
+            ),
         }
     }
 
