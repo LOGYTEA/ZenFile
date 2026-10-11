@@ -952,6 +952,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             );
             // 设置页排布编辑器：正在拖卡片，只更新位置并重画，别的命中一概不理。
             if app.tab().settings && app.settings_drag.is_some() {
+                if app.settings_radius_drag {
+                    let id = app.settings_radius_sel.clone();
+                    let g = settings::geom(app, &l);
+                    let max = settings::radius_max(&id).max(1);
+                    let w = (g.slider.right - g.slider.left).max(1);
+                    let frac = ((x - g.slider.left) as f32 / w as f32).clamp(0.0, 1.0);
+                    app.set_radius(&id, (frac * max as f32).round() as u32);
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                    return LRESULT(0);
+                }
                 if let Some(d) = &mut app.settings_drag {
                     d.cur = (x, y);
                 }
@@ -1079,6 +1089,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     let mut ht = None;
                     let mut hc = None;
                     let mut hr = None;
+                    let mut htree = None;
                     match settings::hit(app, &l, x, y) {
                         Some(settings::Hit::Tab(i)) => ht = Some(i),
                         Some(settings::Hit::Card(i)) => {
@@ -1088,7 +1099,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                             hc = settings::geom(app, &l).chip_ids.get(i).copied()
                         }
                         Some(settings::Hit::Row(a)) => hr = Some(a),
+                        Some(settings::Hit::Tree(i)) => {
+                            htree = Some(i);
+                        }
+                        Some(settings::Hit::RadiusSlider(_)) => {}
                         None => {}
+                    }
+                    if app.settings_hover_tree != htree {
+                        app.settings_hover_tree = htree;
                     }
                     (hr, ht, hc)
                 }
@@ -1348,6 +1366,37 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                         app.settings_hover_card = None;
                         let _ = InvalidateRect(Some(hwnd), None, true);
                     }
+                    Some(settings::Hit::Tree(i)) => {
+                        let g = settings::geom(app, &l);
+                        if let Some(id) = g.tree_ids.get(i).cloned() {
+                            // 点父节点 = 展开/收起；点叶子 = 只是选中。
+                            // 两种都把滑杆指过去，于是顺手就能调。
+                            if settings::radius_has_kids(&id) {
+                                if !app.settings_tree_open.remove(&id) {
+                                    app.settings_tree_open.insert(id.clone());
+                                }
+                            }
+                            app.settings_radius_sel = id;
+                        }
+                        let _ = InvalidateRect(Some(hwnd), None, true);
+                    }
+                    Some(settings::Hit::RadiusSlider(sx)) => {
+                        app.settings_radius_drag = true;
+                        let id = app.settings_radius_sel.clone();
+                        let g = settings::geom(app, &l);
+                        let max = settings::radius_max(&id).max(1);
+                        let w = (g.slider.right - g.slider.left).max(1);
+                        let frac = ((sx - g.slider.left) as f32 / w as f32).clamp(0.0, 1.0);
+                        app.set_radius(&id, (frac * max as f32).round() as u32);
+                        let _ = InvalidateRect(Some(hwnd), None, true);
+                    }
+                    Some(settings::Hit::Row(action)) if action >= 2000 => {
+                        // 快捷键行：进"录制"态，下一次按键写进去
+                        let idx = (action - 2000) as usize;
+                        let key = settings::HOTKEY_LABELS.get(idx).map(|(k, _)| k.to_string());
+                        app.hotkey_capture = key;
+                        let _ = InvalidateRect(Some(hwnd), None, true);
+                    }
                     Some(settings::Hit::Row(action)) if action >= 1000 => {
                         // 插件行：动作编号 1000 + 模块下标
                         let idx = (action - 1000) as usize;
@@ -1536,6 +1585,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         }
         WM_LBUTTONUP => {
             let (x, y) = client_xy(hwnd, lparam);
+            // 圆角滑杆的拖拽到此为止（按住不放的那段由 WM_MOUSEMOVE 连续改值）
+            {
+                let app = &mut *app_ptr;
+                app.settings_radius_drag = false;
+            }
             // 拖标签：松手就落地（换顺序 / 8 向贴 / 拆成新进程）。
             // 必须排在最前面 —— 拖标签期间别的分支都不该插手。
             {
@@ -1863,6 +1917,29 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             if app.addr_editing {
                 return LRESULT(0);
             }
+            // 「快捷键」页正在录一个新组合键：这一下按键归它，不往下走
+            if let Some(act) = app.hotkey_capture.clone() {
+                let vk = wparam.0 as u32;
+                if vk == 0x1B {
+                    app.hotkey_capture = None;
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                    return LRESULT(0);
+                }
+                if let Some(name) = vk_name(vk) {
+                    let mut acc = String::new();
+                    mod_down(0x11, "ctrl+", &mut acc);
+                    mod_down(0x12, "alt+", &mut acc);
+                    mod_down(0x10, "shift+", &mut acc);
+                    acc.push_str(name);
+                    app.cfg.core.hotkeys.insert(act.clone(), acc.clone());
+                    let _ = fm_core::config::Config::save_user_patch(&serde_json::json!({
+                        "core": { "hotkeys": { act: acc } }
+                    }));
+                    app.hotkey_capture = None;
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                }
+                return LRESULT(0);
+            }
             handle_key(app, wparam.0 as i32);
             paint::sync_address(app);
             LRESULT(0)
@@ -2132,6 +2209,50 @@ fn show_bulk_rename_menu(hwnd: HWND, app: &mut App, l: &paint::Layout) {
         app.menu_hwnd = Some(h);
     }
 }
+
+/// 修饰键是否按下（VK_CONTROL 0x11 / VK_MENU 0x12 / VK_SHIFT 0x10）。
+fn mod_down(vk: i32, tag: &str, acc: &mut String) {
+    // GetKeyState 在 windows-rs 0.62 里是 unsafe 的（别处那几处调用点其实漏了
+    // unsafe，靠的是旧版签名 —— 这里照规矩包起来）
+    if unsafe { GetKeyState(vk) } < 0 {
+        acc.push_str(tag);
+    }
+}
+
+/// 虚拟键 → 配置里那个名字。只列真会有人拿来当快捷键的键，
+/// 认不出来的直接放弃（宁可不录，也不能录进一个解析不回来的串）。
+fn vk_name(vk: u32) -> Option<&'static str> {
+    Some(match vk {
+        0x08 => "backspace",
+        0x09 => "tab",
+        0x0D => "enter",
+        0x20 => "space",
+        0x21 => "pageup",
+        0x22 => "pagedown",
+        0x23 => "end",
+        0x24 => "home",
+        0x25 => "left",
+        0x26 => "up",
+        0x27 => "right",
+        0x28 => "down",
+        0x2D => "insert",
+        0x2E => "delete",
+        0x30..=0x39 => DIGITS[(vk - 0x30) as usize],
+        0x41..=0x5A => LETTERS[(vk - 0x41) as usize],
+        0x70..=0x87 => FKEYS[(vk - 0x70) as usize],
+        _ => return None,
+    })
+}
+
+const DIGITS: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+const LETTERS: [&str; 26] = [
+    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s",
+    "t", "u", "v", "w", "x", "y", "z",
+];
+const FKEYS: [&str; 24] = [
+    "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12", "f13", "f14",
+    "f15", "f16", "f17", "f18", "f19", "f20", "f21", "f22", "f23", "f24",
+];
 
 /// 松手：条目拖拽去落地 / 框选去选中。
 fn finish_drag(app: &mut App, l: &paint::Layout, x: i32, y: i32) {

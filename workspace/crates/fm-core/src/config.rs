@@ -61,6 +61,11 @@ pub struct UiConfig {
     /// "此电脑"这个节点默认是否展开（展开后才看得到具体盘符）。
     pub sidebar_thispc_expanded: bool,
     pub tabs: TabsConfig,
+    /// 圆角：键 = 圆角项 id（`fm_app::settings` 那棵三级树，如 "sidebar.hover"），
+    /// 值 = DIP 半径。用 map 而不是二十来个字段 —— 这棵树还会继续长，
+    /// 而且"没配过的项用默认值"正好靠 map 的缺省天然成立。
+    #[serde(default)]
+    pub radius: std::collections::BTreeMap<String, u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

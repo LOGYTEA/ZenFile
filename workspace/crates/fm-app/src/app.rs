@@ -33,12 +33,16 @@ pub const SETTINGS_PATH: &str = "shell:Settings";
 
 /// 设置页顶部小标签的下标（第 19 轮第 1 项）。
 pub const SETTINGS_TAB_UI: u8 = 0;
-pub const SETTINGS_TAB_MENU: u8 = 1;
-pub const SETTINGS_TAB_ADVANCED: u8 = 2;
-pub const SETTINGS_TAB_PLUGIN: u8 = 3;
-pub const SETTINGS_TAB_ABOUT: u8 = 4;
+pub const SETTINGS_TAB_LOOK: u8 = 1;
+pub const SETTINGS_TAB_INTERACT: u8 = 2;
+pub const SETTINGS_TAB_MENU: u8 = 3;
+pub const SETTINGS_TAB_HOTKEY: u8 = 4;
+pub const SETTINGS_TAB_ADVANCED: u8 = 5;
+pub const SETTINGS_TAB_PLUGIN: u8 = 6;
+pub const SETTINGS_TAB_ABOUT: u8 = 7;
 /// 设置页标签的显示名。顺序与上面的下标一一对应。
-pub const SETTINGS_TABS: [&str; 5] = ["界面", "右键菜单", "高级", "插件", "关于"];
+pub const SETTINGS_TABS: [&str; 8] =
+    ["界面", "外观", "交互", "右键菜单", "快捷键", "高级", "插件", "关于"];
 
 pub fn is_home_path(p: &Path) -> bool {
     p.to_string_lossy().eq_ignore_ascii_case(HOME_PATH)
@@ -603,6 +607,16 @@ pub struct App {
     pub settings_hover_tab: Option<u8>,
     /// 排布编辑器里鼠标悬停的组件/条目 id。
     pub settings_hover_card: Option<u32>,
+    /// 「外观」圆角树里当前选中的项 id（"global" / "sidebar" / "sidebar.hover"）。
+    pub settings_radius_sel: String,
+    /// 「外观」圆角树里已展开的节点 id。
+    pub settings_tree_open: HashSet<String>,
+    /// 「外观」圆角树里鼠标悬停的第几行。
+    pub settings_hover_tree: Option<usize>,
+    /// 「外观」圆角滑杆正被拖着（按下后不松手连续改值）。
+    pub settings_radius_drag: bool,
+    /// 「快捷键」：正在等一个新按键组合的动作名（`None` = 没在录）。
+    pub hotkey_capture: Option<String>,
     /// 排布编辑器里正在拖的卡片。
     pub settings_drag: Option<crate::settings::SettingsDrag>,
     /// 「界面 / 右键菜单」的排布（顺序 + 被收进「更多」的那些）。
@@ -995,6 +1009,11 @@ impl App {
             tab_drag: None,
             tab_hover_since: None,
             drag_dock: None,
+            settings_radius_sel: "global".to_string(),
+            settings_tree_open: HashSet::new(),
+            settings_hover_tree: None,
+            settings_radius_drag: false,
+            hotkey_capture: None,
             fast_mode: false,
             xfer: None,
             io_tx,
@@ -1285,6 +1304,26 @@ impl App {
             }
         }
         out.join(" 丨 ")
+    }
+
+    /// 某个圆角项当前的值（DIP）。没在配置里出现过就用树上的默认值 ——
+    /// 于是"加了新圆角项"不需要迁移旧配置。
+    pub fn radius_of(&self, id: &str) -> u32 {
+        self.cfg
+            .ui
+            .radius
+            .get(id)
+            .copied()
+            .unwrap_or_else(|| crate::settings::radius_default(id))
+    }
+
+    /// 改一个圆角项并写回用户层。
+    pub fn set_radius(&mut self, id: &str, v: u32) {
+        let v = v.min(crate::settings::radius_max(id));
+        self.cfg.ui.radius.insert(id.to_string(), v);
+        let _ = fm_core::config::Config::save_user_patch(&serde_json::json!({
+            "ui": { "radius": { id: v } }
+        }));
     }
 
     /// 当前标签下标越界了就夹回来（删标签、拖走标签之后都要）。
