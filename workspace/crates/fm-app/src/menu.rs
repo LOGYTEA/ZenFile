@@ -131,6 +131,13 @@ pub enum Command {
     RecycleSelectAll,
     NewTab,
     About,
+    // —— 第 19 轮：多窗口 ——
+    /// 在本进程里再开一个主窗口（托盘菜单 / Ctrl+N）
+    NewWindow,
+    /// 把第 n 个窗口提到前台（托盘菜单里的窗口清单）
+    FocusWindow(usize),
+    /// 关掉所有窗口并退出
+    QuitApp,
 }
 
 /// 去掉菜单文本里的 `&` 加速键标记。

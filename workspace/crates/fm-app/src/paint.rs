@@ -1117,7 +1117,7 @@ pub struct AddressBar {
 ///
 /// 面包屑排版必须量真实宽度：按"字数 × 平均宽"估算在中英混排下必然错位
 /// （"用户" 两字和 "Administrator" 十三个字母完全不是一个尺度）。
-unsafe fn text_width(hdc: HDC, font: HFONT, text: &str) -> i32 {
+pub(crate) unsafe fn text_width(hdc: HDC, font: HFONT, text: &str) -> i32 {
     let old = SelectObject(hdc, font.into());
     let w: Vec<u16> = text.encode_utf16().collect();
     let mut sz = SIZE::default();
@@ -2899,7 +2899,7 @@ pub fn settings_hit(app: &App, l: &Layout, x: i32, y: i32) -> Option<u32> {
 }
 
 /// Windows 11 风格的开关：胶囊轨道 + 圆滑块。开 = 强调色轨道、滑块靠右。
-fn draw_toggle(hdc: HDC, row: &SettingRow, app: &App, on: bool) {
+pub(crate) fn draw_toggle(hdc: HDC, row: &SettingRow, app: &App, on: bool) {
     let t = app.theme;
     let s = app.metrics.scale;
     let r = setting_switch_rect(row, s);
@@ -2925,7 +2925,7 @@ fn draw_toggle(hdc: HDC, row: &SettingRow, app: &App, on: bool) {
 
 /// 多选项（主题 / 大小单位 / 默认视图）：画成一个"当前值 ▾"按钮，
 /// 一眼看得出这一行是可以点开换值的。
-fn draw_value_button(hdc: HDC, row: &SettingRow, app: &App) {
+pub(crate) fn draw_value_button(hdc: HDC, row: &SettingRow, app: &App) {
     let t = app.theme;
     let s = app.metrics.scale;
     let r = setting_value_rect(row, s);
@@ -2956,7 +2956,25 @@ fn draw_value_button(hdc: HDC, row: &SettingRow, app: &App) {
     }
 }
 
+/// 设置页（第 19 轮第 1 项整体重做）。
+///
+/// 底色铺完就交给 `crate::settings`：顶部五个小标签、可拖拽的排布编辑器、
+/// 「更多」收纳区、高级开关、插件清单、关于页，全在那边。
 fn paint_settings(app: &mut App, hdc: HDC, l: &Layout) {
+    let t = app.theme;
+    unsafe {
+        let bg = CreateSolidBrush(t.window_bg);
+        let r = RECT { left: l.view.left, top: l.view.top, right: l.view.right, bottom: l.view.bottom };
+        FillRect(hdc, &r, bg);
+        let _ = DeleteObject(bg.into());
+    }
+    crate::settings::paint(app, hdc, l);
+}
+
+/// 老的设置页（分组开关清单）。「高级」标签现在的行定义还借用它的分组表，
+/// 因此保留为公开函数；新设置页的绘制走 `crate::settings::paint`。
+#[allow(dead_code)]
+pub fn paint_settings_legacy(app: &mut App, hdc: HDC, l: &Layout) {
     let t = app.theme;
     let s = app.metrics.scale;
     let rows = settings_rows(app, l);

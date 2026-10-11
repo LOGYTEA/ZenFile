@@ -17,6 +17,7 @@ mod rename;
 mod paint;
 mod props;
 mod shellnew;
+mod settings;
 mod sysview;
 mod theme;
 
@@ -43,6 +44,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 
 use app::{init_com, App};
 use fm_core::config;
@@ -51,7 +53,19 @@ use fm_core::paths::Target;
 
 /// App 实例的全局裸指针。WndProc 与子控件回调需要通过它访问状态；
 /// 全程单线程 UI，因此不存在数据竞争。
+///
+/// 多窗口（第 19 轮第 0 项）：每个主窗口各自持有一份 `App`（放在自己的
+/// GWLP_USERDATA 里），这里保留的是**第一个**窗口的 App —— 托盘、全局热键
+/// 这些"进程级"的东西挂在它身上。`WINDOWS` 是全部主窗口的清单。
 static mut APP: *mut App = std::ptr::null_mut();
+/// 本进程所有主窗口。最后一个关掉时才退出消息循环。
+pub(crate) static mut WINDOWS: Vec<HWND> = Vec::new();
+/// 托盘宿主的隐藏窗口类名。新实例靠 `FindWindowW` 找到它，把"要开的路径"
+/// 用 WM_COPYDATA 递过去然后自己退出 —— 于是多个窗口跑在**同一个进程**里，
+/// 图标缓存、文件名索引、配置缓存全部共用，不会因为多开而翻倍。
+static mut TRAY_CLASS: HSTRING = HSTRING::new();
+/// 托盘宿主的隐藏窗口句柄；本进程不是宿主时为 null。
+static mut TRAY_HWND: HWND = HWND(std::ptr::null_mut());
 
 const WM_TRAY: u32 = WM_APP + 1;
 /// 后台文件操作（复制/移动/拖拽落地）完成。由 worker 线程 Post 回来，
@@ -117,17 +131,36 @@ fn main() {
     }
 
     let tray_mode = args.iter().any(|a| a == "--tray");
+    /// 强制新开进程（标签拖出窗口 → 拆分窗口时用）。默认不开：见下。
+    let force_process = args.iter().any(|a| a == "--new-process");
+    let start_path = args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .map(PathBuf::from)
+        // 无参数时落在"主页"（与资源管理器首页一致），而不是进程的当前目录
+        .unwrap_or_else(|| PathBuf::from(app::HOME_PATH));
 
-    // 单实例锁 §3.1（第 4 条）
-    let mutex = unsafe {
-        windows::Win32::System::Threading::CreateMutexW(None, false, &HSTRING::from("ZenFile.SingleInstance"))
-    };
-    if let Err(e) = &mutex {
-        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-            eprintln!("已有一个实例在运行：{e:?}");
-            return;
-        }
+    // ---------------------------------------------------------------- 多窗口（第 19 轮第 0 项）
+    //
+    // 老行为是"抢不到单实例互斥量就退出"，于是**永远只有一个窗口**。现在改成：
+    //   * 已经有一个实例在跑 → 把要开的路径递给它，它在本进程里再开一个窗口，
+    //     本进程随即退出。多个窗口共享同一份图标缓存 / 文件名索引 / 配置，
+    //     这就是"多开但不吃资源"的做法（实测第二个窗口只多几百 KB）。
+    //   * `--new-process`（标签拖出窗口）才真的新起进程；它抢不到托盘互斥量，
+    //     因此**托盘始终只有一个**，且卫星进程不注册热键、不拉子模块。
+    if !force_process && hand_off_to_running_instance(&start_path) {
+        return;
     }
+
+    // 托盘归属锁：抢到的那个进程负责托盘。卫星进程抢不到 → 不注册托盘。
+    // 这样无论开多少个窗口/进程，系统托盘里始终只有一个 ZenFile 图标。
+    let tray_mutex = unsafe {
+        windows::Win32::System::Threading::CreateMutexW(None, false, &HSTRING::from("ZenFile.TrayOwner"))
+    };
+    // 注意：windows-rs 的 CreateMutexW 只看句柄是否为 NULL —— 名字已存在时
+    // 系统照样返回一个有效句柄，所以这里**必须自己看 GetLastError**。
+    // 只看 Ok/Err 的话每个进程都会以为自己是宿主，托盘图标就会有好几个。
+    let tray_owner = unsafe { GetLastError() } != ERROR_ALREADY_EXISTS;
 
     // COM 必须在 STA（§2 / §7.1）：上下文菜单与 IFileOperation 的前置条件。
     init_com();
@@ -148,94 +181,49 @@ fn main() {
         GetModuleHandleW(PCWSTR::null()).ok().map(|m| windows::Win32::Foundation::HINSTANCE(m.0))
     };
     register_classes(instance);
+    register_tray_class(instance);
 
     menu::register_menu_class();
     props::register_props_class();
     openwith::register_class();
     rename::register_class();
 
-    let hwnd = unsafe {
-        CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            PCWSTR(MAIN_CLASS.as_ptr()),
-            // 窗口标题带上版本号：alt-tab / 任务栏一眼能看出跑的是哪一版
-            PCWSTR(HSTRING::from(format!("{APP_TITLE} {APP_VERSION}")).as_ptr()),
-            // WS_CLIPCHILDREN 不能省：搜索框是一个子 EDIT 控件，放大镜和空态
-            // 提示都是画在它**自己**的 DC 上的。父窗口每次重绘会把整条工具栏
-            // （含搜索框那块矩形）刷成底色，没有这个样式就会把子控件刚画好的
-            // 装饰整块盖掉 —— 表现是"不点它的时候有图标和 placeholder，
-            // 一点上去父窗口重绘一次，就只剩一块空板了"。
-            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, // 含 WS_THICKFRAME：保留贴靠与最大化动画的前提 §4
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            (1180.0) as i32,
-            760,
-            None,
-            None,
-            instance,
-            None,
-        )
-    }
-    .expect("创建主窗口失败");
-
-    // 注意：这里必须是全 0。早期版本把 cyTopHeight 设为 1 想保留 DWM 圆角，
-    // 结果那 1px 玻璃区域在窗口激活时被 DWM 渲染成白色 —— 实测窗口顶部 y=0
-    // 整行 1180 个近白像素，也就是"顶部白线"和"标题栏按钮上的白框"，
-    // 两者是同一个根因。贴靠/最大化动画由 WM_NCHITTEST 返回 HTMAXBUTTON 保证，
-    // 不依赖这 1px 扩展。
-    unsafe {
-        let margins = MARGINS {
-            cxLeftWidth: 0,
-            cxRightWidth: 0,
-            cyTopHeight: 0,
-            cyBottomHeight: 0,
+    // 托盘宿主：一个**隐藏的顶层窗口**（不能是 HWND_MESSAGE —— 那种窗口
+    // FindWindowW 找不到，新实例就没法把路径递过来）。它永不显示，只负责收
+    // WM_TRAY 与 WM_COPYDATA。挂在隐藏窗口上而不是某个主窗口上，是为了
+    // "第一个窗口关了托盘就跟着没了"这种情况不再发生。
+    if tray_owner {
+        let th = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                PCWSTR(TRAY_CLASS.as_ptr()),
+                PCWSTR(HSTRING::from("ZenFileTrayHost").as_ptr()),
+                WS_POPUP,
+                0, 0, 0, 0,
+                None, None, instance, None,
+            )
         };
-        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
-    }
-
-    let start_path = args
-        .iter()
-        .find(|a| !a.starts_with('-'))
-        .map(PathBuf::from)
-        // 无参数时落在"主页"（与资源管理器首页一致），而不是进程的当前目录
-        .unwrap_or_else(|| PathBuf::from(app::HOME_PATH));
-
-    let mut boxed = Box::new(App::new(hwnd, cfg));
-    boxed.metrics = theme::Metrics::new(unsafe { GetDpiForWindow(hwnd) });
-    // 量度按 DPI 算完之后，再把"用户拖过的导航窗格宽度"盖回去
-    boxed.sync_metrics();
-    boxed.open_tab(start_path);
-    let app = Box::into_raw(boxed);
-    unsafe {
-        APP = app;
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
-    }
-
-    let app = unsafe { &mut *APP };
-    paint::create_children(app, instance);
-    paint::sync_address(app);
-
-    // 托盘（唯一）§3.1 第 3 条
-    add_tray(hwnd);
-
-    // 全局热键 §8：默认 Ctrl+Alt+*，Win 组合保留给用户自行配置
-    register_hotkeys(app, hwnd);
-
-    // 已启用模块作为子进程启动（导致任务管理器里的树状折叠）
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            app.spawn_modules(dir);
+        if let Ok(th) = th {
+            unsafe {
+                TRAY_HWND = th;
+                add_tray(th);
+            }
         }
     }
 
-    unsafe {
-        let _ = SetTimer(Some(hwnd), TIMER_DRAIN, 100, None);
-        let _ = SetTimer(Some(hwnd), TIMER_BUSY, 50, None);
-        if tray_mode {
-            let _ = ShowWindow(hwnd, SW_HIDE);
-        } else {
-            let _ = ShowWindow(hwnd, SW_SHOW);
-            let _ = windows::Win32::Graphics::Gdi::UpdateWindow(hwnd);
+    let Some(hwnd) = spawn_window(instance, cfg.clone(), start_path.clone(), true, !tray_mode) else {
+        eprintln!("创建主窗口失败");
+        return;
+    };
+
+    // 已启用模块作为子进程启动（导致任务管理器里的树状折叠）
+    // 只有宿主进程拉子模块：卫星进程再拉一份就是纯浪费。
+    if tray_owner {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let app = unsafe { &mut *APP };
+                app.spawn_modules(dir);
+            }
         }
     }
 
@@ -253,20 +241,332 @@ fn main() {
 
     // 退出顺序 §3.6：先终止子进程再让宿主退出
     unsafe {
-        let _ = KillTimer(Some(hwnd), TIMER_DRAIN);
-        let _ = KillTimer(Some(hwnd), TIMER_BUSY);
-        let _ = UnregisterHotKey(Some(hwnd), HOTKEY_MAIN);
-        remove_tray(hwnd);
-        let app = &mut *APP;
-        if let Some(tree) = app.tree.take() {
-            drop(tree);
+        if !TRAY_HWND.0.is_null() {
+            remove_tray(TRAY_HWND);
         }
-        if let Some(w) = app.watcher.take() {
-            w.stop();
+        if !APP.is_null() {
+            let app = &mut *APP;
+            if let Some(tree) = app.tree.take() {
+                drop(tree);
+            }
+            if let Some(w) = app.watcher.take() {
+                w.stop();
+            }
         }
         let _ = drop_app();
-        let _ = CloseHandle(mutex.unwrap());
+        if let Ok(m) = tray_mutex {
+            let _ = CloseHandle(m);
+        }
     }
+}
+
+/// 新建一个主窗口（连同它自己的 `App`）。本进程内可以有任意多个。
+///
+/// `primary` 表示这是本进程的第一个窗口：全局热键只注册一次（同一个热键
+/// 在同一线程里注册两次会失败），托盘由隐藏的托盘宿主窗口负责，与这里无关。
+fn spawn_window(
+    instance: Option<HINSTANCE>,
+    cfg: fm_core::config::Config,
+    start: PathBuf,
+    primary: bool,
+    show: bool,
+) -> Option<HWND> {
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            PCWSTR(MAIN_CLASS.as_ptr()),
+            // 窗口标题带上版本号：alt-tab / 任务栏一眼能看出跑的是哪一版
+            PCWSTR(HSTRING::from(format!("{APP_TITLE} {APP_VERSION}")).as_ptr()),
+            // WS_CLIPCHILDREN 不能省：搜索框是一个子 EDIT 控件，放大镜和空态
+            // 提示都是画在它**自己**的 DC 上的。父窗口每次重绘会把整条工具栏
+            // （含搜索框那块矩形）刷成底色，没有这个样式就会把子控件刚画好的
+            // 装饰整块盖掉 —— 表现是"不点它的时候有图标和 placeholder，
+            // 一点上去父窗口重绘一次，就只剩一块空板了"。
+            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, // 含 WS_THICKFRAME：保留贴靠与最大化动画的前提 §4
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            1180,
+            760,
+            None,
+            None,
+            instance,
+            None,
+        )
+    };
+    let Ok(hwnd) = hwnd else { return None };
+
+    // 注意：这里必须是全 0。早期版本把 cyTopHeight 设为 1 想保留 DWM 圆角，
+    // 结果那 1px 玻璃区域在窗口激活时被 DWM 渲染成白色 —— 实测窗口顶部 y=0
+    // 整行 1180 个近白像素，也就是"顶部白线"和"标题栏按钮上的白框"，
+    // 两者是同一个根因。贴靠/最大化动画由 WM_NCHITTEST 返回 HTMAXBUTTON 保证，
+    // 不依赖这 1px 扩展。
+    unsafe {
+        let margins = MARGINS {
+            cxLeftWidth: 0,
+            cxRightWidth: 0,
+            cyTopHeight: 0,
+            cyBottomHeight: 0,
+        };
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+    }
+
+    let mut boxed = Box::new(App::new(hwnd, cfg));
+    boxed.metrics = theme::Metrics::new(unsafe { GetDpiForWindow(hwnd) });
+    // 量度按 DPI 算完之后，再把"用户拖过的导航窗格宽度"盖回去
+    boxed.sync_metrics();
+    boxed.open_tab(start);
+    let app = Box::into_raw(boxed);
+    unsafe {
+        if APP.is_null() {
+            APP = app;
+        }
+        let cascade = WINDOWS.len() as i32;
+        WINDOWS.push(hwnd);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
+        // 第二个及以后的窗口错开一点，否则新窗口把旧的整个盖住，看着像没开
+        if cascade > 0 {
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                80 + cascade * 34,
+                60 + cascade * 34,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    let app = unsafe { &mut *app };
+    paint::create_children(app, instance);
+    paint::sync_address(app);
+
+    // 全局热键 §8：默认 Ctrl+Alt+*，Win 组合保留给用户自行配置。
+    // 只能注册一次 —— 同一个线程里对同一个 ID 注册第二次会失败。
+    if primary {
+        register_hotkeys(app, hwnd);
+    }
+
+    unsafe {
+        let _ = SetTimer(Some(hwnd), TIMER_DRAIN, 100, None);
+        let _ = SetTimer(Some(hwnd), TIMER_BUSY, 50, None);
+        if show {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = windows::Win32::Graphics::Gdi::UpdateWindow(hwnd);
+        }
+    }
+    Some(hwnd)
+}
+
+/// 关掉本进程所有窗口（托盘菜单「退出」）。
+pub unsafe fn close_all_windows() {
+    let all: Vec<HWND> = WINDOWS.clone();
+    for h in all {
+        let _ = DestroyWindow(h);
+    }
+    if !TRAY_HWND.0.is_null() {
+        let _ = DestroyWindow(TRAY_HWND);
+    }
+}
+
+/// 在本进程里再开一个主窗口（Ctrl+N / 托盘菜单 / 标签拆分）。
+///
+/// 复用当前进程的 App 配置对象：图标缓存、文件名索引、配置都只有一份，
+/// 第二个窗口不会把内存翻一倍。
+pub fn new_window(path: PathBuf) {
+    let instance = unsafe { GetModuleHandleW(PCWSTR::null()).ok().map(|m| HINSTANCE(m.0)) };
+    let cfg = match app_ref_opt() {
+        Some(a) => a.cfg.clone(),
+        None => match fm_core::config::Config::defaults() {
+            Ok(c) => c,
+            Err(_) => return,
+        },
+    };
+    if let Some(h) = spawn_window(instance, cfg, path, false, true) {
+        unsafe {
+            let _ = SetForegroundWindow(h);
+        }
+    }
+}
+
+/// 把第 n 个窗口提到前台（托盘菜单里的窗口清单）。
+pub fn focus_window(i: usize) {
+    unsafe {
+        let Some(h) = WINDOWS.get(i).copied() else { return };
+        if IsIconic(h).0 != 0 {
+            let _ = ShowWindow(h, SW_RESTORE);
+        }
+        if IsWindowVisible(h).0 == 0 {
+            let _ = ShowWindow(h, SW_SHOW);
+        }
+        let _ = SetForegroundWindow(h);
+    }
+}
+
+// ---------------------------------------------------------------- 托盘宿主窗口
+
+fn register_tray_class(instance: Option<HINSTANCE>) {
+    unsafe {
+        TRAY_CLASS = HSTRING::from("ZenFileTrayHost");
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(tray_proc),
+            hInstance: instance.unwrap_or_default(),
+            lpszClassName: PCWSTR(TRAY_CLASS.as_ptr()),
+            ..Default::default()
+        };
+        RegisterClassExW(&wc);
+    }
+}
+
+/// 把"要打开的路径"交给已经在跑的那个实例，成功则返回 true（本进程随即退出）。
+///
+/// 这是"多开不吃资源"的关键：新窗口开在老进程里，图标缓存、文件名索引、
+/// 配置对象全是同一份，第二个窗口只多几百 KB，而不是再来一个 27MB。
+fn hand_off_to_running_instance(path: &std::path::Path) -> bool {
+    unsafe { TRAY_CLASS = HSTRING::from("ZenFileTrayHost") };
+    let host = unsafe { FindWindowW(PCWSTR(TRAY_CLASS.as_ptr()), None) };
+    let Ok(host) = host else { return false };
+    if host.0.is_null() {
+        return false;
+    }
+    let mut text: Vec<u16> = path.to_string_lossy().encode_utf16().collect();
+    text.push(0);
+    let mut cds = COPYDATASTRUCT {
+        dwData: 1, // 1 = "开一个新窗口"
+        cbData: (text.len() * 2) as u32,
+        lpData: text.as_mut_ptr() as *mut core::ffi::c_void,
+    };
+    unsafe {
+        let _ = SendMessageW(
+            host,
+            WM_COPYDATA,
+            Some(WPARAM(0)),
+            Some(LPARAM(&mut cds as *mut COPYDATASTRUCT as isize)),
+        );
+    }
+    true
+}
+
+unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_COPYDATA => {
+            let cds = &*(lparam.0 as *const COPYDATASTRUCT);
+            if cds.dwData == 1 && !cds.lpData.is_null() && cds.cbData > 1 {
+                let slice = std::slice::from_raw_parts(cds.lpData as *const u16, (cds.cbData as usize) / 2);
+                let s = String::from_utf16_lossy(slice);
+                let s = s.trim_end_matches('\0');
+                let p = if s.is_empty() {
+                    PathBuf::from(app::HOME_PATH)
+                } else {
+                    PathBuf::from(s)
+                };
+                let instance = GetModuleHandleW(PCWSTR::null())
+                    .ok()
+                    .map(|m| HINSTANCE(m.0));
+                let cfg = app_ref_opt()
+                    .map(|a| a.cfg.clone())
+                    .unwrap_or_else(|| fm_core::config::Config::defaults().unwrap());
+                if let Some(h) = spawn_window(instance, cfg, p, false, true) {
+                    let _ = ShowWindow(h, SW_SHOW);
+                    let _ = SetForegroundWindow(h);
+                }
+            }
+            LRESULT(1)
+        }
+        WM_TRAY => {
+            match lparam.0 as u32 {
+                // 左键单击 / 双击：有窗口就把它们全叫回来（含"关闭时退到托盘"
+                // 藏起来的那些），一个都没有才新开一个。
+                0x0201 | 0x0203 => {
+                    if WINDOWS.is_empty() {
+                        let instance = GetModuleHandleW(PCWSTR::null())
+                            .ok()
+                            .map(|m| HINSTANCE(m.0));
+                        let cfg = app_ref_opt()
+                            .map(|a| a.cfg.clone())
+                            .unwrap_or_else(|| fm_core::config::Config::defaults().unwrap());
+                        if let Some(h) =
+                            spawn_window(instance, cfg, PathBuf::from(app::HOME_PATH), false, true)
+                        {
+                            let _ = SetForegroundWindow(h);
+                        }
+                    } else {
+                        let mut first = None;
+                        for h in WINDOWS.iter() {
+                            let hh = *h;
+                            if IsIconic(hh).0 != 0 {
+                                let _ = ShowWindow(hh, SW_RESTORE);
+                            }
+                            if IsWindowVisible(hh).0 == 0 {
+                                let _ = ShowWindow(hh, SW_SHOW);
+                            }
+                            if first.is_none() {
+                                first = Some(hh);
+                            }
+                        }
+                        if let Some(h) = first {
+                            let _ = SetForegroundWindow(h);
+                        }
+                    }
+                }
+                // 右键：托盘菜单（新建窗口 / 窗口清单 / 退出）
+                0x0205 => show_tray_menu(hwnd),
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            remove_tray(hwnd);
+            // 托盘宿主没了：如果还有主窗口在跑，说明是用户关了最后一个窗口
+            // 又退了宿主 —— 这时候整个进程该收工。
+            PostQuitMessage(0);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// 托盘右键菜单。用自绘菜单（和窗口内右键同一套观感）。
+fn show_tray_menu(hwnd: HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut pt = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
+    }
+    let (scale, theme, app) = match app_ref_opt() {
+        Some(a) => (a.metrics.scale, a.theme.clone(), a as *mut App),
+        None => (1.0, theme::dark(), std::ptr::null_mut()),
+    };
+    if app.is_null() {
+        return;
+    }
+    let mut entries: Vec<menu::MenuEntry> = vec![
+        app::shell_row("新建窗口", Some("\u{E8A7}"), menu::Command::NewWindow),
+        app::shell_row("设置", Some("\u{E713}"), menu::Command::OpenSettings),
+        menu::MenuEntry::sep(),
+    ];
+    unsafe {
+        for (i, h) in WINDOWS.iter().enumerate() {
+            let mut buf = [0u16; 256];
+            let n = GetWindowTextW(*h, &mut buf);
+            let title = String::from_utf16_lossy(&buf[..n as usize]);
+            let short = if title.chars().count() > 34 {
+                format!("{}…", title.chars().take(34).collect::<String>())
+            } else {
+                title
+            };
+            let label = if IsWindowVisible(*h).0 != 0 {
+                short
+            } else {
+                format!("{short}（已隐藏）")
+            };
+            entries.push(app::shell_row(&label, Some("\u{E7B3}"), menu::Command::FocusWindow(i)));
+        }
+    }
+    entries.push(menu::MenuEntry::sep());
+    entries.push(app::shell_row("退出 ZenFile", Some("\u{E7E8}"), menu::Command::QuitApp));
+    let _ = menu::open_menu(app, hwnd, entries, pt.x, pt.y, scale, theme, None, false);
 }
 
 static mut MAIN_CLASS: HSTRING = HSTRING::new();
@@ -641,6 +941,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 app.cfg.ui.sidebar_visible,
                 app.cfg.ui.statusbar_visible,
             );
+            // 设置页排布编辑器：正在拖卡片，只更新位置并重画，别的命中一概不理。
+            if app.tab().settings && app.settings_drag.is_some() {
+                if let Some(d) = &mut app.settings_drag {
+                    d.cur = (x, y);
+                }
+                let _ = InvalidateRect(Some(hwnd), None, false);
+                return LRESULT(0);
+            }
             // 正在拖条目 / 拉框选：更新当前点、重算投放目标并重画。
             // 必须排在别的命中之前 —— 拖拽期间不该改变选中集。
             if app.drag.is_some() {
@@ -706,11 +1014,29 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             } else {
                 0u8
             };
-            // 设置页的悬停行：点哪一行要高亮，否则不知道自己会改到哪一项
-            let hover_setting = if app.tab().settings {
-                paint::settings_hit(app, &l, x, y)
+            // 设置页的悬停：顶部小标签 + 排布卡片/收纳项 + 开关行
+            let (hover_setting, hover_set_tab, hover_set_card) = if app.tab().settings {
+                if app.settings_drag.is_some() {
+                    (app.settings_hover, app.settings_hover_tab, app.settings_hover_card)
+                } else {
+                    let mut ht = None;
+                    let mut hc = None;
+                    let mut hr = None;
+                    match settings::hit(app, &l, x, y) {
+                        Some(settings::Hit::Tab(i)) => ht = Some(i),
+                        Some(settings::Hit::Card(i)) => {
+                            hc = settings::geom(app, &l).card_ids.get(i).copied()
+                        }
+                        Some(settings::Hit::Chip(i)) => {
+                            hc = settings::geom(app, &l).chip_ids.get(i).copied()
+                        }
+                        Some(settings::Hit::Row(a)) => hr = Some(a),
+                        None => {}
+                    }
+                    (hr, ht, hc)
+                }
             } else {
-                None
+                (None, None, None)
             };
             // 工具栏「后退/前进/向上」三个导航按钮的悬停。
             // 它们本质是按钮，不给底色就只像三个浮着的图标。
@@ -769,7 +1095,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 || hover_header != app.hover_header
                 || hover_rec != app.hover_recycle
                 || hover_rec_btn != app.hover_recycle_btn
+                || hover_set_tab != app.settings_hover_tab
+                || hover_set_card != app.settings_hover_card
             {
+                app.settings_hover_tab = hover_set_tab;
+                app.settings_hover_card = hover_set_card;
                 app.hover_nav = hover_nav;
                 app.hover_header = hover_header;
                 app.hover_recycle = hover_rec;
@@ -890,6 +1220,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 app.invalidate();
                 return LRESULT(0);
             }
+            // 设置页排布编辑器：按下卡片/收纳项 → 开始拖
+            if app.tab().settings {
+                if let Some(h) = settings::hit(app, &l, x, y) {
+                    if settings::begin_drag(app, &l, &h, x, y) {
+                        let _ = SetCapture(hwnd);
+                        let _ = InvalidateRect(Some(hwnd), None, true);
+                        return LRESULT(0);
+                    }
+                }
+            }
             // 分隔线（导航窗格宽度 / 表头列宽）：排在虚拟视图分支之前，
             // 否则打开设置页之后整条消息在设置分支里就 return 了。
             if let Some(which) = paint::split_hit(app, &l, x, y) {
@@ -927,14 +1267,31 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     return LRESULT(0);
                 }
             }
-            // 设置页：开关点一下就切；**多选项点一下展开下拉**（不再循环切换）
+            // 设置页：顶部小标签切换；开关点一下就切；多选项点一下展开下拉
             if app.tab().settings {
-                if let Some(action) = paint::settings_hit(app, &l, x, y) {
-                    if matches!(action, paint::SET_THEME | paint::SET_UNIT | paint::SET_VIEW) {
-                        show_setting_dropdown(hwnd, app, &l, action);
-                    } else if let Some(cmd) = settings_command(action) {
-                        app.run_command(cmd);
+                match settings::hit(app, &l, x, y) {
+                    Some(settings::Hit::Tab(i)) => {
+                        app.settings_tab = i;
+                        app.settings_hover_card = None;
+                        let _ = InvalidateRect(Some(hwnd), None, true);
                     }
+                    Some(settings::Hit::Row(action)) if action >= 1000 => {
+                        // 插件行：动作编号 1000 + 模块下标
+                        let idx = (action - 1000) as usize;
+                        let key = app.cfg.modules.keys().nth(idx).cloned();
+                        if let Some(k) = key {
+                            let on = app.cfg.modules.get(&k).map(|m| m.enabled).unwrap_or(false);
+                            app.set_module_enabled(&k, !on);
+                        }
+                    }
+                    Some(settings::Hit::Row(action)) => {
+                        if matches!(action, paint::SET_THEME | paint::SET_UNIT | paint::SET_VIEW) {
+                            show_setting_dropdown(hwnd, app, &l, action);
+                        } else if let Some(cmd) = settings_command(action) {
+                            app.run_command(cmd);
+                        }
+                    }
+                    _ => {}
                 }
                 return LRESULT(0);
             }
@@ -1106,6 +1463,23 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         }
         WM_LBUTTONUP => {
             let (x, y) = client_xy(hwnd, lparam);
+            // 设置页排布编辑器：松手落地（收进「更多」/ 插到新位置 / 拖回恢复）
+            {
+                let app = &mut *app_ptr;
+                if app.settings_drag.is_some() {
+                    let _ = ReleaseCapture();
+                    let l = paint::compute_layout(
+                        app.last_size.0,
+                        app.last_size.1,
+                        &app.metrics,
+                        app.cfg.ui.sidebar_visible,
+                        app.cfg.ui.statusbar_visible,
+                    );
+                    settings::finish_drag(app, &l, x, y);
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                    return LRESULT(0);
+                }
+            }
             // 拖完条目 / 拉完框：落地
             {
                 let app = &mut *app_ptr;
@@ -1431,20 +1805,42 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
-        WM_TRAY => {
-            if lparam.0 as u32 == 0x0201 || lparam.0 as u32 == 0x0203 {
-                let hidden = IsWindowVisible(hwnd).0 == 0;
-                let _ = ShowWindow(hwnd, if hidden { SW_SHOW } else { SW_HIDE });
-                if hidden {
-                    let _ = SetForegroundWindow(hwnd);
-                }
-            } else if lparam.0 as u32 == 0x0205 {
-                let _ = DestroyWindow(hwnd);
-            }
-            LRESULT(0)
-        }
+        // 托盘消息不再走这里（见 `tray_proc`）：托盘挂在隐藏的托盘宿主窗口上，
+        // 于是"关掉第一个窗口"不会把托盘图标一起带走。
         WM_DESTROY => {
-            PostQuitMessage(0);
+            unsafe {
+                let _ = KillTimer(Some(hwnd), TIMER_DRAIN);
+                let _ = KillTimer(Some(hwnd), TIMER_BUSY);
+                if std::ptr::eq(app_ptr, APP) {
+                    let _ = UnregisterHotKey(Some(hwnd), HOTKEY_MAIN);
+                }
+                WINDOWS.retain(|h| *h != hwnd);
+                if !app_ptr.is_null() {
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                    let mut boxed = Box::from_raw(app_ptr);
+                    // 后台线程必须在这里收掉：它们 PostMessage 回这个 hwnd，
+                    // 窗口没了之后每帧一次的 drain 也跟着没了，线程会一直挂着。
+                    if let Some(w) = boxed.watcher.take() {
+                        w.stop();
+                    }
+                    if let Some(c) = boxed.index_cancel.take() {
+                        c.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    drop(boxed);
+                    if std::ptr::eq(app_ptr, APP) {
+                        APP = std::ptr::null_mut();
+                    }
+                }
+                if WINDOWS.is_empty() {
+                    // 最后一个窗口关了：进程收工。托盘宿主窗口一起拆掉，
+                    // 否则系统托盘里会留下一个点不动的残影。
+                    if !TRAY_HWND.0.is_null() {
+                        let _ = DestroyWindow(TRAY_HWND);
+                        TRAY_HWND = HWND(std::ptr::null_mut());
+                    }
+                    PostQuitMessage(0);
+                }
+            }
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -2164,6 +2560,10 @@ fn handle_key(app: &mut App, key: i32) {
         // 所以不能只 focus 那个平时藏着的 EDIT，得先把它显示出来。
         _ if ctrl && key == 0x4C => paint::begin_address_edit(app),
         _ if ctrl && key == 0x54 => app.new_tab(),
+        // Ctrl+N：新开一个**窗口**（与 Ctrl+T 新标签区分）。开在本进程里，资源共享。
+        _ if ctrl && !shift && key == 0x4E => crate::new_window(PathBuf::from(app::HOME_PATH)),
+        // Ctrl+,：打开设置（Windows 应用的通用设置快捷键）
+        _ if ctrl && key == 0xBC => app.open_settings(),
         _ if ctrl && key == 0x57 => app.close_tab(app.active),
         _ if ctrl && shift && key == 0x4E => app.new_folder(),
         _ if ctrl && shift && key == 0x56 => app.cycle_view(),

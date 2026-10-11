@@ -31,6 +31,15 @@ pub const RECYCLE_PATH: &str = "shell:RecycleBin";
 /// 设置页哨兵路径。以标签页形式打开，不参与目录枚举。
 pub const SETTINGS_PATH: &str = "shell:Settings";
 
+/// 设置页顶部小标签的下标（第 19 轮第 1 项）。
+pub const SETTINGS_TAB_UI: u8 = 0;
+pub const SETTINGS_TAB_MENU: u8 = 1;
+pub const SETTINGS_TAB_ADVANCED: u8 = 2;
+pub const SETTINGS_TAB_PLUGIN: u8 = 3;
+pub const SETTINGS_TAB_ABOUT: u8 = 4;
+/// 设置页标签的显示名。顺序与上面的下标一一对应。
+pub const SETTINGS_TABS: [&str; 5] = ["界面", "右键菜单", "高级", "插件", "关于"];
+
 pub fn is_home_path(p: &Path) -> bool {
     p.to_string_lossy().eq_ignore_ascii_case(HOME_PATH)
 }
@@ -472,6 +481,16 @@ pub struct App {
     pub recycle_sel: HashSet<String>,
     /// 设置页里鼠标悬停的行（存的是该行的动作编号，行位置会随开关文案变化）。
     pub settings_hover: Option<u32>,
+    /// 设置页当前停在哪个小标签（见 `SETTINGS_TABS`）。
+    pub settings_tab: u8,
+    /// 设置页顶部小标签的悬停下标。
+    pub settings_hover_tab: Option<u8>,
+    /// 排布编辑器里鼠标悬停的组件/条目 id。
+    pub settings_hover_card: Option<u32>,
+    /// 排布编辑器里正在拖的卡片。
+    pub settings_drag: Option<crate::settings::SettingsDrag>,
+    /// 「界面 / 右键菜单」的排布（顺序 + 被收进「更多」的那些）。
+    pub ui_settings: crate::settings::Settings,
     /// 文件名索引（Everything 式秒搜）。整卷一份，常驻内存。
     pub index: Option<std::sync::Arc<fm_core::index::Index>>,
     /// `index` 属于哪个卷根（`C:\`）。换了卷要重新载入。
@@ -840,6 +859,11 @@ impl App {
             hover_recycle: None,
             hover_recycle_btn: 0,
             settings_hover: None,
+            settings_tab: 0,
+            settings_hover_tab: None,
+            settings_hover_card: None,
+            settings_drag: None,
+            ui_settings: crate::settings::Settings::load(),
             hover_caption: 0,
             pressed_caption: 0,
             addr_editing: false,
@@ -2406,14 +2430,13 @@ impl App {
             Command::RecycleEmpty => self.empty_recycle(),
             Command::RecycleSelectAll => self.recycle_select_all(),
             Command::NewTab => self.new_tab(),
-            Command::About => report(
-                self.hwnd,
-                &format!(
-                    "{} 轻量资源管理器\n{}\n\nWin32 + GDI 自绘，无 WebView2 依赖",
-                    crate::APP_TITLE,
-                    crate::APP_VERSION
-                ),
-            ),
+            // 新窗口开在本进程里（共享图标缓存 / 文件名索引 / 配置），
+            // 这是"多开不吃资源"的做法。
+            Command::NewWindow => crate::new_window(PathBuf::from(HOME_PATH)),
+            Command::FocusWindow(i) => crate::focus_window(i),
+            Command::QuitApp => unsafe { crate::close_all_windows() },
+            // 「关于」不再弹 MessageBox：跳到设置页的「关于」标签（第 19 轮第 1 项）
+            Command::About => self.open_settings_at(SETTINGS_TAB_ABOUT),
         }
     }
 
@@ -2554,11 +2577,17 @@ impl App {
 
     /// 以标签页形式打开设置页。已经开过就直接切过去，避免堆一串重复标签。
     pub fn open_settings(&mut self) {
+        self.open_settings_at(self.settings_tab);
+    }
+
+    /// 打开设置页并停到指定标签（「关于」从这里进）。
+    pub fn open_settings_at(&mut self, tab: u8) {
         if let Some(i) = self.tabs.iter().position(|t| t.settings) {
             self.active = i;
         } else {
             self.open_tab(PathBuf::from(SETTINGS_PATH));
         }
+        self.settings_tab = tab;
         self.settings_hover = None;
         crate::paint::sync_address(self);
         self.invalidate();
@@ -2657,7 +2686,7 @@ impl App {
     }
 
     /// 只把 UI 开关写回 settings.user.json，不覆盖其它字段。
-    fn persist_ui_pref(&self) {
+    pub fn persist_ui_pref(&self) {
         if let Err(e) = fm_core::config::Config::save_user_patch(&serde_json::json!({
             "ui": {
                 "sidebar_visible": self.cfg.ui.sidebar_visible,
@@ -2734,6 +2763,20 @@ impl App {
     }
 
     // ------------------------------------------------------------ 模块与配置
+
+    /// 启用/停用一个子模块（设置页「插件」标签用）。
+    ///
+    /// 只改用户层配置并落盘；已经跑着的进程不动它 —— 下一次启动才按新开关拉起，
+    /// 这比"边跑边杀" predictable 得多。
+    pub fn set_module_enabled(&mut self, id: &str, on: bool) {
+        if let Some(m) = self.cfg.modules.get_mut(id) {
+            m.enabled = on;
+        }
+        let _ = fm_core::config::Config::save_user_patch(&serde_json::json!({
+            "modules": { id: { "enabled": on } }
+        }));
+        self.invalidate();
+    }
 
     pub fn spawn_modules(&mut self, exe_dir: &Path) {
         let mut tree = match ProcessTree::new() {
@@ -3336,34 +3379,39 @@ pub fn submenu_row(text: &str, glyph: Option<&'static str>, children: Vec<menu::
 }
 
 /// 自绘菜单的第一屏：图标行 + 常规动作（§7 产品化解法）。
+///
+/// 第 19 轮：条目的**顺序与显隐由设置页「右键菜单」标签决定**（拖出来的排布存在
+/// `ui_settings.json`）。所以这里先按 id 收进一张表，最后再按排布吐出去 ——
+/// 而不是像以前那样写死一串 push。id 与 `settings::MENU_ITEM_NAMES` 一一对应。
 fn own_menu_rows(app: &App, items: &[PathBuf]) -> Vec<menu::MenuEntry> {
-    let mut rows = Vec::new();
+    let mut tagged: Vec<(u16, menu::MenuEntry)> = Vec::new();
+    let mut push = |id: u16, e: menu::MenuEntry| tagged.push((id, e));
+
     if !items.is_empty() {
-        rows.push(shell_row("打开", Some("\u{E8A7}"), Command::Open));
+        push(0, shell_row("打开", Some("\u{E8A7}"), Command::Open));
         // 「打开方式」只对文件有意义：文件夹的"打开方式"在资源管理器里也没有。
         if items.iter().any(|p| p.is_file()) {
-            rows.push(shell_row("打开方式", Some("\u{E7AC}"), Command::OpenWith));
+            push(1, shell_row("打开方式", Some("\u{E7AC}"), Command::OpenWith));
         }
         // 「复制」这类"要拿走点什么"的动作，在没有可复制内容时必须是**禁用态**：
         // 资源管理器里它就是淡的、点不动。之前不管有没有选中都照常列出，
         // 点下去静悄悄什么都不发生，看着像菜单坏了。
         if copyable_here(app) {
-            rows.push(shell_row("剪切", Some("\u{E8C6}"), Command::Cut));
-            rows.push(shell_row("复制", Some("\u{E8C8}"), Command::Copy));
+            push(2, shell_row("剪切", Some("\u{E8C6}"), Command::Cut));
+            push(3, shell_row("复制", Some("\u{E8C8}"), Command::Copy));
         } else {
-            rows.push(disabled_row("剪切", Some("\u{E8C6}"), Command::Cut));
-            rows.push(disabled_row("复制", Some("\u{E8C8}"), Command::Copy));
+            push(2, disabled_row("剪切", Some("\u{E8C6}"), Command::Cut));
+            push(3, disabled_row("复制", Some("\u{E8C8}"), Command::Copy));
         }
-        rows.push(shell_row("重命名", Some("\u{E8AC}"), Command::Rename));
+        // 粘贴要有东西可粘才可用：剪贴板里没有 CF_HDROP 时同样是禁用态
+        if clipboard::has_files() {
+            push(4, shell_row("粘贴", Some("\u{E77F}"), Command::Paste));
+        } else {
+            push(4, disabled_row("粘贴", Some("\u{E77F}"), Command::Paste));
+        }
+        push(5, shell_row("重命名", Some("\u{E8AC}"), Command::Rename));
         // 「批量重命名」搬到了目录栏最右侧的按钮（带下拉），不再占右键菜单的位置
-        rows.push(shell_row("删除", Some("\u{E74D}"), Command::Delete));
-        rows.push(menu::MenuEntry::sep());
-    }
-    // 粘贴要有东西可粘才可用：剪贴板里没有 CF_HDROP 时同样是禁用态
-    if clipboard::has_files() {
-        rows.push(shell_row("粘贴", Some("\u{E77F}"), Command::Paste));
-    } else {
-        rows.push(disabled_row("粘贴", Some("\u{E77F}"), Command::Paste));
+        push(7, shell_row("删除", Some("\u{E74D}"), Command::Delete));
     }
     if items.is_empty() {
         // —— 以下只属于"空白处右键"（背景菜单）——
@@ -3371,10 +3419,9 @@ fn own_menu_rows(app: &App, items: &[PathBuf]) -> Vec<menu::MenuEntry> {
         // 资源管理器里右键**某个文件/文件夹**时，菜单里没有"查看/排序方式/刷新/新建/全选"：
         // 那些是"对当前这个视图做什么"，不是"对这个东西做什么"。之前不管右键落在
         // 哪都照单全列，点"刷新"的时候看着像菜单做多了。
-        rows.push(submenu_row("新建", Some("\u{E8F4}"), new_rows()));
-        rows.push(menu::MenuEntry::sep());
-        rows.push(shell_row("全选", Some("\u{E762}"), Command::SelectAll));
-        rows.push(shell_row("刷新", Some("\u{E72C}"), Command::Refresh));
+        push(8, submenu_row("新建", Some("\u{E8F4}"), new_rows()));
+        push(9, shell_row("全选", Some("\u{E762}"), Command::SelectAll));
+        push(10, shell_row("刷新", Some("\u{E72C}"), Command::Refresh));
         let mut view_children = view_rows(app);
         view_children.push(menu::MenuEntry::sep());
         // 三道开关分开列：隐藏项是用户自己设的，系统项是系统保护的，
@@ -3386,17 +3433,48 @@ fn own_menu_rows(app: &App, items: &[PathBuf]) -> Vec<menu::MenuEntry> {
             Command::ToggleExtensions,
             app.cfg.files.view.show_extensions,
         ));
-        rows.push(submenu_row("查看", Some("\u{E7B3}"), view_children));
-        rows.push(submenu_row("排序方式", Some("\u{E8CB}"), sort_rows(app)));
+        push(11, submenu_row("查看", Some("\u{E7B3}"), view_children));
+        push(12, submenu_row("排序方式", Some("\u{E8CB}"), sort_rows(app)));
     }
-    rows.push(shell_row(
-        if items.is_empty() { "属性（当前文件夹）" } else { "属性" },
-        Some("\u{E946}"),
-        Command::Properties,
-    ));
+    push(
+        13,
+        shell_row(
+            if items.is_empty() { "属性（当前文件夹）" } else { "属性" },
+            Some("\u{E946}"),
+            Command::Properties,
+        ),
+    );
     // 「设置」从右键菜单里去掉了：它是"改软件"的入口，混在"对这个东西做什么"
     // 的菜单里既不合语义又容易被误点（用户要求）。入口保留在「更多」菜单。
-    rows
+
+    // —— 按排布输出 ——
+    let order = &app.ui_settings.menu_order;
+    let hidden = &app.ui_settings.menu_hidden;
+    let mut out: Vec<menu::MenuEntry> = Vec::new();
+    for id in order {
+        if hidden.contains(id) {
+            continue;
+        }
+        // 分隔线跟着分组走：粘贴是"改这个东西"的收尾，属性单独一节，
+        // 空白处右键的"新建…"另起一节。
+        let sep_before = (*id == 8 && items.is_empty()) || *id == 13;
+        if sep_before {
+            out.push(menu::MenuEntry::sep());
+        }
+        if let Some((_, e)) = tagged.iter().find(|(i, _)| i == id) {
+            out.push(e.clone());
+        }
+    }
+    // 排布里没记的条目（以后新增的）补在末尾，不至于凭空消失
+    for (id, e) in &tagged {
+        if !order.contains(id) && !hidden.contains(id) {
+            out.push(e.clone());
+        }
+    }
+    while matches!(out.last(), Some(e) if e.separator) {
+        out.pop();
+    }
+    out
 }
 
 /// 菜单全局去重：同名的一级项只留第一条。
