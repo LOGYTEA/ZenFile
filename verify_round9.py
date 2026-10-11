@@ -508,13 +508,24 @@ if tab_now and tab0:
     t1_before = grab(hwnd)
     move(hwnd, rr[0] + tab_w // 2, 16)
     t1_after = grab(hwnd)
-    # 只看标签 1 右侧那一小块（关闭按钮该出现的地方）
-    ink_before = sum(1 for y in range(6, 30) for x in range(rr[1] - 26, rr[1] - 4)
-                     if sum(px(t1_before[0], t1_before[1], x, y)) > 200)
-    ink_after = sum(1 for y in range(6, 30) for x in range(rr[1] - 26, rr[1] - 4)
-                    if sum(px(t1_after[0], t1_after[1], x, y)) > 200)
-    print(f"    标签1 右侧墨迹: 悬停前 {ink_before} -> 悬停后 {ink_after}")
-    mark(ink_after > ink_before + 8, "鼠标悬停非激活标签后出现关闭按钮")
+    # 只看标签 1 右侧那一小块（关闭按钮该出现的地方）。
+    # 注意：第十三轮改成**每个标签都常画 ×**（原来只有当前/悬停那个才画，
+    # 用户反馈就是"标签关不掉"）。所以判据不能再是"悬停后才冒出来"，
+    # 而是两条：① 不悬停也看得见 ×；② 悬停时 × 底下要有 hover 底色反馈。
+    def close_ink(rw, st, pred):
+        return sum(1 for y in range(6, 30) for x in range(rr[1] - 26, rr[1] - 4)
+                   if pred(px(rw, st, x, y)))
+
+    glyph = lambda c: sum(c) > 200
+    hover_fill = lambda c: all(abs(a - b) <= 12 for a, b in zip(c, HOVER_BG))
+    g_before, g_after = close_ink(t1_before[0], t1_before[1], glyph), \
+        close_ink(t1_after[0], t1_after[1], glyph)
+    f_before, f_after = close_ink(t1_before[0], t1_before[1], hover_fill), \
+        close_ink(t1_after[0], t1_after[1], hover_fill)
+    print(f"    标签1 × 墨迹: 悬停前 {g_before} -> 悬停后 {g_after}；"
+          f"hover 底色 {f_before} -> {f_after}")
+    mark(g_before >= 8, "非激活标签也常画关闭按钮（不必悬停才出现）")
+    mark(f_after > f_before + 20, "悬停时关闭按钮有底色反馈")
     # 中键关闭标签 1
     p_before = strip_ink_right(t1_after[0], t1_after[1], w, h)
     u.PostMessageW(hwnd, WM_MBUTTONDOWN, 0, (16 << 16) | ((rr[0] + tab_w // 2) & 0xFFFF))

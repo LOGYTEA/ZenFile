@@ -242,12 +242,18 @@ if len(cs) >= 2:
     # 折叠掉的最深一层是 NexAddr（保留的是 Level1..Level4）
     mark(after.lower().endswith("nexaddr"), f"点 `…` 跳到被折叠的那一层（{after}）")
 raw, stride, w, h = grab(hw)
-overflow = sum(
+# 不能拿"地址框右边 30px 内没有亮像素"当判据：那块地盘现在是**搜索框**，
+# 它自己的放大镜和占位文字本来就该亮在那儿（第十轮加的）。真正要守的是
+# 面包屑自己别越过地址框右沿 —— 折叠完最后一节的右边界必须在框内。
+last_right = cs[-1][1] if cs else A[0]
+gap = sum(
     1 for y in range(A[1] + 3, A[3] - 3)
-    for x in range(A[2] + 2, min(A[2] + 30, w - 1))
+    for x in range(A[2] + 1, min(A[2] + 6, w - 1))
     if sum(px(raw, stride, x, y)) > 200
 )
-mark(overflow == 0, f"窄窗口下也没有溢出到框外（{overflow} px）")
+print(f"  最后一节右沿 {last_right} / 地址框右沿 {A[2]}；紧邻右侧 5px 亮像素 {gap}")
+mark(last_right <= A[2] - 1, f"折叠后面包屑仍收在地址框内（右沿 {last_right} ≤ {A[2]}）")
+mark(gap == 0, f"地址框右侧留有空隙，没有糊到下一个控件上（{gap} px）")
 
 # 编辑态
 print("\n[编辑态] 点地址栏空白处")

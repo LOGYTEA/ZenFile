@@ -720,7 +720,14 @@ impl App {
     }
 
     pub fn close_tab(&mut self, index: usize) {
+        // 只剩一个标签也允许关：点了 × 窗口却纹丝不动，是"按钮坏了"的典型观感。
+        // 资源管理器在这里是关掉整个窗口，而我们有托盘模式，关窗口 ≠ 退出，
+        // 所以照样关，然后补一个新的主页标签回来。
         if self.tabs.len() <= 1 {
+            self.tabs.clear();
+            self.active = 0;
+            self.open_tab(PathBuf::from(HOME_PATH));
+            self.invalidate();
             return;
         }
         self.tabs.remove(index);

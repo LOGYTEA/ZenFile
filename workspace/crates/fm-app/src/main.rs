@@ -54,6 +54,8 @@ static mut APP: *mut App = std::ptr::null_mut();
 
 const WM_TRAY: u32 = WM_APP + 1;
 const TIMER_DRAIN: usize = 1;
+/// 对外显示的产品名。托盘提示、窗口标题、标题栏落款共用这一份，改一处就够。
+pub const APP_TITLE: &str = "ZenFile";
 /// 目录栏下沿进度条的动画节拍。一直挂着，但只有 busy() 时才真的重画。
 const TIMER_BUSY: usize = 2;
 const HOTKEY_MAIN: i32 = 1;
@@ -137,7 +139,7 @@ fn main() {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             PCWSTR(MAIN_CLASS.as_ptr()),
-            PCWSTR(HSTRING::from("ZenFile").as_ptr()),
+            PCWSTR(HSTRING::from(APP_TITLE).as_ptr()),
             WS_OVERLAPPEDWINDOW, // 含 WS_THICKFRAME：保留贴靠与最大化动画的前提 §4
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -325,7 +327,7 @@ unsafe fn attach_console() {}
 
 fn add_tray(hwnd: HWND) {
     let mut tip: [u16; 128] = [0; 128];
-    for (i, c) in "ZenFile 资源管理器".encode_utf16().take(127).enumerate() {
+    for (i, c) in format!("{APP_TITLE} 资源管理器").encode_utf16().take(127).enumerate() {
         tip[i] = c;
     }
     let mut nid = NOTIFYICONDATAW {

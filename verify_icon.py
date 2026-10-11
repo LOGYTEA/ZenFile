@@ -32,7 +32,11 @@ g.GetDIBits.argtypes = [wt.HDC, wt.HBITMAP, ctypes.c_uint, ctypes.c_uint,
                         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
 
 
-def grab(hwnd):
+def grab(hwnd, print_window=False):
+    """自绘窗口（ZenFile）必须走 PrintWindow(PW_RENDERFULLCONTENT)：
+    它的内容全画在一张内存位图上，直接从 GetDC 上 BitBlt 抓到的往往是一帧
+    半成品 —— 量出来的"图标"就会是一块实心方块。资源管理器是普通窗口，
+    BitBlt 反而更稳（PrintWindow 对 CabinetWClass 不一定买账）。"""
     r = wt.RECT()
     u.GetWindowRect(hwnd, ctypes.byref(r))
     w, h = r.right - r.left, r.bottom - r.top
@@ -40,7 +44,12 @@ def grab(hwnd):
     mem = g.CreateCompatibleDC(hdc)
     bmp = g.CreateCompatibleBitmap(hdc, w, h)
     g.SelectObject(mem, bmp)
-    g.BitBlt(mem, 0, 0, w, h, hdc, 0, 0, 0x00CC0020)
+    if print_window:
+        u.PrintWindow.restype = wt.BOOL
+        u.PrintWindow.argtypes = [wt.HWND, wt.HDC, ctypes.c_uint]
+        u.PrintWindow(hwnd, mem, 2)
+    else:
+        g.BitBlt(mem, 0, 0, w, h, hdc, 0, 0, 0x00CC0020)
     hdr = struct.pack("<IiiHHIIiiII", 40, w, h, 1, 32, 0, w * h, 0, 0, 0, 0)
     buf = ctypes.create_string_buffer(w * h * 4)
     g.GetDIBits(mem, bmp, 0, h, buf, hdr, 0)
@@ -89,8 +98,36 @@ def shape(at, x, y, bg):
 
 
 # --- ZenFile ---
+# 这是个**手工对照脚本**（要同时开着资源管理器做逐像素比对），但也不能因为
+# 没开着 ZenFile 就直接 IndexError —— 自己拉起来一个再抓。
+import os as _os
+import subprocess as _sp
+import time as _t
+
+EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\ZenFile.exe"
+CMP_DIR = _os.path.join(_os.environ.get("TEMP", r"C:\Windows\Temp"), "ZenIconCmp")
+for _i in range(3):
+    _os.makedirs(_os.path.join(CMP_DIR, f"folder{_i}"), exist_ok=True)
+
 hw = u.FindWindowW("ZenFileMainWindow", None)
-raw, w, h = grab(hw)
+if not hw:
+    _sp.run(["taskkill", "/F", "/IM", "ZenFile.exe"], capture_output=True)
+    _t.sleep(0.4)
+    _sp.Popen([EXE, CMP_DIR])
+    for _ in range(60):
+        _t.sleep(0.25)
+        hw = u.FindWindowW("ZenFileMainWindow", None)
+        if hw:
+            _t.sleep(1.8)
+            break
+if not hw:
+    print("ZenFile 起不来")
+    sys.exit(1)
+raw, w, h = grab(hw, print_window=True)
+if w < 400 or h < 300:
+    print(f"抓到的窗口尺寸不对（{w}x{h}）：BitBlt 对自绘双缓冲窗口拿不到内容，"
+          f"请确认 ZenFile 已在前台可见")
+    sys.exit(1)
 at = mk(raw, w, h)
 res = find_folder_icon(raw, w, h, 157, 400, 100, 500)
 if not res:
@@ -112,15 +149,23 @@ def cb(hwnd, lp):
         b = ctypes.create_unicode_buffer(256)
         u.GetClassNameW(hwnd, b, 256)
         if b.value == "CabinetWClass":
-            found.append(hwnd)
+            # 最小化的窗口矩形是 320x210 的"图标标题"尺寸而非真实客户区，
+            # BitBlt 出来全黑，量出来的 w/h 也和业务无关，直接跳过。
+            r = wt.RECT()
+            u.GetWindowRect(hwnd, ctypes.byref(r))
+            if r.right - r.left >= 400 and r.bottom - r.top >= 300:
+                found.append(hwnd)
     return True
 
 
 u.EnumWindows(WNDENUMPROC(cb), 0)
 if not found:
-    print("\n（未打开资源管理器，跳过对比）")
+    print("\n（未打开资源管理器或窗口被最小化，跳过对比）")
     sys.exit(0)
 raw2, w2, h2 = grab(found[0])
+if w2 < 400 or h2 < 300:
+    print(f"\n（资源管理器窗口尺寸 {w2}x{h2} 不可用，跳过对比）")
+    sys.exit(0)
 at2 = mk(raw2, w2, h2)
 res2 = find_folder_icon(raw2, w2, h2, 157, min(w2-20,600), 100, min(h2-20,600))
 if not res2:

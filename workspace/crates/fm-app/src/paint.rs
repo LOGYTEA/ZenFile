@@ -11,7 +11,8 @@ use windows::Win32::Graphics::Gdi::{
     IntersectClipRect, InvalidateRect, LineTo, MoveToEx, PS_SOLID, Rectangle, ReleaseDC, RestoreDC,
     SaveDC, SelectObject, SetBkMode, SetTextColor, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
     DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DRAW_TEXT_FORMAT, FONT_CHARSET,
-    FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FONT_QUALITY, HDC, HFONT, SRCCOPY, TRANSPARENT,
+    FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FONT_QUALITY, GetStockObject, HDC, HFONT,
+    NULL_BRUSH, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::UI::Controls::EM_SETSEL;
@@ -125,9 +126,9 @@ pub fn sidebar_font(scale: f32) -> HFONT {
             if !SIDEBAR_FONT.0.is_null() {
                 let _ = DeleteObject(SIDEBAR_FONT.into());
             }
-            // -16 是上一轮"改大点"的结果，实测比菜单正文还大一号，整条侧栏显得笨重。
-            // 回到 -13：与列表正文同号，导航窗格本来就该比内容区轻一点。
-            SIDEBAR_FONT = make_font((-13.0 * scale).round() as i32, 400, "Microsoft YaHei UI");
+            // -13 与列表正文同号，但导航窗格看起来还是偏重（用户嫌大）。
+            // 再降一档到 -12：比重列表轻一号，才是资源管理器导航窗格的分量。
+            SIDEBAR_FONT = make_font((-12.0 * scale).round() as i32, 400, "Microsoft YaHei UI");
             SIDEBAR_FONT_SCALE = scale;
         }
         SIDEBAR_FONT
@@ -463,6 +464,10 @@ fn paint_drag_overlay(app: &mut App, hdc: HDC, l: &Layout) {
     let bz = ((t.window_bg.0 >> 16) & 0xFF) as i32;
     // 半透明填充用手动混色省掉一次 AlphaBlend（覆盖层是纯装饰，够用）
     let blend = COLORREF(((ax + bx) / 2 | (((ay + by) / 2) << 8) | (((az + bz) / 2) << 16)) as u32);
+    let items: Vec<std::path::PathBuf> = match app.drag.as_ref() {
+        Some(d) if d.active => d.items.clone(),
+        _ => Vec::new(),
+    };
     unsafe {
         let pen = CreatePen(PS_SOLID, 1, accent);
         let old_pen = SelectObject(hdc, pen.into());
@@ -491,13 +496,32 @@ fn paint_drag_overlay(app: &mut App, hdc: HDC, l: &Layout) {
             SelectObject(hdc, old_b);
         }
 
-        // 2) 框选矩形
+        // 2) 框选矩形：Win11 那种"淡蓝半透明遮罩 + accent 边"。
+        //
+        // 之前用 `Rectangle()` 直接填实色构图填搞定：实色把底下的文件条目整块盖住，
+        // 拖的时候只能看见一块板，看不见自己框进去的是什么。这里改成真·半透明：
+        // 先把 accent 铺进一张离屏图，再用 AlphaBlend 以 60/255 压上去 —— 底下
+        // 的文字还能透出来（混的是真实内容，不是混背景色）。
         if kind == crate::app::DragKind::Marquee {
             let r = marquee;
-            Rectangle(hdc, r.left, r.top, r.right, r.bottom);
+            alpha_fill_rect(hdc, &r, accent, 60);
+            let ob = SelectObject(hdc, GetStockObject(NULL_BRUSH).into());
+            MoveToEx(hdc, r.left, r.top, None);
+            LineTo(hdc, r.right - 1, r.top);
+            LineTo(hdc, r.right - 1, r.bottom - 1);
+            LineTo(hdc, r.left, r.bottom - 1);
+            LineTo(hdc, r.left, r.top);
+            SelectObject(hdc, ob);
         }
 
-        // 3) 跟着光标的提示牌："移动 3 项到 下载"
+        // 3) 拖拽影像：跟着光标的一张小卡片（图标 + 名字），半透明。
+        //
+        // 没有它的时候，按住文件拖只看见一个写着"移动 3 项到 xx"的文字条，
+        // 完全不像"把东西拎起来了" —— 用户问"拖动效果呢"就是这个。
+        if kind == crate::app::DragKind::Items && !items.is_empty() {
+            draw_drag_image(app, hdc, cur, &items, copy);
+        }
+        // 4) 跟着光标的提示牌："移动 3 项到 下载"
         if kind == crate::app::DragKind::Items {
             let text = match &target_name {
                 Some(nm) => format!("{} {} 项到 {}", if copy { "复制" } else { "移动" }, items_n, nm),
@@ -531,6 +555,161 @@ fn paint_drag_overlay(app: &mut App, hdc: HDC, l: &Layout) {
         SelectObject(hdc, old_pen);
         let _ = DeleteObject(brush.into());
         let _ = DeleteObject(pen.into());
+    }
+}
+
+/// 拖拽影像里的图标：目录走 dir_icon（认 desktop.ini 的自定义图标），文件按扩展名。
+fn drag_icon(app: &mut App, path: &std::path::Path) -> HICON {
+    if path.is_dir() {
+        app.icons.dir_icon(path, true)
+    } else {
+        let ext = path
+            .extension()
+            .map(|x| format!(".{}", x.to_string_lossy()))
+            .unwrap_or_default();
+        app.icons.file_icon(path, &ext, true)
+    }
+}
+
+/// 给一个矩形铺上半透明色（真·AlphaBlend）。
+///
+/// 不能图省事把颜色和目标底色手动混一混再实心填充：那样混出来的是**不透明**
+/// 的一块板，底下的内容全被盖住。这里把色块画进离屏图，再以 alpha 压上去，
+/// 底下是什么就还能看见什么（这是 AlphaBlend 和普通 FillRect 唯一的本质区别）。
+fn alpha_fill_rect(hdc: HDC, r: &RECT, color: COLORREF, alpha: u8) {
+    let w = (r.right - r.left).max(1);
+    let h = (r.bottom - r.top).max(1);
+    unsafe {
+        let mem = CreateCompatibleDC(Some(hdc));
+        if mem.is_invalid() {
+            return;
+        }
+        let bmp = CreateCompatibleBitmap(hdc, w, h);
+        let old = SelectObject(mem, bmp.into());
+        let br = CreateSolidBrush(color);
+        FillRect(mem, &RECT { left: 0, top: 0, right: w, bottom: h }, br);
+        let _ = DeleteObject(br.into());
+        let mut bf: windows::Win32::Graphics::Gdi::BLENDFUNCTION = std::mem::zeroed();
+        bf.BlendOp = windows::Win32::Graphics::Gdi::AC_SRC_OVER as u8;
+        bf.BlendFlags = 0;
+        bf.SourceConstantAlpha = alpha;
+        bf.AlphaFormat = 0;
+        let _ = windows::Win32::Graphics::Gdi::AlphaBlend(
+            hdc, r.left, r.top, w, h, mem, 0, 0, w, h, bf,
+        );
+        SelectObject(mem, old);
+        let _ = DeleteObject(bmp.into());
+        let _ = DeleteDC(mem);
+    }
+}
+
+/// 跟手的拖拽影像：一张半透明小卡片，图标 + 名字（多项时堆叠两枚图标）。
+///
+/// 位置在光标右下 12px 处（资源管理器同款），整体按 80% 不透明度压上去 ——
+/// 拖拽影像必须能透出底下内容，否则松手前看不见自己待会儿要落在哪。
+fn draw_drag_image(app: &mut App, hdc: HDC, cur: (i32, i32), items: &[std::path::PathBuf], copy: bool) {
+    let s = app.metrics.scale;
+    let icon_s = (32.0 * s).round() as i32;
+    let pad = (8.0 * s).round() as i32;
+    let gap = (6.0 * s).round() as i32;
+    let first = &items[0];
+    let name = if items.len() == 1 {
+        crate::app::display_title(first)
+    } else {
+        format!("{} 项", items.len())
+    };
+    let font = ui_font(s);
+    let tw = unsafe {
+        let old = SelectObject(hdc, font.into());
+        let w = text_width(hdc, font, &name);
+        SelectObject(hdc, old);
+        w
+    };
+    // 多项时把第二枚图标错开一点，做出"一叠"的感觉
+    let stack = if items.len() > 1 { (6.0 * s).round() as i32 } else { 0 };
+    let w = pad * 2 + icon_s + stack + gap + tw;
+    let h = pad * 2 + icon_s.max((16.0 * s).round() as i32);
+    let x = cur.0 + (12.0 * s).round() as i32;
+    let y = cur.1 + (12.0 * s).round() as i32;
+    // 卡片先画进离屏图（底色/accent 边/图标/文字），整张再半透明压上去
+    unsafe {
+        let mem = CreateCompatibleDC(Some(hdc));
+        if mem.is_invalid() {
+            return;
+        }
+        let bmp = CreateCompatibleBitmap(hdc, w, h);
+        let old = SelectObject(mem, bmp.into());
+        let bg = CreateSolidBrush(app.theme.surface);
+        FillRect(mem, &RECT { left: 0, top: 0, right: w, bottom: h }, bg);
+        let _ = DeleteObject(bg.into());
+        let pen = CreatePen(
+            windows::Win32::Graphics::Gdi::PS_SOLID,
+            (1.0 * s).round().max(1.0) as i32,
+            app.theme.accent,
+        );
+        let op = SelectObject(mem, pen.into());
+        let ob = SelectObject(mem, GetStockObject(NULL_BRUSH).into());
+        MoveToEx(mem, 0, 0, None);
+        let _ = LineTo(mem, w - 1, 0);
+        let _ = LineTo(mem, w - 1, h - 1);
+        let _ = LineTo(mem, 0, h - 1);
+        let _ = LineTo(mem, 0, 0);
+        SelectObject(mem, ob);
+        SelectObject(mem, op);
+        let _ = DeleteObject(pen.into());
+
+        let icons: Vec<HICON> = items
+            .iter()
+            .take(2)
+            .map(|p| drag_icon(app, p))
+            .collect();
+        if items.len() > 1 {
+            app.icons.draw(mem, icons[1], pad + stack, pad + stack / 2, icon_s);
+            app.icons.draw(mem, icons[0], pad, pad, icon_s);
+        } else {
+            app.icons.draw(mem, icons[0], pad, pad, icon_s);
+        }
+        let of = SelectObject(mem, font.into());
+        SetBkMode(mem, TRANSPARENT);
+        SetTextColor(mem, app.theme.text);
+        let mut n: Vec<u16> = name.encode_utf16().collect();
+        DrawTextW(
+            mem,
+            &mut n,
+            &mut RECT { left: pad + icon_s + stack + gap, top: 0, right: w - pad, bottom: h },
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+        );
+        SelectObject(mem, of);
+        // 复制时左上角挂一个小 "+"：这是资源管理器区分移动/复制的唯一视觉信号
+        if copy {
+            let d = (14.0 * s).round() as i32;
+            let br = CreateSolidBrush(app.theme.accent);
+            FillRect(mem, &RECT { left: 0, top: 0, right: d, bottom: d }, br);
+            let _ = DeleteObject(br.into());
+            let gf = glyph_font(s);
+            let og = SelectObject(mem, gf.into());
+            SetTextColor(mem, app.theme.text);
+            let mut plus: Vec<u16> = "\u{E710}".encode_utf16().collect();
+            DrawTextW(
+                mem,
+                &mut plus,
+                &mut RECT { left: 0, top: 0, right: d, bottom: d },
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+            SelectObject(mem, og);
+        }
+
+        let mut bf: windows::Win32::Graphics::Gdi::BLENDFUNCTION = std::mem::zeroed();
+        bf.BlendOp = windows::Win32::Graphics::Gdi::AC_SRC_OVER as u8;
+        bf.BlendFlags = 0;
+        bf.SourceConstantAlpha = 205;
+        bf.AlphaFormat = 0;
+        let _ = windows::Win32::Graphics::Gdi::AlphaBlend(
+            hdc, x, y, w, h, mem, 0, 0, w, h, bf,
+        );
+        SelectObject(mem, old);
+        let _ = DeleteObject(bmp.into());
+        let _ = DeleteDC(mem);
     }
 }
 
@@ -628,9 +807,8 @@ fn paint_title_bar(app: &mut App, hdc: HDC, l: &Layout) {
             // 标题文字右侧要留出关闭按钮的位置，否则长标题会被 × 压住
             let mut tr = pad_rect_width(&r, 10);
             tr.left = icon_x + icon_s + (6.0 * app.metrics.scale).round() as i32;
-            if i == app.active || hovered {
-                tr.right -= (18.0 * app.metrics.scale) as i32;
-            }
+            // 现在每个标签都有 ×，这块地方无条件留出来，不能按 hover 态变
+            tr.right -= (18.0 * app.metrics.scale) as i32;
             draw_text(hdc, &tab.title, tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
             if i == app.active {
                 let accent = CreateSolidBrush(t.accent);
@@ -638,15 +816,18 @@ fn paint_title_bar(app: &mut App, hdc: HDC, l: &Layout) {
                 FillRect(hdc, &line, accent);
                 let _ = DeleteObject(accent.into());
             }
-            // 关闭按钮：当前标签常驻，其余标签只在鼠标悬停时出现（同资源管理器）
-            if i == app.active || hovered {
+            // 关闭按钮：**每个标签都常画**。
+            // 早先学资源管理器"只画当前/悬停那个"，结果用户找不到 ×，反馈就是
+            // "标签关不掉" —— 看不见的按钮等于不存在。代价是标签栏稍挤一点，
+            // 但"能关"比"像"重要。非活动标签的 × 画淡一点，视觉重心仍在当前标签。
+            {
                 let cr = l.tab_close_rect(i, app.tabs.len(), &app.metrics);
                 if hovered {
                     let hb = CreateSolidBrush(t.hover_bg);
                     FillRect(hdc, &cr, hb);
                     let _ = DeleteObject(hb.into());
                 }
-                SetTextColor(hdc, t.text);
+                SetTextColor(hdc, if i == app.active || hovered { t.text } else { t.text_dim });
                 let g = glyph_font(app.metrics.scale);
                 let old_g = SelectObject(hdc, g.into());
                 draw_text(hdc, "\u{E8BB}", cr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
@@ -659,6 +840,11 @@ fn paint_title_bar(app: &mut App, hdc: HDC, l: &Layout) {
         if plus.right < l.tabs.right {
             draw_chrome_button(app, hdc, &plus, "\u{E710}", false); // Add
         }
+        // 程序名：自绘标题栏把系统标题整个盖掉了，界面上没有任何地方写得出
+        // ZenFile —— 用户问"软件名改在哪"就是这个。资源管理器在这里显示
+        // "此电脑 - 文件资源管理器"，我们照抄同一套位置：标签栏右边、"+"
+        // 之后靠 tags.right 排。
+        draw_app_name(app, hdc, l);
         // 侧栏折叠开关（最左）与更多菜单（最小化左侧）
         draw_chrome_button(
             app,
@@ -680,6 +866,39 @@ fn paint_title_bar(app: &mut App, hdc: HDC, l: &Layout) {
         draw_caption_button(app, hdc, &l.min_btn, 1);
         draw_caption_button(app, hdc, &l.max_btn, 2);
         draw_caption_button(app, hdc, &l.close_btn, 3);
+        SelectObject(hdc, old);
+    }
+}
+
+/// 标题栏上的程序名 "- ZenFile"。
+///
+/// 位置在标签栏右端起往右排，遇不到标签就紧贴标题栏右侧留 12px。
+/// 用 text_dim 写：它是"从属于当前标签"的次级信息，不该抢文件名那一行的
+/// 注意力（资源管理器也是把它写成淡色）。
+fn draw_app_name(app: &mut App, hdc: HDC, l: &Layout) {
+    let s = app.metrics.scale;
+    let text = format!("- {}", crate::APP_TITLE);
+    let font = ui_font(s);
+    unsafe {
+        let old = SelectObject(hdc, font.into());
+        let w = text_width(hdc, font, &text) + (4.0 * s) as i32;
+        let left = l.tabs.right - w;
+        let r = RECT { left, top: l.title.top, right: l.tabs.right, bottom: l.title.bottom };
+        // 贴着最后一个标签时给一点空隙，别让人看成标签的一部分
+        let pad = (12.0 * s) as i32;
+        let r = if left < l.new_tab_rect(app.tabs.len(), &app.metrics).right + pad {
+            RECT { left: l.tabs.right - w + pad, ..r }
+        } else {
+            r
+        };
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, app.theme.text_dim);
+        draw_text(
+            hdc,
+            &text,
+            r,
+            DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+        );
         SelectObject(hdc, old);
     }
 }
@@ -1628,7 +1847,7 @@ fn paint_home(app: &mut App, hdc: HDC, l: &Layout) {
                 sr.bottom = bar.top - 2;
                 DrawTextW(hdc, &mut sub, &mut sr, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
 
-                // 容量条：轨道 + 已用占比。
+                // 容量条：轨道 + **剩余**占比。
                 //
                 // 两点精度要求：
                 // 1) 宽度一律走**整数四舍五入**（`(used*w + total/2)/total`）。
@@ -1642,9 +1861,12 @@ fn paint_home(app: &mut App, hdc: HDC, l: &Layout) {
                 if let Some(d) = drive {
                     if let (Some(total), Some(free)) = (d.total, d.available) {
                         if total > 0 {
-                            let used = total.saturating_sub(free);
+                            // 条**填的是剩余空间**（不是已用）。旁边的文案写的是
+                            // "X 可用，共 Y"，条和数字口径一致才读得懂：以前按
+                            // 已用填，数字报"236 GB 可用"、条却只填到 36%，
+                            // 看着像"条坏了"。
                             let full = bar.right - bar.left;
-                            let w = ((used as u128 * full as u128 + (total as u128) / 2)
+                            let w = ((free as u128 * full as u128 + (total as u128) / 2)
                                 / total as u128) as i32;
                             if w > 0 && w <= full {
                                 let fill = RECT { right: bar.left + w, ..bar };
@@ -1778,6 +2000,18 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
         let col_size = cols.size;
 
         let visible: Vec<usize> = app.tab().visible.clone();
+        // 当前正在被拖走的那些条目的 key（小写路径）—— 画的时候要调淡
+        let dragged: Vec<String> = app
+            .drag
+            .as_ref()
+            .filter(|d| d.active)
+            .map(|d| {
+                d.items
+                    .iter()
+                    .map(|p| p.to_string_lossy().to_lowercase())
+                    .collect()
+            })
+            .unwrap_or_default();
         let header_h = (26.0 * app.metrics.scale) as i32;
         let list_top = l.view.top + if mode == fm_core::ViewMode::Details { header_h } else { 0 };
         let view_h = l.view.bottom - list_top;
@@ -1825,7 +2059,12 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
                 continue;
             };
             let (path, name, size, is_dir, is_hidden, is_system) = snap;
-            let alpha = if is_system { 110 } else if is_hidden { 150 } else { 255 };
+            let mut alpha = if is_system { 110 } else if is_hidden { 150 } else { 255 };
+            // 正在被拖走的那些条目要淡下去。资源管理器就是这么表示的：东西已经
+            // "拎在手上"，原地剩下的是一个占位影子，不然根本看不出拖的是哪几个。
+            if dragged.contains(&path.to_string_lossy().to_lowercase()) {
+                alpha = alpha.min(90);
+            }
             icon_alpha.push(alpha);
             let ext = path
                 .extension()
@@ -2876,8 +3115,11 @@ pub fn end_address_edit(app: &mut App, refocus: bool) {
 }
 
 pub fn sync_address(app: &App) {
+    // 主页那一页（常用文件夹 + 本机驱动器）在资源管理器里地址栏写的就是"主页"，
+    // 侧栏虽然把首页并到了"此电脑"这一格，但**地址栏要标的是"这是哪一页"**，
+    // 不是"从哪点进来的"，所以这里写"主页"。
     let text = if app.tab().home {
-        "此电脑".to_string()
+        "主页".to_string()
     } else if app.tab().recycle {
         "回收站".to_string()
     } else if app.tab().settings {
