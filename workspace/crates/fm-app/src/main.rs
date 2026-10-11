@@ -878,6 +878,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 if app.tick_refresh_home() {
                     let _ = InvalidateRect(Some(hwnd), None, true);
                 }
+                // 拖着文件悬在标签上满 600ms → 自动切到那个标签
+                if app.tick_tab_hover() {
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                }
                 // 自研传输跑完就重列目录（弹窗自己也在轮询同一份 stats）
                 app.drain_transfer();
             }
@@ -954,12 +958,31 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 let _ = InvalidateRect(Some(hwnd), None, false);
                 return LRESULT(0);
             }
+            // 正在拖**标签**：算去处（换顺序 / 8 向贴 / 拖出窗口）并重画。
+            // 也要排在别的命中之前：拖标签期间不该去动选中集。
+            if app.tab_drag.is_some() {
+                update_tab_drag(app, hwnd, &l, x, y);
+                return LRESULT(0);
+            }
             // 正在拖条目 / 拉框选：更新当前点、重算投放目标并重画。
             // 必须排在别的命中之前 —— 拖拽期间不该改变选中集。
             if app.drag.is_some() {
                 let ctrl_now = (wparam.0 & 0x0008) != 0 || GetKeyState(0x11) < 0;
                 app.update_drag(x, y, ctrl_now);
                 let target = drop_target_at(app, &l, x, y);
+                // 拖着文件悬在某个标签上：记下"从第几毫秒开始悬着"，
+                // 满 600ms 由 WM_TIMER 自动把那个标签翻出来（资源管理器同款）。
+                if let Some(t) = &target {
+                    if let app::DropKind::Tab(i) = t.kind {
+                        if app.tab_hover_since.map(|(j, _)| j) != Some(i) {
+                            app.tab_hover_since = Some((i, std::time::Instant::now()));
+                        }
+                    } else {
+                        app.tab_hover_since = None;
+                    }
+                } else {
+                    app.tab_hover_since = None;
+                }
                 app.drop_target = target;
                 let _ = InvalidateRect(Some(hwnd), None, true);
                 return LRESULT(0);
@@ -1215,6 +1238,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 app.cfg.ui.sidebar_visible,
                 app.cfg.ui.statusbar_visible,
             );
+            // 分栏时"点哪一边哪一边就是当前窗格"。必须在任何命中测试之前做：
+            // 下面所有分支读的都是 app.tab()，也就是**焦点窗格**的那个标签。
+            if app.split() {
+                if let Some(pi) = paint::pane_index_at(app, &l, x, y) {
+                    app.focus_pane = pi;
+                }
+            }
             // 重命名编辑框还开着时，点任何地方都是"先收掉它"。
             // 我们的 WM_LBUTTONDOWN 走完就 return，从不交给 DefWindowProc，
             // 于是焦点压根不会从 EDIT 上挪开 —— KILLFOCUS 永远不来，框就一直
@@ -1252,10 +1282,19 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             if let Some(i) = hit_tab(app, &l, x, y) {
                 // 关闭按钮压在标签右上角，命中优先级必须高于"切换标签"，
                 // 否则每次点 × 都会先切一次标签（然后才关掉别的）。
-                if inside(&l.tab_close_rect(i, app.tabs.len(), &app.metrics), x, y) {
+                let pl = if app.split() {
+                    paint::pane_layout(app, &l, app.focus_pane)
+                } else {
+                    l
+                };
+                if inside(&pl.tab_close_rect(i, pl_tab_count(app), &app.metrics), x, y) {
                     app.close_tab(i);
                 } else {
-                    app.active = i;
+                    app.pane_mut().active = i;
+                    // 记一份"可能在拖标签"。真进入拖拽态要等鼠标越过阈值
+                    // （见 WM_MOUSEMOVE）—— 普通单击也会抖几像素。
+                    app.begin_tab_drag(app.focus_pane, i, x, y);
+                    SetCapture(hwnd);
                 }
                 paint::sync_address(app);
                 let _ = InvalidateRect(Some(hwnd), None, true);
@@ -1468,6 +1507,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         }
         WM_LBUTTONUP => {
             let (x, y) = client_xy(hwnd, lparam);
+            // 拖标签：松手就落地（换顺序 / 8 向贴 / 拆成新进程）。
+            // 必须排在最前面 —— 拖标签期间别的分支都不该插手。
+            {
+                let app = &mut *app_ptr;
+                if app.tab_drag.is_some() {
+                    end_tab_drag(app, hwnd);
+                    let _ = ReleaseCapture();
+                    return LRESULT(0);
+                }
+            }
             // 设置页排布编辑器：松手落地（收进「更多」/ 插到新位置 / 拖回恢复）
             {
                 let app = &mut *app_ptr;
@@ -1525,7 +1574,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     app.cfg.ui.sidebar_visible,
                     app.cfg.ui.statusbar_visible,
                 );
-                let plus = l.new_tab_rect(app.tabs.len(), &app.metrics);
+                let plus = l.new_tab_rect(app.tab_count(), &app.metrics);
                 (l, plus)
             };
             if y < l.title.bottom {
@@ -1588,7 +1637,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 // 用它来关闭会让人莫名其妙丢标签。
                 let tab_w = (paint::TAB_W as f32 * app.metrics.scale) as i32;
                 let i = ((x - l.tabs.left) / tab_w.max(1)) as usize;
-                if i >= app.tabs.len() {
+                if i >= app.tab_count() {
                     app.new_tab();
                 } else {
                     let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
@@ -1871,6 +1920,94 @@ fn view_row_at(app: &App, l: &paint::Layout, x: i32, y: i32, view_top: i32) -> O
 ///
 /// 顺序有意义：地址栏压在工具栏里、导航窗格又压着内容区左边缘，
 /// 从最具体的开始判才不会"想拖到面包屑结果落进了下面的行"。
+/// 焦点窗格的标签数。分栏时 `tab_count()` 跟 `focus_pane` 走，
+/// 这里只是把它写短一点，免得到处 `app.panes[app.focus_pane].tabs.len()`。
+fn pl_tab_count(app: &App) -> usize {
+    app.panes[app.focus_pane].tabs.len()
+}
+
+/// 拖着标签移动：算这一刻它会落到哪。
+///
+/// 三种去处互斥，优先级从高到低：
+///   1. 出了窗口客户区 → 拆成新进程
+///   2. 落在内容区     → 8 向贴
+///   3. 还在标签条上   → 换顺序
+fn update_tab_drag(app: &mut App, hwnd: HWND, l: &paint::Layout, x: i32, y: i32) {
+    // 先把"是否越过阈值"这一件事做完并**放开借用**：下面要拿 &app 去问
+    // 窗格几何，一直攥着 &mut 会和它打架。
+    {
+        let Some(d) = app.tab_drag.as_mut() else { return };
+        d.cur = (x, y);
+        if !d.active {
+            let dx = x - d.origin.0;
+            let dy = y - d.origin.1;
+            // 4px 阈值：普通单击也会抖几像素，不给阈值的话点一下就算"拖"
+            if dx * dx + dy * dy <= 16 {
+                return;
+            }
+            d.active = true;
+        }
+    }
+    let (w, h) = app.last_size;
+    let outside = x < 0 || y < 0 || x >= w || y >= h;
+    let (dock, over) = if outside {
+        (None, None)
+    } else {
+        // 分栏时"贴到哪个窗格"由光标所在窗格决定，顺手把它设为焦点
+        let pl = if app.split() {
+            if let Some(pi) = paint::pane_index_at(app, l, x, y) {
+                app.focus_pane = pi;
+            }
+            paint::pane_layout(app, l, app.focus_pane)
+        } else {
+            *l
+        };
+        if y > pl.view.top && y < pl.view.bottom && x > pl.view.left && x < pl.view.right {
+            (Some(paint::dock_zone_at(&pl, x, y)), None)
+        } else {
+            (None, hit_tab(app, &pl, x, y))
+        }
+    };
+    if let Some(d) = app.tab_drag.as_mut() {
+        d.outside = outside;
+        d.dock = dock;
+        d.over_tab = over;
+    }
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, true);
+    }
+}
+
+/// 拖标签松手：把 `finish_tab_drag` 算出来的结果真的执行掉。
+fn end_tab_drag(app: &mut App, hwnd: HWND) {
+    match app.finish_tab_drag() {
+        app::TabDrop::Nothing => {}
+        app::TabDrop::Reorder { pane, from, to } => {
+            app.reorder_tab(pane, from, to);
+            paint::sync_address(app);
+        }
+        app::TabDrop::Dock { pane, index, zone } => {
+            // dock_tab 认的是"焦点窗格"当目标，拖拽期间 update_tab_drag
+            // 已经把焦点挪到光标所在那个窗格了，这里直接用。
+            app.dock_tab(pane, index, zone);
+            app.reload();
+            paint::sync_address(app);
+            paint::reposition(app);
+        }
+        app::TabDrop::TearOff { pane, index, path } => {
+            // 拆成新进程：先起新的，再关本窗口这个 —— 顺序反了的话
+            // （只剩一个标签时会先补一个主页标签）新窗口拿不到原路径。
+            crate::new_window(path);
+            app.focus_pane = pane.min(app.panes.len() - 1);
+            app.close_tab(index);
+            paint::sync_address(app);
+        }
+    }
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, true);
+    }
+}
+
 fn drop_target_at(app: &mut App, l: &paint::Layout, x: i32, y: i32) -> Option<app::DropTarget> {
     // 1) 地址栏面包屑（第 12 轮第 12 项：拖到哪一级就进哪一级）
     if inside(&l.address, x, y) && !app.addr_editing {
@@ -1900,8 +2037,30 @@ fn drop_target_at(app: &mut App, l: &paint::Layout, x: i32, y: i32) -> Option<ap
             }
         }
     }
+    // 2.5) **标签条**：拖到某个标签上 = 落到那个标签所在的目录。
+    // 必须排在内容区之前 —— 标签条压在窗口顶上，但它的 y 也可能落进
+    // `l.view` 的范围（分栏时窗格的标签条就在内容区顶上）。
+    let pl = if app.split() {
+        match paint::pane_index_at(app, l, x, y) {
+            Some(pi) => paint::pane_layout(app, l, pi),
+            None => *l,
+        }
+    } else {
+        *l
+    };
+    if let Some(i) = hit_tab(app, &pl, x, y) {
+        let n = if app.split() { app.panes[app.focus_pane].tabs.len() } else { app.tab_count() };
+        if i < n {
+            let path = if app.split() {
+                app.panes[app.focus_pane].tabs[i].path.clone()
+            } else {
+                app.pane().tabs[i].path.clone()
+            };
+            return Some(app::DropTarget { path, kind: app::DropKind::Tab(i) });
+        }
+    }
     // 3) 内容区里的文件夹行
-    let view_top = l.view.top + header_height(app);
+    let view_top = pl.view.top + header_height(app);
     if y >= view_top && y < l.view.bottom {
         if let Some(row) = view_row_at(app, l, x, y, view_top) {
             let idx = app.tab().visible.get(row).copied();
@@ -1959,7 +2118,16 @@ fn finish_drag(app: &mut App, l: &paint::Layout, x: i32, y: i32) {
         app::DragKind::Items => {
             if let Some(t) = drop_target_at(app, l, x, y) {
                 let copy = drag.copy || app.drag_copy();
+                // **先搬，再切标签**。反过来的话 `drop_items` 里的
+                // "目标 == 当前目录就跳过"会把它当成自己拖给自己 ——
+                // 表现就是"拖到标签上松手，什么都没发生"。
                 app.drop_items(t.path.clone(), drag.items.clone(), copy);
+                if let app::DropKind::Tab(i) = t.kind {
+                    if i < app.panes[app.focus_pane].tabs.len() {
+                        app.panes[app.focus_pane].active = i;
+                        app.reload();
+                    }
+                }
             }
         }
     }
@@ -2392,7 +2560,10 @@ unsafe fn handle_hit_test(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     let (w, h) = app.last_size;
     let l = paint::compute_layout(w, h, &app.metrics, app.cfg.ui.sidebar_visible, app.cfg.ui.statusbar_visible);
     let border = (4.0 * app.metrics.scale).round() as i32;
-    let plus = l.new_tab_rect(app.tabs.len(), &app.metrics);
+    let plus = l.new_tab_rect(app.tab_count(), &app.metrics);
+    // 分栏之后窗口顶部那条标签栏是空的（每条标签归各自的窗格画），
+    // 这里的命中必须跟着关掉，否则会点到"看不见的标签"。
+    let has_top_tabs = !app.split();
     // 标题栏上的自有控件（侧栏开关 / 更多菜单 / 新建标签 / 三大金刚键）所在
     // 的位置一律不算边框 —— 它们本来就压在窗口最外侧那几像素上。
     let on_caption_ctrl = inside(&l.sidebar_toggle, pt.x, pt.y)
@@ -2400,8 +2571,9 @@ unsafe fn handle_hit_test(hwnd: HWND, lparam: LPARAM) -> LRESULT {
         || inside(&l.min_btn, pt.x, pt.y)
         || inside(&l.max_btn, pt.x, pt.y)
         || inside(&l.close_btn, pt.x, pt.y)
-        || (0..app.tabs.len()).any(|i| inside(&l.tab_rect(i, app.tabs.len(), &app.metrics), pt.x, pt.y))
-        || (plus.right < l.tabs.right && inside(&plus, pt.x, pt.y));
+        || (has_top_tabs
+            && (0..app.tab_count()).any(|i| inside(&l.tab_rect(i, app.tab_count(), &app.metrics), pt.x, pt.y)))
+        || (has_top_tabs && plus.right < l.tabs.right && inside(&plus, pt.x, pt.y));
 
     // 四边 + 四角。**必须放在标题栏判定之前**：标题栏占着窗口顶上那一长条，
     // 先判标题栏的话顶边永远拿不到 HTTOP。
@@ -2434,8 +2606,9 @@ unsafe fn handle_hit_test(hwnd: HWND, lparam: LPARAM) -> LRESULT {
         // —— 表现就是"标签点不动、切不了"。标签之间的空白仍留给拖拽。
         if inside(&l.sidebar_toggle, pt.x, pt.y)
             || inside(&l.menu_btn, pt.x, pt.y)
-            || (0..app.tabs.len()).any(|i| inside(&l.tab_rect(i, app.tabs.len(), &app.metrics), pt.x, pt.y))
-            || (plus.right < l.tabs.right && inside(&plus, pt.x, pt.y))
+            || (has_top_tabs
+                && (0..app.tab_count()).any(|i| inside(&l.tab_rect(i, app.tab_count(), &app.metrics), pt.x, pt.y)))
+            || (has_top_tabs && plus.right < l.tabs.right && inside(&plus, pt.x, pt.y))
         {
             return LRESULT(1); // HTCLIENT
         }
@@ -2454,9 +2627,24 @@ unsafe fn handle_hit_test(hwnd: HWND, lparam: LPARAM) -> LRESULT {
 }
 
 fn hit_tab(app: &App, l: &paint::Layout, x: i32, y: i32) -> Option<usize> {
+    // 分栏时窗口顶部那条标签栏不存在，标签在自己的窗格顶上 ——
+    // 命中要用"光标所在窗格"覆写过的 Layout，否则点窗格里的标签永远点不中。
+    if app.split() {
+        if let Some(pi) = paint::pane_index_at(app, l, x, y) {
+            let pl = paint::pane_layout(app, l, pi);
+            if y >= pl.title.top && y <= pl.title.bottom {
+                for i in 0..app.panes[pi].tabs.len() {
+                    if inside(&pl.tab_rect(i, app.panes[pi].tabs.len(), &app.metrics), x, y) {
+                        return Some(i);
+                    }
+                }
+            }
+        }
+        return None;
+    }
     if y >= l.title.top && y <= l.title.bottom {
-        for i in 0..app.tabs.len() {
-            if inside(&l.tab_rect(i, app.tabs.len(), &app.metrics), x, y) {
+        for i in 0..app.tab_count() {
+            if inside(&l.tab_rect(i, app.tab_count(), &app.metrics), x, y) {
                 return Some(i);
             }
         }
@@ -2569,7 +2757,7 @@ fn handle_key(app: &mut App, key: i32) {
         _ if ctrl && !shift && key == 0x4E => crate::new_window(PathBuf::from(app::HOME_PATH)),
         // Ctrl+,：打开设置（Windows 应用的通用设置快捷键）
         _ if ctrl && key == 0xBC => app.open_settings(),
-        _ if ctrl && key == 0x57 => app.close_tab(app.active),
+        _ if ctrl && key == 0x57 => app.close_tab(app.pane().active),
         _ if ctrl && shift && key == 0x4E => app.new_folder(),
         _ if ctrl && shift && key == 0x56 => app.cycle_view(),
         _ if ctrl && shift && key == 0x43 => {

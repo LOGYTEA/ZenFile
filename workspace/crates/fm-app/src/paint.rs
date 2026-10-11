@@ -463,12 +463,14 @@ pub fn paint(app: &mut App, hdc: HDC, width: i32, height: i32) {
         if app.cfg.ui.sidebar_visible {
             paint_sidebar(app, mem, &l);
         }
-        paint_view(app, mem, &l);
+        paint_panes(app, mem, &l);
         if app.cfg.ui.statusbar_visible {
             paint_status(app, mem, &l);
         }
 
         paint_drag_overlay(app, mem, &l);
+        // 拖标签时的"8 向贴"预览：压在最上面
+        paint_dock_overlay(app, mem, &l);
 
         let _ = BitBlt(hdc, 0, 0, width, height, Some(mem), 0, 0, SRCCOPY);
         SelectObject(mem, old_bmp);
@@ -481,6 +483,154 @@ pub fn paint(app: &mut App, hdc: HDC, width: i32, height: i32) {
 ///
 /// 必须画在**所有内容之上**（所以放在 paint() 的最后）：框选是从空白处起手的，
 /// 矩形会盖住条目；拖到面包屑上时高亮也要压在地址栏上。
+/// 分栏时每个窗格顶部那条标签条的高度（DIP）。
+pub const PANE_STRIP_H: f32 = 26.0;
+
+pub fn pane_strip_px(scale: f32) -> i32 {
+    (PANE_STRIP_H * scale).round() as i32
+}
+
+/// 点 (x, y) 落在第几个窗格里。不分栏时就是焦点窗格。
+pub fn pane_index_at(app: &App, l: &Layout, x: i32, y: i32) -> Option<usize> {
+    if app.panes.len() <= 1 {
+        return Some(app.focus_pane);
+    }
+    for (i, p) in app.panes.iter().enumerate() {
+        let pr = p.rect.to_px(&l.view);
+        if x >= pr.left && x < pr.right && y >= pr.top && y < pr.bottom {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// 把 `Layout` 里"内容区 / 标签条"那几个矩形覆写成第 `i` 个窗格的。
+///
+/// 这是分栏能成立的关键：绘制和命中测试都先调它，于是下面那一大片只认
+/// `app.tab()` / `l.view` 的老代码（近两百处）完全不用知道窗格的存在。
+pub fn pane_layout(app: &App, l: &Layout, i: usize) -> Layout {
+    if app.panes.len() <= 1 {
+        return *l;
+    }
+    let pr = app.panes[i.min(app.panes.len() - 1)].rect.to_px(&l.view);
+    let strip = pane_strip_px(app.metrics.scale);
+    let mut o = *l;
+    o.tabs = RECT { left: pr.left, top: pr.top, right: pr.right, bottom: pr.top + strip };
+    o.title = o.tabs;
+    o.view = RECT { left: pr.left, top: pr.top + strip, right: pr.right, bottom: pr.bottom };
+    o
+}
+
+/// 内容区里的"8 向贴"判定：四边各占 30% 的带，两带相交处是四角，
+/// 正中间那块是 Center（合并进目标窗格，不分栏）。
+pub fn dock_zone_at(l: &Layout, x: i32, y: i32) -> crate::app::DockZone {
+    use crate::app::DockZone::*;
+    let r = l.view;
+    let w = r.right - r.left;
+    let h = r.bottom - r.top;
+    if w <= 0 || h <= 0 {
+        return Center;
+    }
+    let mx = ((w as f32) * 0.30) as i32;
+    let my = ((h as f32) * 0.30) as i32;
+    let left = x < r.left + mx;
+    let right = x >= r.right - mx;
+    let top = y < r.top + my;
+    let bottom = y >= r.bottom - my;
+    match (top, bottom, left, right) {
+        (true, _, true, _) => TopLeft,
+        (true, _, _, true) => TopRight,
+        (_, true, true, _) => BottomLeft,
+        (_, true, _, true) => BottomRight,
+        (true, _, _, _) => Top,
+        (_, true, _, _) => Bottom,
+        (_, _, true, _) => Left,
+        (_, _, _, true) => Right,
+        _ => Center,
+    }
+}
+
+/// 某个贴靠区对应的矩形。四角是 1/4 大小的规则矩形 —— 口径必须和
+/// `app::split_rect` 一致，两边各写一份就会"预览在这、落在那"。
+pub fn dock_zone_rect(l: &Layout, z: crate::app::DockZone) -> RECT {
+    use crate::app::DockZone::*;
+    let r = l.view;
+    let w = r.right - r.left;
+    let h = r.bottom - r.top;
+    let hw = w / 2;
+    let hh = h / 2;
+    match z {
+        Left => RECT { left: r.left, top: r.top, right: r.left + hw, bottom: r.bottom },
+        Right => RECT { left: r.left + hw, top: r.top, right: r.right, bottom: r.bottom },
+        Top => RECT { left: r.left, top: r.top, right: r.right, bottom: r.top + hh },
+        Bottom => RECT { left: r.left, top: r.top + hh, right: r.right, bottom: r.bottom },
+        TopLeft => RECT { left: r.left, top: r.top, right: r.left + hw, bottom: r.top + hh },
+        TopRight => RECT { left: r.left + hw, top: r.top, right: r.right, bottom: r.top + hh },
+        BottomLeft => RECT { left: r.left, top: r.top + hh, right: r.left + hw, bottom: r.bottom },
+        BottomRight => RECT { left: r.left + hw, top: r.top + hh, right: r.right, bottom: r.bottom },
+        Center => r,
+    }
+}
+
+/// 贴靠预览：把"松手之后新标签会落到哪一块"真的画出来。
+///
+/// 只高亮一块还不够 —— 用户看不见另外 7 个方向在哪，所以同时把十字分隔线
+/// 淡淡勾出来，鼠标一带就能看出分界在哪。
+pub fn paint_dock_overlay(app: &App, hdc: HDC, l: &Layout) {
+    let Some(d) = app.tab_drag.as_ref() else { return };
+    if !d.active {
+        return;
+    }
+    let Some(zone) = d.dock else { return };
+    let t = app.theme;
+    let pl = pane_layout(app, l, app.focus_pane);
+    let r = dock_zone_rect(&pl, zone);
+    unsafe {
+        let mw = ((2.0 * app.metrics.scale).round() as i32).max(1);
+        // 十字骨架
+        let guide = CreateSolidBrush(t.surface_alt);
+        let g = pl.view;
+        let hw = (g.right - g.left) / 2;
+        let hh = (g.bottom - g.top) / 2;
+        for gr in [
+            RECT { left: g.left + hw, top: g.top, right: g.left + hw + mw, bottom: g.bottom },
+            RECT { left: g.left, top: g.top + hh, right: g.right, bottom: g.top + hh + mw },
+        ] {
+            FillRect(hdc, &gr, guide);
+        }
+        let _ = DeleteObject(guide.into());
+        // 命中的那块：半透明强调色 + 一圈实边
+        alpha_fill_rect(hdc, &r, t.accent, 70);
+        let edge = CreateSolidBrush(t.accent);
+        for e in [
+            RECT { left: r.left, top: r.top, right: r.right, bottom: r.top + mw },
+            RECT { left: r.left, top: r.bottom - mw, right: r.right, bottom: r.bottom },
+            RECT { left: r.left, top: r.top, right: r.left + mw, bottom: r.bottom },
+            RECT { left: r.right - mw, top: r.top, right: r.right, bottom: r.bottom },
+        ] {
+            FillRect(hdc, &e, edge);
+        }
+        let _ = DeleteObject(edge.into());
+        let label = match zone {
+            crate::app::DockZone::Center => "合并到这个窗格",
+            crate::app::DockZone::Left => "贴到左侧",
+            crate::app::DockZone::Right => "贴到右侧",
+            crate::app::DockZone::Top => "贴到上方",
+            crate::app::DockZone::Bottom => "贴到下方",
+            crate::app::DockZone::TopLeft => "贴到左上",
+            crate::app::DockZone::TopRight => "贴到右上",
+            crate::app::DockZone::BottomLeft => "贴到左下",
+            crate::app::DockZone::BottomRight => "贴到右下",
+        };
+        let f = ui_font(app.metrics.scale);
+        let old = SelectObject(hdc, f.into());
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, t.text);
+        draw_text(hdc, label, r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(hdc, old);
+    }
+}
+
 fn paint_drag_overlay(app: &mut App, hdc: HDC, l: &Layout) {
     // 先把要用的标量抄出来：下面取面包屑矩形要 &mut app，不能让 &app.drag
     // 的借用一直挂着。
@@ -527,6 +677,8 @@ fn paint_drag_overlay(app: &mut App, hdc: HDC, l: &Layout) {
                 .sidebar_rows()
                 .get(i)
                 .map(|row| sidebar_row_geoms(l, i, row.depth, s, app.sidebar_scroll).0),
+            // 拖到标签上：把那个标签整块描出来（"文件会落进这个标签的目录"）
+            Some(crate::app::DropKind::Tab(i)) => Some(l.tab_rect(i, app.tab_count(), &app.metrics)),
             None => None,
         };
         if let Some(r) = target_rect {
@@ -801,17 +953,68 @@ fn paint_title_bar(app: &mut App, hdc: HDC, l: &Layout) {
         let old = SelectObject(hdc, font.into());
         SetBkMode(hdc, TRANSPARENT);
 
-        // 标签页
-        // 图标先统一取好：dir_icon 要 &mut，不能一边遍历 tabs 一边改缓存
-        let mut tab_icons: Vec<Option<HICON>> = vec![None; app.tabs.len()];
-        let mut tab_glyphs: Vec<Option<&'static str>> = vec![None; app.tabs.len()];
-        for (i, tab) in app.tabs.iter().enumerate() {
-            if tab.home {
+        // 标签页。**分栏时这一条让位给每个窗格自己的标签条**
+        // （见 `paint_panes`），否则同一排标签会被画两遍。
+        if !app.split() {
+            paint_tab_strip(app, hdc, l, app.focus_pane);
+        }
+        // （原"- ZenFile"字样已按用户要求删掉：标题栏右侧那块地盘留给标签）
+        // 侧栏折叠开关（最左）与更多菜单（最小化左侧）
+        draw_chrome_button(
+            app,
+            hdc,
+            &l.sidebar_toggle,
+            ChromeGlyph::PaneToggle,
+            app.hover_chrome & crate::app::HOVER_SIDEBAR_TOGGLE != 0,
+        );
+        draw_chrome_button(
+            app,
+            hdc,
+            &l.menu_btn,
+            ChromeGlyph::MoreDots,
+            app.hover_chrome & crate::app::HOVER_MENU_BTN != 0,
+        );
+        // 标题按钮（自绘）。命中与动作由 WM_NC* 消息自己接管 —— 客户区已扩展到
+        // 整窗，系统那套非客户区默认处理在这里靠不住（三个键点不动）。
+        // 悬停/按下都要有反馈：没有反馈的按钮在用户眼里就是"坏的"。
+        draw_caption_button(app, hdc, &l.min_btn, 1);
+        draw_caption_button(app, hdc, &l.max_btn, 2);
+        draw_caption_button(app, hdc, &l.close_btn, 3);
+        SelectObject(hdc, old);
+    }
+}
+
+/// 画一排标签条。窗口顶部那条（`paint_title_bar`）和分栏后每个窗格自己那条
+/// 都走这里 —— 两边各写一份必然会长歪。
+///
+/// `pi` 是窗格下标；`l.tabs` 决定这一条画在哪（调用方把它覆写成窗格的顶边）。
+fn paint_tab_strip(app: &mut App, hdc: HDC, l: &Layout, pi: usize) {
+    let t = app.theme;
+    let n = app.panes[pi].tabs.len();
+    if n == 0 {
+        return;
+    }
+    unsafe {
+        let font = ui_font(app.metrics.scale);
+        let old = SelectObject(hdc, font.into());
+        SetBkMode(hdc, TRANSPARENT);
+        let mut tab_icons: Vec<Option<HICON>> = vec![None; n];
+        let mut tab_glyphs: Vec<Option<&'static str>> = vec![None; n];
+        // 先把要的东西拷出来：`dir_icon` 要 &mut app.icons，
+        // 拿着 `app.panes[pi].tabs` 的不可变借用不放会跟它打架。
+        let infos: Vec<(bool, bool, bool, std::path::PathBuf)> = app
+            .pane()
+            .tabs
+            .iter()
+            .map(|t| (t.home, t.recycle, t.settings, t.path.clone()))
+            .collect();
+        for (i, (home, recycle, settings, path)) in infos.iter().enumerate() {
+            if *home {
                 tab_icons[i] = crate::icons::stock_icon(
                     windows::Win32::UI::Shell::SIID_DESKTOPPC.0,
                     false,
                 );
-            } else if tab.recycle {
+            } else if *recycle {
                 tab_icons[i] = crate::icons::stock_icon(
                     if app.recycle_items.is_empty() {
                         windows::Win32::UI::Shell::SIID_RECYCLER.0
@@ -820,20 +1023,20 @@ fn paint_title_bar(app: &mut App, hdc: HDC, l: &Layout) {
                     },
                     false,
                 );
-            } else if tab.settings {
+            } else if *settings {
                 tab_glyphs[i] = Some("\u{E713}"); // Settings，与右键菜单同一枚
-            } else if !tab.path.as_os_str().is_empty() {
-                let h = app.icons.dir_icon(&tab.path, false);
+            } else if !path.as_os_str().is_empty() {
+                let h = app.icons.dir_icon(path, false);
                 if !h.0.is_null() {
                     tab_icons[i] = Some(h);
                 }
             }
         }
 
-        for (i, tab) in app.tabs.iter().enumerate() {
-            let r = l.tab_rect(i, app.tabs.len(), &app.metrics);
-            let hovered = app.hover_tab == Some(i);
-            let (bg, fg) = if i == app.active {
+        for (i, tab) in app.panes[pi].tabs.iter().enumerate() {
+            let r = l.tab_rect(i, n, &app.metrics);
+            let hovered = pi == app.focus_pane && app.hover_tab == Some(i);
+            let (bg, fg) = if i == app.panes[pi].active {
                 (t.tab_active, t.text)
             } else if hovered {
                 // 悬停也要看得出来：不然鼠标扫过标签栏没有任何反馈
@@ -868,7 +1071,7 @@ fn paint_title_bar(app: &mut App, hdc: HDC, l: &Layout) {
             // 现在每个标签都有 ×，这块地方无条件留出来，不能按 hover 态变
             tr.right -= (18.0 * app.metrics.scale) as i32;
             draw_text(hdc, &tab.title, tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-            if i == app.active {
+            if i == app.panes[pi].active {
                 let accent = CreateSolidBrush(t.accent);
                 let line = RECT { left: r.left, top: r.bottom - 2, right: r.right, bottom: r.bottom };
                 FillRect(hdc, &line, accent);
@@ -879,13 +1082,13 @@ fn paint_title_bar(app: &mut App, hdc: HDC, l: &Layout) {
             // "标签关不掉" —— 看不见的按钮等于不存在。代价是标签栏稍挤一点，
             // 但"能关"比"像"重要。非活动标签的 × 画淡一点，视觉重心仍在当前标签。
             {
-                let cr = l.tab_close_rect(i, app.tabs.len(), &app.metrics);
+                let cr = l.tab_close_rect(i, n, &app.metrics);
                 if hovered {
                     let hb = CreateSolidBrush(t.hover_bg);
                     FillRect(hdc, &cr, hb);
                     let _ = DeleteObject(hb.into());
                 }
-                SetTextColor(hdc, if i == app.active || hovered { t.text } else { t.text_dim });
+                SetTextColor(hdc, if i == app.panes[pi].active || hovered { t.text } else { t.text_dim });
                 let g = glyph_font(app.metrics.scale);
                 let old_g = SelectObject(hdc, g.into());
                 draw_text(hdc, "\u{E8BB}", cr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
@@ -894,34 +1097,58 @@ fn paint_title_bar(app: &mut App, hdc: HDC, l: &Layout) {
         }
 
         // 新建标签（+）：紧跟最后一个标签
-        let plus = l.new_tab_rect(app.tabs.len(), &app.metrics);
+        let plus = l.new_tab_rect(n, &app.metrics);
         if plus.right < l.tabs.right {
             draw_chrome_button(app, hdc, &plus, ChromeGlyph::Plus, false);
         }
         // （原"- ZenFile"字样已按用户要求删掉：标题栏右侧那块地盘留给标签）
-        // 侧栏折叠开关（最左）与更多菜单（最小化左侧）
-        draw_chrome_button(
-            app,
-            hdc,
-            &l.sidebar_toggle,
-            ChromeGlyph::PaneToggle,
-            app.hover_chrome & crate::app::HOVER_SIDEBAR_TOGGLE != 0,
-        );
-        draw_chrome_button(
-            app,
-            hdc,
-            &l.menu_btn,
-            ChromeGlyph::MoreDots,
-            app.hover_chrome & crate::app::HOVER_MENU_BTN != 0,
-        );
-        // 标题按钮（自绘）。命中与动作由 WM_NC* 消息自己接管 —— 客户区已扩展到
-        // 整窗，系统那套非客户区默认处理在这里靠不住（三个键点不动）。
-        // 悬停/按下都要有反馈：没有反馈的按钮在用户眼里就是"坏的"。
-        draw_caption_button(app, hdc, &l.min_btn, 1);
-        draw_caption_button(app, hdc, &l.max_btn, 2);
-        draw_caption_button(app, hdc, &l.close_btn, 3);
         SelectObject(hdc, old);
     }
+}
+
+/// 画内容区。分栏时逐个窗格来：先把 `focus_pane` 指到那一个窗格、
+/// 再把 `Layout::view` 覆写成它的矩形，于是下面那一大片只认
+/// `app.tab()` / `l.view` 的旧代码一行都不用改。
+fn paint_panes(app: &mut App, hdc: HDC, l: &Layout) {
+    if app.panes.len() <= 1 {
+        paint_view(app, hdc, l);
+        return;
+    }
+    let saved = app.focus_pane;
+    let n = app.panes.len();
+    let strip = (26.0 * app.metrics.scale).round() as i32;
+    let outer = l.view;
+    let t = app.theme;
+    for i in 0..n {
+        app.focus_pane = i;
+        let pr = app.panes[i].rect.to_px(&outer);
+        let mut l2 = *l;
+        l2.tabs = RECT { left: pr.left, top: pr.top, right: pr.right, bottom: pr.top + strip };
+        l2.title = l2.tabs;
+        l2.view = RECT {
+            left: pr.left,
+            top: pr.top + strip,
+            right: pr.right,
+            bottom: pr.bottom,
+        };
+        unsafe {
+            let b = CreateSolidBrush(t.window_bg);
+            FillRect(hdc, &pr, b);
+            let _ = DeleteObject(b.into());
+        }
+        paint_tab_strip(app, hdc, &l2, i);
+        paint_view(app, hdc, &l2);
+        // 窗格之间的缝：只有"右边和下边"需要画，最外圈本来就是窗口边界。
+        unsafe {
+            let line = CreateSolidBrush(if i == saved { t.accent } else { t.surface_alt });
+            let edge = RECT { left: pr.left, top: pr.bottom - 2, right: pr.right, bottom: pr.bottom };
+            FillRect(hdc, &edge, line);
+            let edge2 = RECT { left: pr.right - 2, top: pr.top, right: pr.right, bottom: pr.bottom };
+            FillRect(hdc, &edge2, line);
+            let _ = DeleteObject(line.into());
+        }
+    }
+    app.focus_pane = saved;
 }
 
 /// 标题栏自有按钮的形状。**一律用几何图形画，不依赖图标字体** ——

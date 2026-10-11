@@ -16,7 +16,7 @@ use fm_core::paths;
 use fm_core::process::ProcessTree;
 use fm_core::types::{filter_entries, FileEntry, FileKind, SortKey, SortSpec, ViewMode};
 use fm_core::watch::{DirWatcher, WatchMsg};
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, IsWindow};
 
@@ -346,12 +346,119 @@ pub enum Nav {
     Same,
 }
 
+/// 归一化矩形（0..1，相对内容区）。用归一化是为了窗口缩放时各窗格比例不变。
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct RectF {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+impl RectF {
+    pub const FULL: RectF = RectF { x: 0.0, y: 0.0, w: 1.0, h: 1.0 };
+    /// 落成像素矩形。`view` 是整个内容区。
+    pub fn to_px(&self, view: &RECT) -> RECT {
+        let vw = (view.right - view.left) as f32;
+        let vh = (view.bottom - view.top) as f32;
+        RECT {
+            left: view.left + (self.x * vw).round() as i32,
+            top: view.top + (self.y * vh).round() as i32,
+            right: view.left + ((self.x + self.w) * vw).round() as i32,
+            bottom: view.top + ((self.y + self.h) * vh).round() as i32,
+        }
+    }
+}
+
+/// 一个窗格：自己的一排标签 + 自己当前的目录视图。
+pub struct Pane {
+    pub tabs: Vec<Tab>,
+    pub active: usize,
+    pub rect: RectF,
+}
+
+impl Default for Pane {
+    fn default() -> Self {
+        Pane { tabs: Vec::new(), active: 0, rect: RectF::FULL }
+    }
+}
+
+/// 拖着标签在内容区里松手时贴到哪。8 个方向 + 中央（合并）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DockZone {
+    Left,
+    Right,
+    Top,
+    Bottom,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+    /// 合进目标窗格，不做分栏
+    Center,
+}
+
+/// 把 `r` 按 `zone` 一分为二：返回 (旧窗格留下的, 新窗格占的)。
+///
+/// 四角不是"四等分"：真做四等分会留下两块无法用矩形表达的 L 形区域。
+/// 这里按 Windows 贴靠的实际语义处理 —— 角落贴等价于"先按左右分，
+/// 新窗格再在它那一半里占上下的一半"，于是新窗格拿到的是一个
+/// **1/4 大小的规则矩形**，旧窗格 keep 住对面那一半（1/2）。
+fn split_rect(r: RectF, zone: DockZone) -> (RectF, RectF) {
+    let (ow, oh) = (r.w, r.h);
+    match zone {
+        DockZone::Left => (
+            RectF { x: r.x + ow * 0.5, y: r.y, w: ow * 0.5, h: oh },
+            RectF { x: r.x, y: r.y, w: ow * 0.5, h: oh },
+        ),
+        DockZone::Right => (
+            RectF { x: r.x, y: r.y, w: ow * 0.5, h: oh },
+            RectF { x: r.x + ow * 0.5, y: r.y, w: ow * 0.5, h: oh },
+        ),
+        DockZone::Top => (
+            RectF { x: r.x, y: r.y + oh * 0.5, w: ow, h: oh * 0.5 },
+            RectF { x: r.x, y: r.y, w: ow, h: oh * 0.5 },
+        ),
+        DockZone::Bottom => (
+            RectF { x: r.x, y: r.y, w: ow, h: oh * 0.5 },
+            RectF { x: r.x, y: r.y + oh * 0.5, w: ow, h: oh * 0.5 },
+        ),
+        // 角落：新窗格占这一角的 1/4，旧窗格只让出"新窗格所在那一侧的上/下半"，
+        // 于是两块都是矩形，且新窗格确实是 1/4 大小。
+        DockZone::TopLeft => (
+            RectF { x: r.x + ow * 0.5, y: r.y, w: ow * 0.5, h: oh },
+            RectF { x: r.x, y: r.y, w: ow * 0.5, h: oh * 0.5 },
+        ),
+        DockZone::TopRight => (
+            RectF { x: r.x, y: r.y, w: ow * 0.5, h: oh },
+            RectF { x: r.x + ow * 0.5, y: r.y, w: ow * 0.5, h: oh * 0.5 },
+        ),
+        DockZone::BottomLeft => (
+            RectF { x: r.x + ow * 0.5, y: r.y, w: ow * 0.5, h: oh },
+            RectF { x: r.x, y: r.y + oh * 0.5, w: ow * 0.5, h: oh * 0.5 },
+        ),
+        DockZone::BottomRight => (
+            RectF { x: r.x, y: r.y, w: ow * 0.5, h: oh },
+            RectF { x: r.x + ow * 0.5, y: r.y + oh * 0.5, w: ow * 0.5, h: oh * 0.5 },
+        ),
+        DockZone::Center => (r, r),
+    }
+}
+
 pub struct App {
     pub hwnd: HWND,
     pub hwnd_address: HWND,
     pub hwnd_search: HWND,
-    pub tabs: Vec<Tab>,
-    pub active: usize,
+    /// 窗格。绝大多数时候只有一个（占满内容区）；把标签拖到内容区做"8 向贴"
+    /// 之后会有两个以上，每个窗格有自己的标签条和当前目录。
+    ///
+    /// **不要直接索引它**：凡是"当前标签"一律走 `tab()` / `tab_mut()`，
+    /// 它们按 `focus_pane` 取。绘制与命中测试在每个窗格开始前会把
+    /// `focus_pane` 指到那一个窗格、并把 `Layout::view` 覆写成它的矩形，
+    /// 于是下面近两百处 `app.tab()` 一行都不用改。
+    pub panes: Vec<Pane>,
+    /// 当前焦点窗格在 `panes` 里的下标。
+    pub focus_pane: usize,
     pub cfg: Config,
     pub metrics: Metrics,
     pub theme: Theme,
@@ -529,6 +636,12 @@ pub struct App {
     pub addr_hover: Option<usize>,
     /// 左键拖拽（拖条目 / 空白处框选）。松手或取消后置回 None。
     pub drag: Option<Drag>,
+    /// 拖标签。与 `drag` 分开：两者可以同时挂着（拖文件的同时不会拖标签），
+    /// 但状态字段混在一起会让"松手时到底在干嘛"变成猜谜。
+    pub tab_drag: Option<TabDrag>,
+    /// 拖着**文件**悬在标签上时：记住"从第几毫秒开始悬在这个标签上"，
+    /// 满了 600ms 就自动切过去（资源管理器的行为：拖到标签上等一下会自动翻页）。
+    pub tab_hover_since: Option<(usize, std::time::Instant)>,
     /// 拖拽当前悬着的可投放目标。
     pub drop_target: Option<DropTarget>,
     /// 正在拖哪一条分隔线（导航窗格宽度 / 详细信息表头的某一列）。
@@ -564,6 +677,34 @@ pub struct SplitDrag {
     pub start_w: i32,
 }
 
+/// 拖标签松手之后要做什么。`App::finish_tab_drag` 只负责算，执行在 WndProc。
+pub enum TabDrop {
+    Nothing,
+    /// 同一个窗格内换位置
+    Reorder { pane: usize, from: usize, to: usize },
+    /// 贴进内容区的某个方向（会真的分出一个窗格）
+    Dock { pane: usize, index: usize, zone: DockZone },
+    /// 拖到窗口外：把这个标签拆成独立进程
+    TearOff { pane: usize, index: usize, path: PathBuf },
+}
+
+/// 拖着**标签**在动。三个去处：换顺序、贴进内容区（8 向）、拖出窗口拆成新进程。
+pub struct TabDrag {
+    /// 这个标签原来在哪个窗格
+    pub pane: usize,
+    pub index: usize,
+    pub origin: (i32, i32),
+    pub cur: (i32, i32),
+    /// 越过阈值才算真的在拖（普通单击也会有几个像素的位移）
+    pub active: bool,
+    /// 还悬在标签条上时的重排落点
+    pub over_tab: Option<usize>,
+    /// 悬在内容区里时的贴靠方向
+    pub dock: Option<DockZone>,
+    /// 已经拖出窗口客户区（松手就拆成新进程）
+    pub outside: bool,
+}
+
 /// 左键拖拽的当前状态（拖条目 或 空白处框选）。
 pub struct Drag {
     pub origin: (i32, i32),
@@ -587,13 +728,13 @@ pub enum DragKind {
 }
 
 /// 拖拽此刻悬在哪一个可投放目标上（画高亮 + 松手时落地用）。
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DropTarget {
     pub path: PathBuf,
     pub kind: DropKind,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum DropKind {
     /// 内容区第 n 行（一个文件夹）
     Row(usize),
@@ -601,6 +742,8 @@ pub enum DropKind {
     Crumb(usize),
     /// 导航窗格第 n 行
     Sidebar(usize),
+    /// **标签条第 n 个标签**：把文件拖到标签上，落到那个标签所在目录
+    Tab(usize),
 }
 
 /// 导航窗格宽度与列宽的取值/夹取范围（DIP）。太窄图标都画不下，太宽占满窗口。
@@ -818,8 +961,8 @@ impl App {
             hwnd,
             hwnd_address: HWND(std::ptr::null_mut()),
             hwnd_search: HWND(std::ptr::null_mut()),
-            tabs: Vec::new(),
-            active: 0,
+            panes: Vec::new(),
+            focus_pane: 0,
             show_hidden: cfg.files.view.show_hidden,
             show_system: cfg.files.view.show_system,
             cfg,
@@ -838,6 +981,8 @@ impl App {
             dirty: true,
             last_size: (0, 0),
             drag_origin: None,
+            tab_drag: None,
+            tab_hover_since: None,
             fast_mode: false,
             xfer: None,
             io_tx,
@@ -937,12 +1082,144 @@ impl App {
     }
 
     pub fn tab(&self) -> &Tab {
-        &self.tabs[self.active]
+        let p = &self.panes[self.focus_pane];
+        &p.tabs[p.active]
     }
 
     pub fn tab_mut(&mut self) -> &mut Tab {
-        let i = self.active;
-        &mut self.tabs[i]
+        let p = &mut self.panes[self.focus_pane];
+        let i = p.active;
+        &mut p.tabs[i]
+    }
+
+    /// 焦点窗格（画它的标签条、决定它是不是"当前"时用）。
+    pub fn pane(&self) -> &Pane {
+        &self.panes[self.focus_pane]
+    }
+
+    pub fn pane_mut(&mut self) -> &mut Pane {
+        let i = self.focus_pane;
+        &mut self.panes[i]
+    }
+
+    /// 焦点窗格的标签数。**不能直接读 `panes[..].tabs.len()`**：
+    /// 绘制每个窗格时 `focus_pane` 会被临时改掉，这里跟着变才是对的。
+    pub fn tab_count(&self) -> usize {
+        self.panes[self.focus_pane].tabs.len()
+    }
+
+    /// 焦点窗格第 i 个标签。
+    pub fn tab_at(&self, i: usize) -> Option<&Tab> {
+        self.panes[self.focus_pane].tabs.get(i)
+    }
+
+    /// 当前是不是分栏（>1 个窗格）。分栏时窗口顶部那条标签栏要让位给
+    /// 每个窗格自己的标签条，否则同一个标签会画两遍。
+    pub fn split(&self) -> bool {
+        self.panes.len() > 1
+    }
+
+    /// 把一个标签"贴"进某个窗格区域。
+    ///
+    /// `zone` 决定新窗格放在哪一侧；已有窗格被压缩到剩下那一侧。
+    /// 返回 true 表示真的分出去了。
+    pub fn dock_tab(&mut self, src_pane: usize, src_tab: usize, zone: DockZone) -> bool {
+        if src_pane >= self.panes.len() || src_tab >= self.panes[src_pane].tabs.len() {
+            return false;
+        }
+        let dst = self.focus_pane.min(self.panes.len() - 1);
+        // 一个窗格里就这一个标签还往它自己身上贴 = 什么都没发生
+        if src_pane == dst && self.panes[dst].tabs.len() <= 1 && self.panes.len() == 1 {
+            return false;
+        }
+        let t = self.panes[src_pane].tabs.remove(src_tab);
+        self.clamp_pane_active(src_pane);
+        // 源窗格被拖空了就收掉。注意这会让它后面的窗格下标**整体前移一位**，
+        // 所以 `dst` 必须跟着减 —— 不减就会贴到隔壁窗格身上（"贴左边却分到了右边"）。
+        let mut dst = dst;
+        if self.panes[src_pane].tabs.is_empty() {
+            self.panes.remove(src_pane);
+            if dst > src_pane {
+                dst -= 1;
+            }
+        }
+        if zone == DockZone::Center {
+            // 中央 = 合进目标窗格，不做分栏
+            if src_pane == dst && self.panes.len() == 1 {
+                // 退化成"原地放回"：把标签塞回它原来的窗格
+                self.panes[dst].tabs.push(t);
+                self.panes[dst].active = self.panes[dst].tabs.len() - 1;
+                self.ensure_pane();
+                return true;
+            }
+            self.panes[dst].tabs.push(t);
+            self.panes[dst].active = self.panes[dst].tabs.len() - 1;
+            self.focus_pane = dst;
+            self.ensure_pane();
+            return true;
+        }
+        let old = self.panes[dst].rect;
+        let (a, b) = split_rect(old, zone);
+        self.panes[dst].rect = a;
+        self.panes.insert(dst + 1, Pane { tabs: vec![t], active: 0, rect: b });
+        self.focus_pane = dst + 1;
+        self.ensure_pane();
+        true
+    }
+
+    /// 当前标签下标越界了就夹回来（删标签、拖走标签之后都要）。
+    fn clamp_pane_active(&mut self, i: usize) {
+        if i >= self.panes.len() {
+            return;
+        }
+        let p = &mut self.panes[i];
+        if p.tabs.is_empty() {
+            p.active = 0;
+        } else if p.active >= p.tabs.len() {
+            p.active = p.tabs.len() - 1;
+        }
+    }
+
+    /// 收尾：一个窗格都没有就补一个；只剩一个就让它占满。
+    fn ensure_pane(&mut self) {
+        if self.panes.is_empty() {
+            self.panes.push(Pane::default());
+        }
+        if self.focus_pane >= self.panes.len() {
+            self.focus_pane = self.panes.len() - 1;
+        }
+        if self.panes.len() == 1 {
+            self.panes[0].rect = RectF::FULL;
+        }
+    }
+
+    /// 标签重排：把第 `from` 个挪到第 `to` 个位置，当前标签跟着它走。
+    pub fn reorder_tab(&mut self, pane: usize, from: usize, to: usize) {
+        if pane >= self.panes.len() {
+            return;
+        }
+        let n = self.panes[pane].tabs.len();
+        if from >= n || to > n {
+            return;
+        }
+        let active = self.panes[pane].active;
+        let t = self.panes[pane].tabs.remove(from);
+        let to = to.min(self.panes[pane].tabs.len());
+        self.panes[pane].tabs.insert(to, t);
+        self.panes[pane].active = if active == from {
+            to
+        } else {
+            let mut a = active;
+            if from < active {
+                a -= 1;
+            }
+            if to <= a {
+                a += 1;
+            }
+            a.min(self.panes[pane].tabs.len().saturating_sub(1))
+        };
+        self.reload();
+        self.invalidate();
     }
 
     pub fn invalidate(&self) {
@@ -954,6 +1231,11 @@ impl App {
     // ---------------------------------------------------------------- 导航
 
     pub fn open_tab(&mut self, path: PathBuf) {
+        // 一个窗格都没有（刚 new 出来 / 分栏时被拖空了）就先补一个满格的
+        if self.panes.is_empty() {
+            self.panes.push(Pane::default());
+            self.focus_pane = 0;
+        }
         // 导航树要用驱动器清单，而它只在"进主页 / 定时兜底 / 设备插拔"时刷新。
         // 首次建标签时那张表还是空的（侧栏会只剩"此电脑"没有盘符），这里补一次。
         if self.drives.is_empty() {
@@ -973,8 +1255,8 @@ impl App {
             }
         }
         tab.sort = SortSpec { key: parse_sort(&self.cfg.files.view.sort_key), descending: self.cfg.files.view.sort_descending };
-        self.tabs.push(tab);
-        self.active = self.tabs.len() - 1;
+        self.pane_mut().tabs.push(tab);
+        self.pane_mut().active = self.pane().tabs.len() - 1;
         self.reload();
         self.invalidate();
     }
@@ -988,16 +1270,19 @@ impl App {
         // 只剩一个标签也允许关：点了 × 窗口却纹丝不动，是"按钮坏了"的典型观感。
         // 资源管理器在这里是关掉整个窗口，而我们有托盘模式，关窗口 ≠ 退出，
         // 所以照样关，然后补一个新的主页标签回来。
-        if self.tabs.len() <= 1 {
-            self.tabs.clear();
-            self.active = 0;
+        if self.tab_count() <= 1 {
+            self.pane_mut().tabs.clear();
+            self.pane_mut().active = 0;
             self.open_tab(PathBuf::from(HOME_PATH));
             self.invalidate();
             return;
         }
-        self.tabs.remove(index);
-        if self.active >= self.tabs.len() {
-            self.active = self.tabs.len() - 1;
+        self.pane_mut().tabs.remove(index);
+        {
+            let p = self.pane_mut();
+            if p.active >= p.tabs.len() {
+                p.active = p.tabs.len() - 1;
+            }
         }
         self.hover_tab = None;
         self.reload();
@@ -1534,7 +1819,7 @@ impl App {
         while let Ok(msg) = self.engine_rx.try_recv() {
             match msg {
                 EngineMsg::Batch(batch) => {
-                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.generation == batch.generation) {
+                    if let Some(tab) = self.pane_mut().tabs.iter_mut().find(|t| t.generation == batch.generation) {
                         if batch.done {
                             tab.loading = false;
                         }
@@ -1551,7 +1836,7 @@ impl App {
                     }
                 }
                 EngineMsg::Error(gen, e) => {
-                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.generation == gen) {
+                    if let Some(tab) = self.pane_mut().tabs.iter_mut().find(|t| t.generation == gen) {
                         tab.loading = false;
                     }
                     eprintln!("枚举失败: {e}");
@@ -1756,6 +2041,80 @@ impl App {
         }
     }
 
+    /// 按下标签：记一份"可能在拖"的状态。真正进入拖拽态要等越过阈值。
+    pub fn begin_tab_drag(&mut self, pane: usize, index: usize, x: i32, y: i32) {
+        self.tab_drag = Some(TabDrag {
+            pane,
+            index,
+            origin: (x, y),
+            cur: (x, y),
+            active: false,
+            over_tab: None,
+            dock: None,
+            outside: false,
+        });
+    }
+
+    /// 松手：算出来这一拖到底要干嘛。**只算不做** —— 开新进程、重列目录
+    /// 这类动作交给 WndProc，App 不该在自己里面偷偷起进程。
+    pub fn finish_tab_drag(&mut self) -> TabDrop {
+        let Some(d) = self.tab_drag.take() else {
+            return TabDrop::Nothing;
+        };
+        self.tab_hover_since = None;
+        if !d.active {
+            return TabDrop::Nothing;
+        }
+        if d.pane >= self.panes.len() || d.index >= self.panes[d.pane].tabs.len() {
+            return TabDrop::Nothing;
+        }
+        if d.outside {
+            return TabDrop::TearOff {
+                pane: d.pane,
+                index: d.index,
+                path: self.panes[d.pane].tabs[d.index].path.clone(),
+            };
+        }
+        if let Some(z) = d.dock {
+            return TabDrop::Dock { pane: d.pane, index: d.index, zone: z };
+        }
+        if let Some(to) = d.over_tab {
+            if to != d.index {
+                return TabDrop::Reorder { pane: d.pane, from: d.index, to };
+            }
+        }
+        TabDrop::Nothing
+    }
+
+    /// 拖着文件悬在标签上：悬够 600ms 就把那个标签翻出来（资源管理器同款）。
+    ///
+    /// 由 `WM_TIMER` 调用。返回 true 表示这一跳真的切了标签（调用方去重画）。
+    pub fn tick_tab_hover(&mut self) -> bool {
+        let Some((i, t0)) = self.tab_hover_since else {
+            return false;
+        };
+        if t0.elapsed().as_millis() < 600 {
+            return false;
+        }
+        if self.drag.is_none() {
+            self.tab_hover_since = None;
+            return false;
+        }
+        if i >= self.panes[self.focus_pane].tabs.len() {
+            self.tab_hover_since = None;
+            return false;
+        }
+        // 已经切过去了就别反复刷（否则每次 reload 一遍）
+        if self.panes[self.focus_pane].active == i {
+            self.tab_hover_since = None;
+            return false;
+        }
+        self.panes[self.focus_pane].active = i;
+        self.tab_hover_since = None;
+        self.reload();
+        true
+    }
+
     /// 拖拽时按住 Ctrl = 复制（与资源管理器一致）；不按就是移动。
     pub fn drag_copy(&self) -> bool {
         unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x11) < 0 }
@@ -1796,12 +2155,12 @@ impl App {
 
     /// 标签页循环切换（Ctrl+Tab / Ctrl+Shift+Tab）
     pub fn cycle_tab(&mut self, delta: isize) {
-        if self.tabs.len() < 2 {
+        if self.tab_count() < 2 {
             return;
         }
-        let len = self.tabs.len() as isize;
-        let cur = self.active as isize;
-        self.active = (((cur + delta) % len + len) % len) as usize;
+        let len = self.tab_count() as isize;
+        let cur = self.pane().active as isize;
+        self.pane_mut().active = (((cur + delta) % len + len) % len) as usize;
         self.reload();
         self.invalidate();
     }
@@ -2683,8 +3042,8 @@ impl App {
 
     /// 打开设置页并停到指定标签（「关于」从这里进）。
     pub fn open_settings_at(&mut self, tab: u8) {
-        if let Some(i) = self.tabs.iter().position(|t| t.settings) {
-            self.active = i;
+        if let Some(i) = self.pane().tabs.iter().position(|t| t.settings) {
+            self.pane_mut().active = i;
         } else {
             self.open_tab(PathBuf::from(SETTINGS_PATH));
         }
@@ -2696,8 +3055,8 @@ impl App {
 
     /// 打开回收站视图。
     pub fn open_recycle(&mut self) {
-        if let Some(i) = self.tabs.iter().position(|t| t.recycle) {
-            self.active = i;
+        if let Some(i) = self.pane().tabs.iter().position(|t| t.recycle) {
+            self.pane_mut().active = i;
             self.reload();
         } else {
             self.open_tab(PathBuf::from(RECYCLE_PATH));
