@@ -3024,6 +3024,18 @@ unsafe extern "system" fn addr_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
 }
 
 unsafe extern "system" fn search_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // 拿到/失去焦点时 EDIT 只会**局部**重画（通常只有插入符那一小块），而装饰是
+    // 画在 `GetDC` 拿到的 DC 上的 —— 裁剪区不是整块，放大镜和提示字就只剩一点点
+    // 残影，整框看着像被清空了（实测点一下：非底色像素 568 → 26）。所以焦点一变
+    // 就整块无效掉，逼它把装饰连同背景一起重画一遍。
+    if msg == WM_SETFOCUS || msg == WM_KILLFOCUS {
+        let _ = InvalidateRect(Some(hwnd), None, true);
+    }
+    // 文本被外部改掉（清空搜索框、Ctrl+F 预热等）也要整块重画：放大镜要不要留、
+    // 空态提示要不要显示，都取决于"现在是不是空的"。
+    if msg == WM_SETTEXT {
+        let _ = InvalidateRect(Some(hwnd), None, true);
+    }
     let r = call_old(SEARCH_OLD, hwnd, msg, wparam, lparam);
     // 放大镜和空态提示必须画在 EDIT **自己画完之后**：画在父窗口上会被 EDIT
     // 的整块背景盖掉。WM_PRINT 那条分支是给 PrintWindow 用的（抓图验证走这条路，

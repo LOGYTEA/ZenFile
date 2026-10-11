@@ -140,7 +140,12 @@ fn main() {
             WINDOW_EX_STYLE(0),
             PCWSTR(MAIN_CLASS.as_ptr()),
             PCWSTR(HSTRING::from(APP_TITLE).as_ptr()),
-            WS_OVERLAPPEDWINDOW, // 含 WS_THICKFRAME：保留贴靠与最大化动画的前提 §4
+            // WS_CLIPCHILDREN 不能省：搜索框是一个子 EDIT 控件，放大镜和空态
+            // 提示都是画在它**自己**的 DC 上的。父窗口每次重绘会把整条工具栏
+            // （含搜索框那块矩形）刷成底色，没有这个样式就会把子控件刚画好的
+            // 装饰整块盖掉 —— 表现是"不点它的时候有图标和 placeholder，
+            // 一点上去父窗口重绘一次，就只剩一块空板了"。
+            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, // 含 WS_THICKFRAME：保留贴靠与最大化动画的前提 §4
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             (1180.0) as i32,
@@ -537,6 +542,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 tab.filter = text;
                 tab.recompute_filter(sh, ss);
                 let _ = InvalidateRect(Some(hwnd), None, true);
+                // 搜索框自己也必须重画：放大镜和空态提示是画在**子 EDIT** 上的，
+                // 而主窗口带了 WS_CLIPCHILDREN，父窗口重绘不再碰它那一块 ——
+                // 只无效父窗口的话，输入之后提示字不会消失、清空之后也不会回来。
+                let _ = InvalidateRect(Some(app.hwnd_search), None, true);
             }
             LRESULT(0)
         }
@@ -674,7 +683,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 app.cfg.ui.sidebar_visible,
                 app.cfg.ui.statusbar_visible,
             );
-            app.pressed_caption = caption_hit(&l, x, y);
+            let hit = caption_hit(&l, x, y);
+            // 没落在三大金刚键上就是 HTCAPTION（标题栏空白处）。**必须交回
+            // DefWindowProc**：拖窗口的模态循环是系统在这条消息里启动的，我们
+            // 自己 return 0 就等于把循环吞掉 —— 表现是"标题栏拖不动窗口"。
+            if hit == 0 {
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
+            }
+            app.pressed_caption = hit;
             let _ = InvalidateRect(Some(hwnd), None, false);
             LRESULT(0)
         }
@@ -694,8 +710,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             app.pressed_caption = 0;
             if which != 0 {
                 run_caption(hwnd, which);
+                return LRESULT(0);
             }
-            LRESULT(0)
+            // 抬在标题栏空白处：同样要交回系统，让它结束这一次拖拽循环
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_NCLBUTTONDBLCLK => {
             let app = &mut *app_ptr;
@@ -707,10 +725,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 app.cfg.ui.sidebar_visible,
                 app.cfg.ui.statusbar_visible,
             );
-            if caption_hit(&l, x, y) != 0 {
-                run_caption(hwnd, caption_hit(&l, x, y));
+            let hit = caption_hit(&l, x, y);
+            if hit != 0 {
+                run_caption(hwnd, hit);
+                return LRESULT(0);
             }
-            LRESULT(0)
+            // 双击标题栏空白处 = 最大化/还原。这也是系统在这条消息里做的，
+            // 我们吞掉它的后果就是"双击最大化之后再也缩不回去"。
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_LBUTTONDOWN => {
             let app = &mut *app_ptr;
