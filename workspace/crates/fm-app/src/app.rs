@@ -369,7 +369,11 @@ pub struct App {
     pub last_size: (i32, i32),
     pub drag_origin: Option<(i32, i32)>,
     pub fast_mode: bool,
-    pub transfer: Option<SharedStats>,
+    /// 正在跑的自研传输（复制/移动）。跑完由 `drain_transfer` 收口并重列目录。
+    ///
+    /// 取代了原来的 `SharedStats`（那是 `ops::transfer_async` 的，只给一个
+    /// 百分比，没有"已处理文件/剩余/已用时间/预计剩余"，也没有取消）。
+    pub xfer: Option<fm_core::transfer::Transfer>,
     /// 后台文件操作的回执通道。worker 干完把错误串（成功则是空串）丢进来，
     /// UI 线程在 `WM_APP_IO_DONE` 里统一收口。
     pub io_tx: Sender<String>,
@@ -835,7 +839,7 @@ impl App {
             last_size: (0, 0),
             drag_origin: None,
             fast_mode: false,
-            transfer: None,
+            xfer: None,
             io_tx,
             io_rx,
             io_pending: 0,
@@ -1993,26 +1997,17 @@ impl App {
                     report(self.hwnd, "不能把文件夹粘贴到它自己里面");
                     return;
                 }
-                let label = if mode == ClipMode::Move { "粘贴（移动）" } else { "粘贴（复制）" };
                 // 东西已经落下去了，原处那层"虚化"必须跟着撤掉
                 self.cut_set.clear();
-                if self.fast_mode || self.cfg.files.operations.fast_mode {
-                    self.transfer = Some(transfer_async(
-                        if mode == ClipMode::Move { TransferKind::Move } else { TransferKind::Copy },
-                        &dest,
-                        files,
-                        self.cfg.files.operations.worker_threads,
-                    ));
-                    return;
-                }
-                // 同 drop_items：真正的搬迁去后台线程，UI 线程不阻塞、不被重入
-                self.spawn_io(label, move || {
-                    if mode == ClipMode::Move {
-                        move_items(0, &dest, &files)
-                    } else {
-                        copy_items(0, &dest, &files)
-                    }
-                });
+                // 一律走自研引擎：不再调 `IFileOperation`（它那个进度窗是模态的，
+                // 会把 WndProc 重入进 `&mut App`；而且只给百分比，拿不到
+                // "已处理/剩余/已用/预计剩余"）。
+                let kind = if mode == ClipMode::Move {
+                    fm_core::transfer::Kind::Move
+                } else {
+                    fm_core::transfer::Kind::Copy
+                };
+                self.start_transfer(kind, dest, files);
                 self.invalidate();
             }
             Ok(Some(_)) | Ok(None) => {}
@@ -2034,6 +2029,57 @@ impl App {
         if let Some(e) = err {
             report(self.hwnd, &e);
         }
+    }
+
+    /// 起一次自研传输：后台线程搬字节 + 自绘进度窗。
+    ///
+    /// 刻意**不**用 `spawn_io`：那一条路是给 `IFileOperation` 用的，
+    /// 这里要的是能随时读到进度、能取消的句柄。
+    pub fn start_transfer(
+        &mut self,
+        kind: fm_core::transfer::Kind,
+        dest: PathBuf,
+        items: Vec<PathBuf>,
+    ) {
+        if items.is_empty() {
+            return;
+        }
+        // 上一次还没跑完就再来一次 → 弹窗只能显示一个，直接拒掉，
+        // 免得两个线程同时往同一个目录里写。
+        if self.xfer.is_some() {
+            report(self.hwnd, "还有一次复制/移动没结束");
+            return;
+        }
+        let threads = self.cfg.files.operations.worker_threads.clamp(2, 32);
+        let t = fm_core::transfer::start(kind, &dest, items, threads);
+        crate::progress::open(kind, &dest, t.stats.clone(), t.cancel.clone(), self.hwnd);
+        self.xfer = Some(t);
+    }
+
+    /// 自研传输的收口：`finished` 一置起来就重列目录、报错。
+    ///
+    /// 由 `WM_TIMER`（10 跳/秒）调用。弹窗自己也在轮询同一份 stats，
+    /// 所以"弹窗关了但活还在跑"是完全合法的 —— 这里照样能收尾。
+    pub fn drain_transfer(&mut self) {
+        let Some(t) = self.xfer.as_ref() else {
+            return;
+        };
+        let (finished, err, failed, canceled) = {
+            let Ok(s) = t.stats.lock() else { return };
+            (s.finished, s.error.clone(), s.failed, s.canceled)
+        };
+        if !finished {
+            return;
+        }
+        self.xfer = None;
+        if let Some(e) = err {
+            report(self.hwnd, &format!("传输失败：{e}"));
+        } else if canceled {
+            // 取消过就别弹框打扰，状态栏里能看出来
+        } else if failed > 0 {
+            report(self.hwnd, &format!("有 {failed} 项没处理成功，其余已完成"));
+        }
+        self.reload();
     }
 
     /// 把一次 Shell 文件操作丢到**独立线程**上去跑。
@@ -2225,36 +2271,27 @@ impl App {
         }
         let cross = !same_volume(&items[0], &dest);
         let mode = if copy || cross { ClipMode::Copy } else { ClipMode::Move };
-        let label = if mode == ClipMode::Move { "移动" } else { "复制" };
-        if self.fast_mode || self.cfg.files.operations.fast_mode {
-            self.transfer = Some(transfer_async(
-                if mode == ClipMode::Move { TransferKind::Move } else { TransferKind::Copy },
-                &dest,
-                items,
-                self.cfg.files.operations.worker_threads,
-            ));
-            return;
-        }
-        // 关键：**不在松手这条消息里真的去搬文件**。搬迁交给后台线程，
-        // 完成后由 WM_APP_IO_DONE 触发 reload —— 这里的 reload 会等到那一步。
-        self.spawn_io(label, move || {
-            if mode == ClipMode::Move {
-                move_items(0, &dest, &items)
-            } else {
-                copy_items(0, &dest, &items)
-            }
-        });
-        // 立刻重画一次：让"正在移动"的进度条出现
+        // 关键：**不在松手这条消息里真的去搬文件**。自研引擎自己开线程，
+        // 完成后由 `drain_transfer` 触发 reload（曾因为在这里同步跑
+        // `IFileOperation`，它的模态循环把 WndProc 重入进 `&mut App`，
+        // 表现为"拖完一松手就僵住"）。
+        let kind = if mode == ClipMode::Move {
+            fm_core::transfer::Kind::Move
+        } else {
+            fm_core::transfer::Kind::Copy
+        };
+        self.start_transfer(kind, dest, items);
         self.invalidate();
     }
 
     /// 拖拽到另一个标签页不适用时的替代：粘贴到指定目录（供外部调用）。
     pub fn paste_into(&mut self, dest: &Path, files: Vec<PathBuf>, mode: ClipMode) {
-        let owner = self.hwnd.0 as isize;
-        let _ = match mode {
-            ClipMode::Move => move_items(owner, dest, &files),
-            ClipMode::Copy => copy_items(owner, dest, &files),
+        let kind = if mode == ClipMode::Move {
+            fm_core::transfer::Kind::Move
+        } else {
+            fm_core::transfer::Kind::Copy
         };
+        self.start_transfer(kind, dest.to_path_buf(), files);
     }
 
     // ------------------------------------------------------------ 右键菜单

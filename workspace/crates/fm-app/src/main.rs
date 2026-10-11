@@ -17,6 +17,7 @@ mod rename;
 mod paint;
 mod props;
 mod shellnew;
+mod progress;
 mod settings;
 mod sysview;
 mod theme;
@@ -877,12 +878,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 if app.tick_refresh_home() {
                     let _ = InvalidateRect(Some(hwnd), None, true);
                 }
-                if let Some(stats) = &app.transfer {
-                    if stats.lock().map(|s| s.finished).unwrap_or(true) {
-                        app.transfer = None;
-                        app.reload();
-                    }
-                }
+                // 自研传输跑完就重列目录（弹窗自己也在轮询同一份 stats）
+                app.drain_transfer();
             }
             LRESULT(0)
         }

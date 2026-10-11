@@ -30,6 +30,7 @@ pub mod paths;
 pub mod process;
 pub mod recycle;
 pub mod selftest;
+pub mod transfer;
 pub mod types;
 pub mod watch;
 

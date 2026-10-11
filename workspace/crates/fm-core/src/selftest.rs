@@ -149,6 +149,112 @@ pub fn run() -> i32 {
         .unwrap_or(0);
     h.check("ops::fast_copy", copied_count >= 200, &format!("复写了 {copied_count} 项"));
 
+    // 8b. 自研传输引擎：多线程 + 单文件分块并行 + 进度/ETA
+    let tr_src = std::env::temp_dir().join("fm-selftest-tr-src");
+    let tr_dst = std::env::temp_dir().join("fm-selftest-tr-dst");
+    let _ = std::fs::remove_dir_all(&tr_src);
+    let _ = std::fs::remove_dir_all(&tr_dst);
+    std::fs::create_dir_all(&tr_src.join("sub")).unwrap();
+    std::fs::create_dir_all(&tr_dst).unwrap();
+    // 20 MB：超过 SPLIT_MIN(8MB)，必须真的走"拆块并行"那条路
+    let big = vec![0x5Au8; 20 * 1024 * 1024];
+    std::fs::write(tr_src.join("big.bin"), &big).unwrap();
+    std::fs::write(tr_src.join("small.txt"), b"hello").unwrap();
+    std::fs::write(tr_src.join("sub").join("a.txt"), b"aaa").unwrap();
+    std::fs::write(tr_src.join("sub").join("b.txt"), b"bbbbbb").unwrap();
+
+    let t = crate::transfer::start(
+        crate::transfer::Kind::Copy,
+        &tr_dst,
+        vec![tr_src.join("big.bin"), tr_src.join("small.txt"), tr_src.join("sub")],
+        8,
+    );
+    loop {
+        if t.stats.lock().unwrap().finished {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let st = t.stats.lock().unwrap().clone();
+    // 内容必须逐字节对得上 —— 分块并行最容易出的错就是块之间错位/漏块
+    let big_ok = std::fs::read(tr_dst.join("big.bin")).map(|b| b == big).unwrap_or(false);
+    let small_ok = std::fs::read(tr_dst.join("small.txt")).unwrap_or_default() == b"hello".to_vec();
+    let sub_ok = std::fs::read(tr_dst.join("sub").join("a.txt")).unwrap_or_default() == b"aaa".to_vec()
+        && std::fs::read(tr_dst.join("sub").join("b.txt")).unwrap_or_default() == b"bbbbbb".to_vec();
+    h.check(
+        "transfer::copy",
+        big_ok && small_ok && sub_ok,
+        &format!(
+            "20MB 分块并行 {} / 小文件 {} / 子目录 {}；{} 文件 {} 字节，用时 {:.0} ms，错 {:?}",
+            big_ok, small_ok, sub_ok, st.files_done, st.bytes_done, st.elapsed_ms, st.error
+        ),
+    );
+    h.check(
+        "transfer::stats",
+        st.files_total == 4 && st.files_done == 4 && st.bytes_total == 20 * 1024 * 1024 + 5 + 3 + 6,
+        &format!(
+            "files {}/{} bytes {}/{}",
+            st.files_done, st.files_total, st.bytes_done, st.bytes_total
+        ),
+    );
+    // 就地粘贴必须生成"X - 副本"，不是覆盖、也不是 "X (2)"
+    let dup = crate::transfer::start(
+        crate::transfer::Kind::Copy,
+        &tr_dst,
+        vec![tr_dst.join("small.txt")],
+        4,
+    );
+    loop {
+        if dup.stats.lock().unwrap().finished {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let copy_named = tr_dst.join("small - 副本.txt").exists();
+    h.check("transfer::conflict", copy_named, "就地粘贴生成「small - 副本.txt」");
+    // 移动：源必须消失，目标必须还在
+    let mv_dst = std::env::temp_dir().join("fm-selftest-tr-mv");
+    let _ = std::fs::remove_dir_all(&mv_dst);
+    std::fs::create_dir_all(&mv_dst).unwrap();
+    let mv = crate::transfer::start(
+        crate::transfer::Kind::Move,
+        &mv_dst,
+        vec![tr_src.join("small.txt")],
+        4,
+    );
+    loop {
+        if mv.stats.lock().unwrap().finished {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    h.check(
+        "transfer::move",
+        mv_dst.join("small.txt").exists() && !tr_src.join("small.txt").exists(),
+        "源已消失、目标已到位",
+    );
+    // 时长/ETA 的格式化：这两个串是直接进弹窗的，不能出现 NaN / -1
+    let fmt_ok = crate::transfer::fmt_duration(83_000.0) == "1:23"
+        && crate::transfer::fmt_duration(3_723_000.0) == "1:02:03"
+        && crate::transfer::fmt_eta(f64::INFINITY) == "正在计算…"
+        && crate::transfer::fmt_eta(400.0) == "不到 1 秒"
+        && crate::transfer::fmt_eta(12_000.0) == "约 12 秒"
+        && crate::transfer::fmt_eta(185_000.0) == "约 3 分 5 秒";
+    h.check(
+        "transfer::fmt",
+        fmt_ok,
+        &format!(
+            "{} / {} / {} / {}",
+            crate::transfer::fmt_duration(83_000.0),
+            crate::transfer::fmt_duration(3_723_000.0),
+            crate::transfer::fmt_eta(185_000.0),
+            crate::transfer::fmt_eta(f64::INFINITY)
+        ),
+    );
+    for d in [&tr_src, &tr_dst, &mv_dst] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+
     // 9. 目录监听
     let (wtx, wrx) = channel::<WatchMsg>();
     let watch_root = std::env::temp_dir().join("fm-selftest-watch");
