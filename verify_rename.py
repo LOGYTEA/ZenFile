@@ -340,7 +340,9 @@ def open_bulk_dropdown(path):
     time.sleep(0.2)
     u.keybd_event(0x11, 0, 2, 0)
     time.sleep(0.3)
-    click(hw, w - 6 - 66, 34 + 20)  # 按钮右沿 = w-6、宽 132；垂直落在目录栏中间
+    # 第 16 轮：按钮从 132px 的文字按钮改成 30px 的**图标**按钮（置顶常驻），
+    # 右沿依旧是 w-6，所以中心是 w-6-15。
+    click(hw, w - 6 - 15, 34 + 20)
     time.sleep(1.0)
     subs = windows_of("ZenFileMenu")
     return hw, (subs[0][0] if subs else None)

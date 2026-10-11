@@ -268,10 +268,11 @@ def open_props(dir_path, row_pref=1, nrow_first=6):
     mh, _mx, _my, mw, mhh = menus[0]
     top0, row_h = menu_row_height(mh, mw, mhh)
     s = row_h / 28.0
-    # 文件菜单: 0打开 1打开方式 2剪切 3复制 4重命名 5删除 6[分隔]
-    #           7粘贴 8新建 9[分隔] 10全选 11刷新 12查看 13排序方式 14属性
+    # 第 16 轮：右键**文件/文件夹**时菜单里不再有 新建/全选/刷新/查看/排序方式
+    # （那些只属于空白处右键），所以「属性」整体前移了 5 行。
+    # 文件菜单: 0打开 1打开方式 2剪切 3复制 4重命名 5删除 6[分隔] 7粘贴 8属性
     # 文件夹菜单没有「打开方式」，后面整体前移一格（删除是第 4 行）。
-    y13 = int(top0 + nrow_first * row_h + 6 * s + 2 * row_h + 6 * s + 4 * row_h + row_h / 2)
+    y13 = int(top0 + nrow_first * row_h + 6 * s + row_h + row_h / 2)
     for mul in (0, -1, 1, -2, 2):
         yy = y13 + int(mul * row_h)
         if yy < 2 or yy > mhh - 2:

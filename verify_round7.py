@@ -205,7 +205,10 @@ ok_all = ok_all and ok2 and ok2b
 
 # ================================================== 3) 菜单悬停 + 子菜单
 print("\n===== 3) 菜单悬停高亮 + 悬停展开子菜单 =====")
-u.PostMessageW(hwnd, WM_RBUTTONUP, 0, (152 << 16) | (400 & 0xFFFF))
+# 右键落在**空白处**（第 16 轮起，带下拉的 新建/查看/排序方式 只出现在背景菜单；
+# 右键某个文件时菜单里没有可展开的项，扫 20 行也扫不出子菜单）。
+# 此时已进入 FolderA（4 个文件），第 6 行以下是空的。
+u.PostMessageW(hwnd, WM_RBUTTONUP, 0, (230 << 16) | (400 & 0xFFFF))
 time.sleep(1.0)
 mw = menu_windows()
 if not mw:

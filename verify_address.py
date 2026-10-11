@@ -130,11 +130,12 @@ def geom(hwnd):
     return {
         "w": r.right - r.left,
         "h": r.bottom - r.top,
-        # 右沿 = 窗口 - pad - 搜索框(170) - 「批量重命名」按钮(132) - 16。
-        # 第 15 轮目录栏最右侧多了那个按钮，地址栏跟着变窄，这里必须同步 ——
-        # 否则"点地址栏空白处"会点到按钮/搜索框上去。
+        # 右沿 = 窗口 - pad - 搜索框(170) - 「批量重命名」按钮 - 16。
+        # 第 15 轮那个按钮是 132px 的文字按钮，第 16 轮改成了 30px 的图标按钮
+        # （地址栏反而拿回 100px）—— 这里必须跟着改，否则"点地址栏空白处"
+        # 会点到搜索框上去。
         "addr": (pad + nav * 3 + 10, title_h + pad,
-                 (r.right - r.left) - pad - 170 - 132 - 16, title_h + toolbar_h - pad),
+                 (r.right - r.left) - pad - 170 - 30 - 16, title_h + toolbar_h - pad),
     }
 
 

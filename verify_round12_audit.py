@@ -203,9 +203,11 @@ def row_ink(raw, i, x0=VIEW_LEFT + 34, x1=VIEW_LEFT + 160):
 
 
 before = row_ink(raw0, 1)
-# 在第 0 行上右键 -> 文件菜单
-post(hw, WM_RBUTTONDOWN, VIEW_LEFT + 60, row_center(0))
-post(hw, WM_RBUTTONUP, VIEW_LEFT + 60, row_center(0))
+# 在**空白处**右键 -> 背景菜单。第 16 轮起「排序方式/查看/刷新/新建」只属于
+# 背景菜单（右键某个文件时它们不再出现，与资源管理器一致），所以这里必须
+# 点在条目之外的空白区 —— 素材只有 3 个文件，第 6 行一定是空的。
+post(hw, WM_RBUTTONDOWN, VIEW_LEFT + 60, row_center(6))
+post(hw, WM_RBUTTONUP, VIEW_LEFT + 60, row_center(6))
 time.sleep(0.7)
 ms = menus()
 print(f"  右键后菜单窗口 {len(ms)} 个")
@@ -215,11 +217,9 @@ if not ms:
 mh, mx, my, mw, mhh = ms[0]
 top0, row_h = menu_metrics(mh, mw, mhh)
 print(f"  菜单量得: 顶边 {top0} 行高 {row_h}")
-# 文件菜单: 0打开 1打开方式 2剪切 3复制 4重命名 5删除 6[sep]
-# 7粘贴 8新建 9[sep] 10全选 11刷新 12查看 13排序方式 14属性
-# （第 15 轮「批量重命名」搬去目录栏按钮，后面整体前移一格）
-FILE_SEPS = (6, 9)
-y_sort = menu_row_center(top0, row_h, 13, FILE_SEPS)
+# 背景菜单: 0粘贴 1新建 2[sep] 3全选 4刷新 5查看 6排序方式 7属性（当前文件夹）
+BG_SEPS = (2, 8)
+y_sort = menu_row_center(top0, row_h, 6, BG_SEPS)
 print(f"  「排序方式」行中心 y={y_sort}")
 move(mh, mw // 2, y_sort)
 time.sleep(0.5)

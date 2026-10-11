@@ -373,16 +373,17 @@ mark(bar >= ROW_H, f"选中行左沿画出了强调竖线（{bar}px ≥ 行高 {
 print("\n[3] 「批量重命名」在目录栏最右侧，右键菜单里已移除")
 hw = launch(BASE)
 raw, stride, W, H = grab(hw)
-# 按钮矩形：右沿 W-6，宽 132
-bx0, bx1 = W - 6 - 132, W - 6
+# 第 16 轮：按钮从 132px 文字按钮改成 30px **图标**按钮（右沿仍是 W-6）
+bx0, bx1 = W - 6 - 30, W - 6
 by0, by1 = TITLE_H + 6, TITLE_H + TOOL_H - 6
 btn_border = count(raw, stride, bx0, bx1, by0, by1, SURFACE, 12)
-btn_text = bright(raw, stride, bx0 + 6, bx1 - 20, by0 + 4, by1 - 4)
-print(f"  按钮区 {bx0}..{bx1}：surface 底色 {btn_border}px，文字亮像素 {btn_text}px")
-mark(btn_border >= 2000, f"目录栏最右侧画出了按钮底（{btn_border}px）")
-mark(btn_text >= 60, f"按钮上有「批量重命名」字样（{btn_text}px 亮像素）")
-u.PostMessageW(hw, WM_LBUTTONDOWN, 0, (((by0 + by1) // 2) << 16) | ((bx0 + 60) & 0xFFFF))
-u.PostMessageW(hw, WM_LBUTTONUP, 0, (((by0 + by1) // 2) << 16) | ((bx0 + 60) & 0xFFFF))
+btn_text = sum(1 for y in range(by0 + 4, by1 - 4) for x in range(bx0 + 2, bx1 - 2)
+               if min(px(raw, stride, x, y)) >= 0x80)
+print(f"  按钮区 {bx0}..{bx1}：surface 底色 {btn_border}px，图标墨迹 {btn_text}px")
+mark(btn_border >= 300, f"目录栏最右侧画出了按钮底（{btn_border}px）")
+mark(btn_text >= 20, f"按钮上画出了图标（{btn_text}px 墨迹）")
+u.PostMessageW(hw, WM_LBUTTONDOWN, 0, (((by0 + by1) // 2) << 16) | ((bx0 + 15) & 0xFFFF))
+u.PostMessageW(hw, WM_LBUTTONUP, 0, (((by0 + by1) // 2) << 16) | ((bx0 + 15) & 0xFFFF))
 time.sleep(0.9)
 ms = windows_of("ZenFileMenu")
 print(f"  点按钮后菜单窗口 {len(ms)} 个")
@@ -403,19 +404,24 @@ if ms:
     print(f"  下拉里文字行 {len(bands)} 条")
     mark(len(bands) == 5, f"下拉有 5 种重命名模式（量到 {len(bands)} 条）")
 subprocess.run(["taskkill", "/F", "/IM", "ZenFile.exe"], capture_output=True)
-# 右键菜单第 5 行（旧「批量重命名」的位置）现在不该有下级菜单
+# 右键文件：整份菜单都不该再有可展开的项（批量重命名去了目录栏；
+# 第 16 轮起 新建/查看/排序方式 也只在空白处右键才出现）
 hw = launch(BASE)
 rclick(hw, VIEW_LEFT + 60, TITLE_H + TOOL_H + HEADER_H + 10)
 ms = windows_of("ZenFileMenu")
 if ms:
     mh, mx, my, mw, mhh = ms[0]
     top0, row_h = menu_metrics(mh, mw, mhh)
-    y5 = menu_row_center(top0, row_h, 5, (6, 9))
-    u.PostMessageW(mh, WM_MOUSEMOVE, 0, (y5 << 16) | (mw // 2))
-    time.sleep(0.6)
-    n = len(windows_of("ZenFileMenu"))
-    print(f"  悬停右键菜单第 5 行后菜单窗口 {n} 个")
-    mark(n == 1, "右键菜单第 5 行不再展开下级菜单（批量重命名已移走）")
+    worst = 1
+    for i in range(0, 9):
+        yi = menu_row_center(top0, row_h, i, (6,))
+        if yi < 2 or yi > mhh - 2:
+            continue
+        u.PostMessageW(mh, WM_MOUSEMOVE, 0, (yi << 16) | (mw // 2))
+        time.sleep(0.35)
+        worst = max(worst, len(windows_of("ZenFileMenu")))
+    print(f"  逐行悬停前 9 行，最多同时出现 {worst} 个菜单窗口")
+    mark(worst == 1, "文件右键菜单里没有任何可展开的项")
 
 # ============================================================ 4) 设置页开关
 print("\n[4] 设置页的开关是真控件")
@@ -534,10 +540,9 @@ ph = None
 if ms:
     mh, mx, my, mw, mhh = ms[0]
     top0, row_h = menu_metrics(mh, mw, mhh)
-    # 0打开 1打开方式 2剪切 3复制 4重命名 5删除 6[sep] 7粘贴 8新建 9[sep]
-    # 10全选 11刷新 12查看 13排序方式 14属性
+    # 第 16 轮：0打开 1打开方式 2剪切 3复制 4重命名 5删除 6[sep] 7粘贴 8属性
     for mul in (0, -1, 1):
-        yy = menu_row_center(top0, row_h, 14, (6, 9)) + mul * row_h
+        yy = menu_row_center(top0, row_h, 8, (6,)) + mul * row_h
         if yy < 2 or yy > mhh - 2:
             continue
         u.PostMessageW(mh, WM_MOUSEMOVE, 0, (yy << 16) | (mw // 2))

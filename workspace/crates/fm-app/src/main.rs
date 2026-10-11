@@ -613,6 +613,20 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let hover_tab = hit_tab(app, &l, x, y);
             // 目录栏最右侧「批量重命名」按钮的悬停。虚拟视图里不画，就也不该有悬停态
             let hover_bulk = paint::bulk_rename_available(app) && inside(&l.bulk_btn, x, y);
+            // 内容区里鼠标指着的**条目**（条目下标，不是行号）。
+            // 行号会随滚动/排序变，用它记 hover 会"指着 A 却高亮了 B"。
+            let hover_row = if x >= l.view.left && y >= l.view.top && y < l.view.bottom {
+                if app.tab().home {
+                    home_entry_at(app, &l, x, y)
+                } else if y >= l.view.top + header_height(app) {
+                    view_row_at(app, &l, x, y, l.view.top + header_height(app))
+                        .and_then(|r| app.tab().visible.get(r).copied())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             // 状态栏布局切换按钮悬停
             let hover_view = if app.cfg.ui.statusbar_visible {
                 match paint::status_view_hit(&l, &app.metrics, x, y) {
@@ -654,9 +668,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 || hover_split != app.hover_split
                 || hover_collapse != app.hover_sidebar_collapse
                 || hover_bulk != app.hover_bulk
+                || hover_row != app.hover_row
             {
                 app.hover_sidebar_collapse = hover_collapse;
                 app.hover_bulk = hover_bulk;
+                app.hover_row = hover_row;
                 app.hover_split = hover_split;
                 app.hovering_close = in_close;
                 app.hover_chrome = chrome;
@@ -1038,6 +1054,15 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                             windows::Win32::UI::WindowsAndMessaging::SW_MAXIMIZE
                         },
                     );
+                }
+                return LRESULT(0);
+            }
+            // 导航窗格：双击 = 展开/收起（单击只导航，见 sidebar_click）。
+            // 必须在进内容区判定之前拦下来：导航窗格压在窗口左侧，
+            // 不拦就会落到"双击打开条目"那条路上去。
+            if app.cfg.ui.sidebar_visible && x < l.sidebar.right && y > l.sidebar.top {
+                if sidebar_dblclick(app, x, y) {
+                    let _ = InvalidateRect(Some(hwnd), None, true);
                 }
                 return LRESULT(0);
             }
@@ -1599,16 +1624,40 @@ fn sidebar_click(app: &mut App, x: i32, y: i32) -> bool {
         app.clamp_sidebar_scroll(&l);
         return true;
     }
-    // 点行：导航过去；可展开的节点顺手展开，省一次点击
-    if row.expandable && !row.expanded {
-        app.toggle_sidebar_node(&row.key);
-    }
+    // 单击**只导航，不展开**。之前这里顺手把节点展开了，结果想换个目录就
+    // 被迫把树撑开一大片，滚都滚不回来；树的展开/收起交给箭头和双击。
     if row.target.is_empty() {
         app.navigate(PathBuf::from(app::HOME_PATH));
     } else {
         app.navigate(PathBuf::from(&row.target));
     }
     paint::sync_address(app);
+    true
+}
+
+/// 导航窗格**双击**：展开 / 收起。
+///
+/// 单击只导航（见 `sidebar_click`），双击才动树 —— 这是资源管理器的导航窗格语义：
+/// "点一下是进去看看，双击是把它摊开"。混在一起的话想进个目录就顺带把树撑开。
+fn sidebar_dblclick(app: &mut App, x: i32, y: i32) -> bool {
+    let l = paint::compute_layout(
+        app.last_size.0,
+        app.last_size.1,
+        &app.metrics,
+        app.cfg.ui.sidebar_visible,
+        app.cfg.ui.statusbar_visible,
+    );
+    let Some((index, _)) = paint::sidebar_hit(app, &l, x, y, app.metrics.scale) else {
+        return false;
+    };
+    let row = app.sidebar_rows().get(index).cloned();
+    let Some(row) = row else { return false };
+    // 不可展开的节点（回收站、常用文件夹）双击没有第二层含义，交给单击那次导航
+    if !row.expandable {
+        return true;
+    }
+    app.toggle_sidebar_node(&row.key);
+    app.clamp_sidebar_scroll(&l);
     true
 }
 

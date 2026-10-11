@@ -29,6 +29,10 @@ pub struct Theme {
     pub selection_bg: COLORREF,
     pub selection_text: COLORREF,
     pub hover_bg: COLORREF,
+    /// 列表行"鼠标悬停"的底色。**必须比选中态弱一档**：悬停是"我会点到这"，
+    /// 选中是"已经点了这"，两者一样重就分不清状态。
+    /// 层次：内容区 < row_hover（悬停） < hover_bg（焦点行） < selection_bg（选中）。
+    pub row_hover: COLORREF,
     pub border: COLORREF,
     pub danger: COLORREF,
     pub tab_active: COLORREF,
@@ -61,6 +65,9 @@ pub fn dark() -> Theme {
         // 现在按"内容区 #202020 < 悬停 #3D3D3D < 选中 #474747"拉开层次：
         // 列表里差 29 级、菜单里差 18 级，都足够看清。
         hover_bg: rgb(0x3D3D3D),
+        // 悬停行：比内容区 #202020 亮 14 级，比焦点行 #3D3D3D 暗 15 级 ——
+        // 一眼能看出"这里可以点"，又不至于和"已选中"抢注意力。
+        row_hover: rgb(0x2E2E2E),
         border: rgb(0x535353),
         danger: rgb(0xE4585A),
         tab_active: rgb(0x2B2B2B),
@@ -82,6 +89,8 @@ pub fn light() -> Theme {
         selection_bg: rgb(0xCBE3FF),
         selection_text: rgb(0x101418),
         hover_bg: rgb(0xE5E5E5),
+        // 亮色下反过来：悬停比焦点行浅一档（#F2F2F2 > #E5E5E5）
+        row_hover: rgb(0xF2F2F2),
         border: rgb(0xC8C8C8),
         danger: rgb(0xC42B2B),
         tab_active: rgb(0xFFFFFF),

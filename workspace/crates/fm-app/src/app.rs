@@ -279,6 +279,11 @@ pub struct App {
     pub sidebar_children: HashMap<String, Vec<PathBuf>>,
     /// 鼠标悬停的导航行下标（用于 hover 反馈）。
     pub sidebar_hover: Option<usize>,
+    /// 鼠标悬停的**条目**下标（`tab.entries` 的下标，不是可见行号）。
+    ///
+    /// 用条目下标而不是行号：滚动/排序之后行号会变，而"鼠标指着这个东西"不会变。
+    /// 列表行和首页磁贴共用这一个字段。
+    pub hover_row: Option<usize>,
     /// 鼠标是不是悬在导航窗格右上角的折叠按钮上。
     pub hover_sidebar_collapse: bool,
     /// 导航窗格的滚动偏移（像素）。树比窗格长时才非 0。
@@ -546,6 +551,16 @@ pub struct SidebarRow {
     /// 展开状态用的 key；不可展开的行为空串
     pub key: String,
     pub icon: SidebarIcon,
+    /// 树线：`guides[k]` 为真就在第 k 层缩进上画一条贯穿整行的竖线。
+    ///
+    /// 长度等于 `depth`（第 0 层是根，恒为 false —— 根那一列不画竖线）。
+    /// 没有这一份信息就只能画成"每层一条平行线"，那是栅格不是树：
+    /// 树的关键在于**最后一个孩子那里线要收口**，后面的兄弟不再有线。
+    pub guides: Vec<bool>,
+    /// 自己是不是父节点的最后一个孩子（决定连接线要在行中线收口成 └）。
+    pub last_child: bool,
+    /// 有没有父节点（根节点没有，根节点不画连接线）。
+    pub has_parent: bool,
 }
 
 /// "此电脑"这个虚拟节点在 `sidebar_expanded` 里的 key。
@@ -621,6 +636,7 @@ impl App {
             sidebar_expanded: HashSet::new(),
             sidebar_children: HashMap::new(),
             sidebar_hover: None,
+            hover_row: None,
             hover_sidebar_collapse: false,
             sidebar_scroll: 0,
             display_names: HashMap::new(),
@@ -762,6 +778,9 @@ impl App {
         if self.cfg.ui.sidebar_follow_current && !is_virtual(&path) {
             self.reveal_in_sidebar(&path);
         }
+        // 换了目录，"鼠标指着哪一项"就不再成立（条目下标指向的是上一页的清单）。
+        // 不清的话新页面第一行会莫名顶着一条悬停底色。
+        self.hover_row = None;
         let depth = self.cfg.files.navigation.history_depth;
         // 标签标题也走本地化显示名：资源管理器里 `C:\Users` 的标签写的是"用户"，
         // 直接显示盘上真名会让人对不上号。
@@ -2484,6 +2503,9 @@ impl App {
             expanded: thispc,
             key: SIDEBAR_THISPC.to_string(),
             icon: SidebarIcon::Stock(windows::Win32::UI::Shell::SIID_DESKTOPPC.0),
+            guides: Vec::new(),
+            last_child: false,
+            has_parent: false,
         });
         for (label, path) in user_folders() {
             rows.push(SidebarRow {
@@ -2494,13 +2516,17 @@ impl App {
                 expanded: false,
                 key: String::new(),
                 icon: SidebarIcon::Path(PathBuf::from(path)),
+                guides: Vec::new(),
+                last_child: false,
+                has_parent: false,
             });
         }
 
         if thispc {
             let mut all: Vec<_> = self.drives.values().cloned().collect();
             all.sort_by(|a, b| a.letter.cmp(&b.letter));
-            for d in all {
+            let n = all.len();
+            for (di, d) in all.into_iter().enumerate() {
                 let key = Self::node_key(&PathBuf::from(&d.root));
                 let expanded = self.is_expanded(&key);
                 rows.push(SidebarRow {
@@ -2511,10 +2537,17 @@ impl App {
                     expanded,
                     key: key.clone(),
                     icon: SidebarIcon::Path(PathBuf::from(&d.root)),
+                    // 第 1 层没有可画的祖先竖线（第 0 层是根，不画），只有一条
+                    // 从"此电脑"伸下来的肘形连接线（由 last_child 决定收口）。
+                    guides: vec![false],
+                    last_child: di + 1 == n,
+                    has_parent: true,
                 });
                 if expanded {
-                    let kids = self.push_children_rows_into(&key, 2, &mut rows);
-                    let _ = kids;
+                    // anc_last[0] = 此电脑（根）恒 false；anc_last[1] = 该盘符
+                    // 是不是最后一个盘符。
+                    let anc = vec![false, di + 1 == n];
+                    self.push_children_rows_into(&key, 2, &anc, &mut rows);
                 }
             }
         }
@@ -2533,12 +2566,25 @@ impl App {
             expanded: false,
             key: String::new(),
             icon: SidebarIcon::Stock(siid),
+            guides: Vec::new(),
+            last_child: false,
+            has_parent: false,
         });
         rows
     }
 
     /// 把某个已展开节点的子目录递归展开成行（深度上限 8，防止符号链接成环）。
-    fn push_children_rows_into(&mut self, key: &str, depth: usize, out: &mut Vec<SidebarRow>) {
+    ///
+    /// `anc_last[k]` = 第 k 层（depth = k）的祖先是不是它父节点的最后一个孩子。
+    /// 它是画树线的唯一依据：第 k 层的竖线能不能贯穿这一行，取决于路径上
+    /// **第 k+1 层那个节点**后面还有没有兄弟。
+    fn push_children_rows_into(
+        &mut self,
+        key: &str,
+        depth: usize,
+        anc_last: &[bool],
+        out: &mut Vec<SidebarRow>,
+    ) {
         if depth > 8 {
             return;
         }
@@ -2546,9 +2592,23 @@ impl App {
             self.load_sidebar_children(key);
         }
         let Some(children) = self.sidebar_children.get(key).cloned() else { return };
-        for child in children {
+        let n = children.len();
+        for (ci, child) in children.into_iter().enumerate() {
             let ckey = Self::node_key(&child);
             let expanded = self.is_expanded(&ckey);
+            let is_last = ci + 1 == n;
+            // 路径上第 j 层那个节点是不是最后一个孩子
+            let path_last = |j: usize| -> bool {
+                if j < depth {
+                    anc_last.get(j).copied().unwrap_or(false)
+                } else {
+                    is_last
+                }
+            };
+            let mut guides = vec![false; depth];
+            for k in 1..depth {
+                guides[k] = !path_last(k + 1);
+            }
             let fb = child.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             let name = self.display_name(&child, &fb);
             out.push(SidebarRow {
@@ -2559,9 +2619,17 @@ impl App {
                 expanded,
                 key: ckey.clone(),
                 icon: SidebarIcon::Path(child.clone()),
+                guides,
+                last_child: is_last,
+                has_parent: true,
             });
             if expanded {
-                self.push_children_rows_into(&ckey, depth + 1, out);
+                let mut next: Vec<bool> = anc_last.to_vec();
+                while next.len() < depth {
+                    next.push(false);
+                }
+                next.push(is_last);
+                self.push_children_rows_into(&ckey, depth + 1, &next, out);
             }
         }
     }
@@ -2767,30 +2835,37 @@ fn own_menu_rows(app: &App, items: &[PathBuf]) -> Vec<menu::MenuEntry> {
     } else {
         rows.push(disabled_row("粘贴", Some("\u{E77F}"), Command::Paste));
     }
-    rows.push(submenu_row(
-        "新建",
-        Some("\u{E8F4}"),
-        vec![
-            shell_row("文件夹", None, Command::NewFolder),
-            shell_row("文本文档", None, Command::NewFile),
-        ],
-    ));
-    rows.push(menu::MenuEntry::sep());
-    rows.push(shell_row("全选", Some("\u{E762}"), Command::SelectAll));
-    rows.push(shell_row("刷新", Some("\u{E72C}"), Command::Refresh));
-    let mut view_children = view_rows(app);
-    view_children.push(menu::MenuEntry::sep());
-    // 三道开关分开列：隐藏项是用户自己设的，系统项是系统保护的，
-    // 扩展名是纯显示开关 —— 混成一个开关没法单独控制。
-    view_children.push(pick_row("隐藏的项目", Command::ToggleHidden, app.show_hidden));
-    view_children.push(pick_row("受保护的系统文件", Command::ToggleSystem, app.show_system));
-    view_children.push(pick_row(
-        "文件扩展名",
-        Command::ToggleExtensions,
-        app.cfg.files.view.show_extensions,
-    ));
-    rows.push(submenu_row("查看", Some("\u{E7B3}"), view_children));
-    rows.push(submenu_row("排序方式", Some("\u{E8CB}"), sort_rows(app)));
+    if items.is_empty() {
+        // —— 以下只属于"空白处右键"（背景菜单）——
+        //
+        // 资源管理器里右键**某个文件/文件夹**时，菜单里没有"查看/排序方式/刷新/新建/全选"：
+        // 那些是"对当前这个视图做什么"，不是"对这个东西做什么"。之前不管右键落在
+        // 哪都照单全列，点"刷新"的时候看着像菜单做多了。
+        rows.push(submenu_row(
+            "新建",
+            Some("\u{E8F4}"),
+            vec![
+                shell_row("文件夹", None, Command::NewFolder),
+                shell_row("文本文档", None, Command::NewFile),
+            ],
+        ));
+        rows.push(menu::MenuEntry::sep());
+        rows.push(shell_row("全选", Some("\u{E762}"), Command::SelectAll));
+        rows.push(shell_row("刷新", Some("\u{E72C}"), Command::Refresh));
+        let mut view_children = view_rows(app);
+        view_children.push(menu::MenuEntry::sep());
+        // 三道开关分开列：隐藏项是用户自己设的，系统项是系统保护的，
+        // 扩展名是纯显示开关 —— 混成一个开关没法单独控制。
+        view_children.push(pick_row("隐藏的项目", Command::ToggleHidden, app.show_hidden));
+        view_children.push(pick_row("受保护的系统文件", Command::ToggleSystem, app.show_system));
+        view_children.push(pick_row(
+            "文件扩展名",
+            Command::ToggleExtensions,
+            app.cfg.files.view.show_extensions,
+        ));
+        rows.push(submenu_row("查看", Some("\u{E7B3}"), view_children));
+        rows.push(submenu_row("排序方式", Some("\u{E8CB}"), sort_rows(app)));
+    }
     rows.push(shell_row(
         if items.is_empty() { "属性（当前文件夹）" } else { "属性" },
         Some("\u{E946}"),
@@ -2798,13 +2873,6 @@ fn own_menu_rows(app: &App, items: &[PathBuf]) -> Vec<menu::MenuEntry> {
     ));
     rows.push(menu::MenuEntry::sep());
     rows.push(shell_row("设置", Some("\u{E713}"), Command::OpenSettings));
-    // 无选中项时给出背景菜单语义说明
-    if items.is_empty() {
-        rows.push(menu::MenuEntry::sep());
-        let mut note = shell_row("当前为空文件夹区域", None, Command::Refresh);
-        note.disabled = true;
-        rows.push(note);
-    }
     rows
 }
 

@@ -82,6 +82,24 @@ pub fn glyph_font(scale: f32) -> HFONT {
     }
 }
 
+/// 按钮角标用的小号字形（下拉三角）。和上面几个字体一样缓存：每帧
+/// `CreateFont` + `DeleteObject` 会在高刷屏上白白多出几百次 GDI 调用。
+static mut CARET_FONT: HFONT = HFONT(std::ptr::null_mut());
+static mut CARET_FONT_SCALE: f32 = 0.0;
+
+pub fn caret_font(scale: f32) -> HFONT {
+    unsafe {
+        if CARET_FONT.0.is_null() || (CARET_FONT_SCALE - scale).abs() > 0.01 {
+            if !CARET_FONT.0.is_null() {
+                let _ = DeleteObject(CARET_FONT.into());
+            }
+            CARET_FONT = make_font((-8.0 * scale).round() as i32, 400, "Segoe MDL2 Assets");
+            CARET_FONT_SCALE = scale;
+        }
+        CARET_FONT
+    }
+}
+
 /// 菜单正文：比列表正文（-13）大一号。导航窗格放大到 -16 之后，菜单还停在 -13
 /// 会显得明显小一号，两处放一起不协调。
 static mut MENU_FONT: HFONT = HFONT(std::ptr::null_mut());
@@ -219,8 +237,12 @@ pub fn compute_layout(w: i32, h: i32, m: &Metrics, sidebar: bool, status: bool) 
     let view_top = tb_top;
     let view_bottom = h - status_h;
     let search_w = (170.0 * m.scale).round() as i32;
-    // 「批量重命名 ▾」：目录栏最右侧。搜索框整体左移让位，地址栏再跟着收窄。
-    let bulk_w = (132.0 * m.scale).round() as i32;
+    // 「批量重命名」图标按钮：目录栏最右侧、**常驻**（置顶显示）。
+    //
+    // 上一版是 132px 的"批量重命名 ▾"文字按钮，把地址栏挤掉了小一半 ——
+    // 面包屑一长就只剩"此电脑 › …"，等于挡住了目录。改成 30px 的纯图标按钮
+    // （字形 E8AC + 右下角一个小三角表示有下拉），地址栏拿回 100px。
+    let bulk_w = (30.0 * m.scale).round() as i32;
 
     let btn_w = (44.0 * m.scale).round() as i32;
     let toggle_w = (40.0 * m.scale).round() as i32;
@@ -1259,10 +1281,10 @@ fn paint_toolbar(app: &mut App, hdc: HDC, l: &Layout) {
             let _ = DeleteObject(pf.into());
         }
 
-        // 「批量重命名 ▾」：只在真目录里出现（主页/回收站/设置没有可重命名的条目）
-        if bulk_rename_available(app) {
-            paint_bulk_button(app, hdc, l);
-        }
+        // 「批量重命名」图标按钮：**无条件画**（置顶显示）。
+        // 虚拟视图（主页/回收站/设置）里画成淡化的不可用态，而不是整块消失 ——
+        // 一个按钮时有时无，用户会以为它丢了。
+        paint_bulk_button(app, hdc, l);
 
         // 工具栏下分隔线，否则与列表区糊成一片
         let lb = CreateSolidBrush(t.border);
@@ -1274,19 +1296,23 @@ fn paint_toolbar(app: &mut App, hdc: HDC, l: &Layout) {
     }
 }
 
-/// 目录栏最右侧这个按钮要不要画。虚拟视图（主页/回收站/设置）没有可批量重命名
-/// 的条目，画出来点了也没反应 —— 不如不画。
+/// 目录栏最右侧这个按钮**此刻能不能用**。虚拟视图（主页/回收站/设置）没有
+/// 可批量重命名的条目 —— 但按钮照样画在那儿，只是淡化且点不动。
 ///
 /// 绘制与命中都走这一个判断，免得"看得见点不到"。
 pub fn bulk_rename_available(app: &App) -> bool {
     !crate::app::is_virtual(&app.tab().path)
 }
 
-/// 「批量重命名 ▾」按钮。点一下弹出五种模式的下拉菜单。
+/// 「批量重命名」图标按钮。点一下在按钮正下方弹出五种模式的下拉菜单。
+///
+/// 做成纯图标（E8AC"重命名" + 右下角一个小三角表示有下拉）而不是文字按钮：
+/// 文字版占 132px，会把地址栏的面包屑挤没。图标版 30px，地址栏拿回 100px。
 fn paint_bulk_button(app: &App, hdc: HDC, l: &Layout) {
     let t = app.theme;
     let s = app.metrics.scale;
-    let hovered = app.hover_bulk;
+    let enabled = bulk_rename_available(app);
+    let hovered = app.hover_bulk && enabled;
     unsafe {
         let r = &l.bulk_btn;
         let bg = CreateSolidBrush(if hovered { t.hover_bg } else { t.surface });
@@ -1304,20 +1330,32 @@ fn paint_bulk_button(app: &App, hdc: HDC, l: &Layout) {
         }
         let _ = DeleteObject(pf.into());
 
-        let font = ui_font(s);
-        let old = SelectObject(hdc, font.into());
         SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, t.text);
-        let tr = RECT { left: r.left + (8.0 * s) as i32, top: r.top, right: r.right - (18.0 * s) as i32, bottom: r.bottom };
-        draw_text(hdc, "批量重命名", tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-        // 下拉箭头：和自绘菜单里子菜单那个 ">" 用同一套字形字体
+        // 主字形：占据整块（略偏左上，给右下角的小三角腾位置）
         let g = glyph_font(s);
         let og = SelectObject(hdc, g.into());
+        SetTextColor(hdc, if enabled { t.text } else { t.text_dim });
+        let gr = RECT {
+            left: r.left - (2.0 * s) as i32,
+            top: r.top - (3.0 * s) as i32,
+            right: r.right - (1.0 * s) as i32,
+            bottom: r.bottom - (3.0 * s) as i32,
+        };
+        draw_text(hdc, "\u{E8AC}", gr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        // 右下角小三角："这是一个下拉，不是普通按钮"。用一个更小的字形字号，
+        // 免得它和主字形抢视觉重量。
+        let small = caret_font(s);
+        let os = SelectObject(hdc, small.into());
         SetTextColor(hdc, t.text_dim);
-        let ar = RECT { left: r.right - (18.0 * s) as i32, top: r.top, right: r.right - (4.0 * s) as i32, bottom: r.bottom };
+        let ar = RECT {
+            left: r.left + (16.0 * s) as i32,
+            top: r.bottom - (14.0 * s) as i32,
+            right: r.right,
+            bottom: r.bottom - (2.0 * s) as i32,
+        };
         draw_text(hdc, "\u{E70D}", ar, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(hdc, os);
         SelectObject(hdc, og);
-        SelectObject(hdc, old);
     }
 }
 
@@ -1433,20 +1471,37 @@ fn paint_sidebar(app: &mut App, hdc: HDC, l: &Layout) {
             if row_r.bottom <= l.sidebar.top {
                 continue;
             }
-            // 阶梯引导线：每一级缩进都画一条竖线，展开出来的子树靠它和父节点
-            // 连起来。没有这些线，三级以下的目录看着就是一堆平铺的文字。
-            if row.depth > 0 {
+            // 树线：这一行才是"树"和"栅格"的分界。
+            //
+            // 之前是"每一级缩进都画一条通天竖线"，结果是一排等距平行线，
+            // 看着像表格。真树的关键在于两件事：
+            //   1) 竖线只在**后面还有兄弟**的那一层画（最后一个孩子的子树里
+            //      就没有这条线了 —— `guides[k]` 就是干这个的）；
+            //   2) 每个节点都有一条从父级竖线伸出来的**肘形连接线**，
+            //      末位孩子那条父级竖线在行中线收口（画成 └ 而不是 ├）。
+            if row.has_parent && row.depth > 0 {
                 let lb = CreateSolidBrush(t.border);
                 let chev_s = (16.0 * scale).round() as i32;
                 let step = (16.0 * scale).round() as i32;
-                for k in 0..row.depth {
-                    let x = l.sidebar.left + (4.0 * scale).round() as i32 + step * k as i32 + chev_s / 2;
-                    FillRect(
-                        hdc,
-                        &RECT { left: x, top: row_r.top, right: x + 1, bottom: row_r.bottom },
-                        lb,
-                    );
+                let base = l.sidebar.left + (4.0 * scale).round() as i32;
+                let line_x = |k: usize| base + step * k as i32 + chev_s / 2;
+                for k in 1..row.depth {
+                    if row.guides.get(k).copied().unwrap_or(false) {
+                        let x = line_x(k);
+                        FillRect(
+                            hdc,
+                            &RECT { left: x, top: row_r.top, right: x + 1, bottom: row_r.bottom },
+                            lb,
+                        );
+                    }
                 }
+                // 肘形连接线：从父级那一层的竖线拉到本行的箭头上
+                let px = line_x(row.depth - 1);
+                let cy = (row_r.top + row_r.bottom) / 2;
+                let vbottom = if row.last_child { cy + 1 } else { row_r.bottom };
+                FillRect(hdc, &RECT { left: px, top: row_r.top, right: px + 1, bottom: vbottom }, lb);
+                let hx1 = base + step * row.depth as i32 + 2;
+                FillRect(hdc, &RECT { left: px, top: cy, right: hx1, bottom: cy + 1 }, lb);
                 let _ = DeleteObject(lb.into());
             }
 
@@ -1888,7 +1943,14 @@ fn paint_home(app: &mut App, hdc: HDC, l: &Layout) {
             let sel = selected[n];
             // 磁贴底色：选中/聚焦时给一层淡淡的高亮，和列表行保持一致的手感。
             // 聚焦同样受 focus_visible 约束，首页一打开第 0 块磁贴不该是亮的。
-            if sel || (app.focus_visible && n == focus_row) {
+            // 首页磁贴同样给悬停反馈，强度比选中弱一档（见列表行的注释）
+            let focused = app.focus_visible && n == focus_row;
+            if !sel && !focused && app.hover_row == Some(tile.index) {
+                let b = CreateSolidBrush(t.row_hover);
+                FillRect(hdc, &tile.rect, b);
+                let _ = DeleteObject(b.into());
+            }
+            if sel || focused {
                 let b = CreateSolidBrush(if sel { t.selection_bg } else { t.hover_bg });
                 FillRect(hdc, &tile.rect, b);
                 let _ = DeleteObject(b.into());
@@ -2208,6 +2270,15 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
             // 焦点行只在用户真的交互过之后才画出来：否则每次打开文件夹，
             // 第 0 行都顶着一条高亮，看着像"默认就勾选了第一行"。
             let focused = app.focus_visible && i == tab.focus_row;
+            // 悬停：和选中同一套语言（一层底色），但**故意弱一档**。
+            // 选中 = 底色 + 行首强调竖线；悬停 = 只有一档更淡的底色，没有竖线。
+            // 两者一样重就分不清"我已经选了它"和"我只是指在这儿"。
+            let hovered = !selected && !focused && app.hover_row == Some(index);
+            if hovered {
+                let fill = CreateSolidBrush(t.row_hover);
+                FillRect(hdc, &r, fill);
+                let _ = DeleteObject(fill.into());
+            }
             if selected || focused {
                 let fill = CreateSolidBrush(if selected { t.selection_bg } else { t.hover_bg });
                 FillRect(hdc, &r, fill);
