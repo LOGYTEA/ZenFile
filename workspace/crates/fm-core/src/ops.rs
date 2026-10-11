@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::core::HSTRING;
+use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVE_FILE_FLAGS};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::Shell::{
@@ -89,13 +90,48 @@ impl FileOp {
     }
 }
 
+/// 就地粘贴时资源管理器给新副本起的名字后缀（"X - 副本"里的"副本"）。
+///
+/// 这个串是 shell32 里的本地化资源，`CopyItem` 传 NULL 时 Shell 只会退化成
+/// "X (2)"，跟资源管理器对不上。资源号没有公开可靠的说法，所以只在中文界面
+/// 下用"副本"，其它语言维持 Shell 默认 —— 硬编造一个英文 "Copy" 反而更糟。
+fn copy_suffix() -> Option<&'static str> {
+    match unsafe { GetUserDefaultUILanguage() } {
+        0x0804 | 0x0404 | 0x0C04 | 0x1004 | 0x1404 => Some("副本"),
+        _ => None,
+    }
+}
+
 /// 复制到目标文件夹。
 pub fn copy_items(owner: isize, dest: &Path, items: &[PathBuf]) -> Result<()> {
     let fo = FileOp::new(owner, false, false)?;
     let dest_item = shell_item(dest)?;
+    let suffix = copy_suffix();
     for src in items {
         let item = shell_item(src)?;
-        unsafe { fo.op.CopyItem(&item, &dest_item, windows::core::PCWSTR::null(), None)? };
+        // 只有"粘回原目录"才需要自己起名（否则名字跟源一样，Shell 不会自动加后缀）
+        let copy_name = match (suffix, src.parent()) {
+            (Some(sfx), Some(p)) if p == dest => src.file_name().map(|n| {
+                let s = n.to_string_lossy();
+                match s.rfind('.') {
+                    Some(i) if i > 0 => format!("{} - {}{}", &s[..i], sfx, &s[i..]),
+                    _ => format!("{s} - {sfx}"),
+                }
+            }),
+            _ => None,
+        };
+        let name_h = copy_name.map(|s| HSTRING::from(s.as_str()));
+        unsafe {
+            fo.op.CopyItem(
+                &item,
+                &dest_item,
+                name_h
+                    .as_ref()
+                    .map(|h| windows::core::PCWSTR(h.as_ptr()))
+                    .unwrap_or(windows::core::PCWSTR::null()),
+                None,
+            )?
+        };
     }
     fo.commit()
 }

@@ -190,7 +190,9 @@ pub fn run() -> i32 {
     let pb = crate::SizeUnit::Auto.format(3u64 * 1024 * 1024 * 1024 * 1024 * 1024);
     h.check(
         "size::auto_smallest",
-        b == "512 字节"
+        // 单位一律 B/KB/MB/GB/TB/PB，不再出现"字节" —— 与资源管理器/系统
+        // 各处显示的口径一致（用户要求：不要"字节"这一档中文单位）。
+        b == "512 B"
             && kb.ends_with("KB")
             && mb.ends_with("MB")
             && gb.ends_with("GB")
@@ -201,7 +203,7 @@ pub fn run() -> i32 {
     h.check(
         "size::fixed",
         crate::SizeUnit::KB.format(2048) == "2 KB"
-            && crate::SizeUnit::Bytes.format(2048) == "2048 字节"
+            && crate::SizeUnit::Bytes.format(2048) == "2048 B"
             && crate::SizeUnit::TB.format(2 * 1024 * 1024 * 1024 * 1024) == "2 TB"
             && crate::SizeUnit::PB.format(2 * 1024 * 1024 * 1024 * 1024 * 1024) == "2 PB",
         "固定单位换算（含 TB / PB）",

@@ -18,6 +18,7 @@ use fm_core::types::{filter_entries, FileEntry, FileKind, SortKey, SortSpec, Vie
 use fm_core::watch::{DirWatcher, WatchMsg};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::InvalidateRect;
+use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, IsWindow};
 
 use crate::icons::IconCache;
 use crate::menu::{self, Command, MenuAction, ShellMenuBridge};
@@ -303,6 +304,18 @@ pub struct App {
     /// 目录枚举是异步的：go_up 的瞬间目标目录一行都没有，直接查找必然落空。
     /// 所以先把"要选中的路径"记下来，等枚举批次到达（drain）后再落地。
     pub pending_select: Option<PathBuf>,
+    /// 选中落地之后**顺手进入重命名**。
+    ///
+    /// 资源管理器里"新建文件夹"之后光标直接在新文件夹的名字上等着改 ——
+    /// 建完不进重命名，就得先找到它、右键、改名，三步走路。
+    pub pending_rename: bool,
+    /// 新建后的重命名要不要"只选主部"。建 .txt 时要（保住扩展名），建文件夹时不分。
+    pub rename_stem_only: bool,
+    /// 上一次单击落在哪个**条目**上（`tab.entries` 下标），以及当时的时刻（ms）。
+    ///
+    /// 用来区分"双击打开"和"两次慢速单击改名"：资源管理器里再点一下已经选中的
+    /// 名字（间隔超过双击时限）就进重命名，连着两下是打开。
+    pub last_click: Option<(usize, u64)>,
     /// 本次右键菜单要作用在哪些条目上。
     ///
     /// `Some(vec![])` 表示右键点在了空白处；`None` 表示不是从右键进来的。
@@ -310,6 +323,19 @@ pub struct App {
     /// 于是"空白处右键"拿到的还是上一次那个条目，菜单判定的就是错的。
     pub context_targets: Option<Vec<PathBuf>>,
     /// 回收站条目（进入回收站视图时刷新一次）。
+    /// 后台枚举回收站的结果通道。`Some` 表示有一趟枚举还在路上。
+    ///
+    /// 回收站是逐盘直读 `$Recycle.Bin` 的：盘多或者垃圾多的时候能到几百毫秒，
+    /// 放在 UI 线程里做就是"点一下回收站卡一下"。所以和目录枚举一样丢后台，
+    /// 结果由 `WM_APP_RECYCLE` 收口。
+    pub recycle_rx: Option<Receiver<Vec<fm_core::recycle::Item>>>,
+    /// 回收站枚举的世代号。切走又切回来时，上一趟的迟到结果要丢掉，
+    /// 否则会把别的视图的显示数据顶掉。
+    pub recycle_gen: u64,
+    /// 鼠标悬停的回收站条目下标（`recycle_items` 的下标）。
+    pub hover_recycle: Option<usize>,
+    /// 回收站顶部三个按钮的悬停位：0=无，1=还原，2=彻底删除，3=清空回收站。
+    pub hover_recycle_btn: u8,
     pub recycle_items: Vec<fm_core::recycle::Item>,
     /// 回收站里被选中的项（按 `$R` 实体名索引）。
     pub recycle_sel: HashSet<String>,
@@ -561,6 +587,30 @@ pub struct SidebarRow {
     pub last_child: bool,
     /// 有没有父节点（根节点没有，根节点不画连接线）。
     pub has_parent: bool,
+    /// 分组之间的空行：只占一格高度，**不画也不参与命中**。
+    ///
+    /// 之前"此电脑/盘符/常用文件夹/回收站"是一路平铺下来的，三组之间没有任何
+    /// 分隔，扫一眼分不清哪几行是一拨（用户：中间加一点空隙）。
+    pub spacer: bool,
+}
+
+impl SidebarRow {
+    /// 分组之间的空行。
+    pub fn spacer() -> Self {
+        SidebarRow {
+            label: String::new(),
+            target: String::new(),
+            depth: 0,
+            expandable: false,
+            expanded: false,
+            key: String::new(),
+            icon: SidebarIcon::Glyph(""),
+            guides: Vec::new(),
+            last_child: false,
+            has_parent: false,
+            spacer: true,
+        }
+    }
 }
 
 /// "此电脑"这个虚拟节点在 `sidebar_expanded` 里的 key。
@@ -644,9 +694,16 @@ impl App {
             hover_tab: None,
             hover_view_btn: 0,
             pending_select: None,
+            pending_rename: false,
+            rename_stem_only: false,
             context_targets: None,
+            last_click: None,
             recycle_items: Vec::new(),
             recycle_sel: HashSet::new(),
+            recycle_rx: None,
+            recycle_gen: 0,
+            hover_recycle: None,
+            hover_recycle_btn: 0,
             settings_hover: None,
             hover_caption: 0,
             pressed_caption: 0,
@@ -921,8 +978,28 @@ impl App {
             self.pending_select = None;
             // 这是"用户从子目录回退"带来的选中，焦点框必须显形，否则等于没选中
             self.focus_visible = true;
+            let rename = self.pending_rename;
+            self.pending_rename = false;
             self.invalidate();
+            if rename {
+                // 建完立刻进重命名：光标直接落在新名字上等着改。
+                let stem = self.rename_stem_only;
+                self.begin_rename_after_create(stem);
+            }
         }
+    }
+
+    /// 刚建出来的那一项进入重命名。
+    ///
+    /// `select_stem` 为真时只选中**文件名主部**、把扩展名留在选区外
+    /// （新建 .txt 时用户要改的是"新建 文本文档"那几个字，不是把 .txt 一起删了）。
+    pub fn begin_rename_after_create(&mut self, select_stem: bool) {
+        self.set_focus_row(self.tab().focus_row);
+        let Some(idx) = self.tab().visible.get(self.tab().focus_row).copied() else {
+            return;
+        };
+        self.rename_index = Some(idx);
+        crate::paint::create_rename_editor(self, select_stem);
     }
 
     /// 重取本机驱动器清单（类型 / 卷标 / 容量）。
@@ -988,15 +1065,11 @@ impl App {
         }
 
         // 回收站/设置同样是虚拟视图：合成显示数据即可，绝不走目录枚举。
-        // 回收站直读 $Recycle.Bin（不走 Shell 的 IShellFolder），几千项也是几十毫秒。
+        // 回收站直读 $Recycle.Bin（不走 Shell 的 IShellFolder）。
+        // 逐盘扫 `$Recycle.Bin` 在盘多/垃圾多时能到几百毫秒，同步做就是
+        // "点一下回收站卡一下"，所以丢后台线程，结果由 WM_APP_RECYCLE 收口。
         if self.tab().recycle {
-            self.recycle_items = fm_core::recycle::list();
-            self.recycle_sel.clear();
-            let tab = self.tab_mut();
-            tab.generation += 1;
-            tab.entries.clear();
-            tab.visible.clear();
-            tab.loading = false;
+            self.spawn_recycle_scan();
             return;
         }
         if self.tab().settings {
@@ -1551,24 +1624,48 @@ impl App {
         self.reload();
     }
 
+    /// 新建之后的收尾：重列 + 把新建那一项选中 + 进重命名。
+    ///
+    /// 目录枚举是异步的，所以"选中"只能挂成 `pending_select`，等枚举批次到了再
+    /// 落地（见 `try_pending_select`），重命名也跟着那一刻一起触发。
+    fn after_create(&mut self, path: PathBuf, select_stem: bool) {
+        self.pending_select = Some(path);
+        self.pending_rename = true;
+        self.rename_stem_only = select_stem;
+        self.reload();
+    }
+
     pub fn new_folder(&mut self) {
         let dir = self.tab().path.clone();
         let owner = self.hwnd.0 as isize;
         if let Err(e) = new_folder(owner, &dir) {
             report(self.hwnd, &format!("创建失败：{e}"));
+            return;
         }
-        self.reload();
+        // new_folder 用的是 Shell 那套，拿不到确切名字；按它的命名规则推出候选
+        let p = paths::unique_name(&dir, "新建文件夹", "");
+        self.after_create(p, false);
     }
 
     pub fn new_file(&mut self) {
         let dir = self.tab().path.clone();
-        let name = paths::unique_name(&dir, "新建文本文档", ".txt");
-        let fname = name.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let p = paths::unique_name(&dir, "新建文本文档", ".txt");
+        let fname = p.file_name().unwrap_or_default().to_string_lossy().to_string();
         let owner = self.hwnd.0 as isize;
         if let Err(e) = new_file(owner, &dir, &fname) {
             report(self.hwnd, &format!("创建失败：{e}"));
+            return;
         }
-        self.reload();
+        self.after_create(p, true);
+    }
+
+    /// 按系统 ShellNew 模板新建（"新建 → 文本文档 / RTF 文档 / …"）。
+    pub fn new_from_template(&mut self, ext: &str) {
+        let dir = self.tab().path.clone();
+        match crate::shellnew::create(&dir, ext) {
+            Ok(p) => self.after_create(p, true),
+            Err(e) => report(self.hwnd, &format!("创建失败：{e}")),
+        }
     }
 
     pub fn begin_rename(&mut self) {
@@ -1580,7 +1677,8 @@ impl App {
             (idx, entry.name.clone())
         };
         self.rename_index = Some(idx);
-        crate::paint::create_rename_editor(self, &name);
+        let _ = name;
+        crate::paint::create_rename_editor(self, true);
     }
 
     pub fn commit_rename(&mut self, new_name: &str) {
@@ -1607,6 +1705,13 @@ impl App {
         self.rename_index = None;
     }
 
+    /// 把编辑框里现在的文字当作新名字提交（供"点一下别处"收尾用）。
+    pub fn commit_rename_from_editor(&mut self) {
+        let Some(h) = self.rename_hwnd else { return };
+        let name = crate::paint::read_window_text(h);
+        self.commit_rename(&name);
+    }
+
     fn destroy_rename_editor(&mut self) {
         if let Some(h) = self.rename_hwnd.take() {
             unsafe {
@@ -1630,8 +1735,12 @@ impl App {
         match clipboard::get_files() {
             Ok(Some((files, mode))) if !files.is_empty() => {
                 let dest = self.tab().path.clone();
-                if dest.to_string_lossy() == files[0].parent().map(|p| p.to_string_lossy()).unwrap_or_default() && mode == ClipMode::Copy {
-                    report(self.hwnd, "源与目标相同，跳过");
+                // 只有"把某个文件夹粘进它自己"才是真做不了（会无限递归）。
+                // 原目录里粘贴是**合法且常用**的操作：资源管理器会生成"X - 副本"。
+                // 之前写成"源与目标相同就跳过"，于是最常用的"复制完就地粘贴"
+                // 什么都不发生，看着就像粘贴功能坏了。
+                if files.iter().any(|f| f == &dest) {
+                    report(self.hwnd, "不能把文件夹粘贴到它自己里面");
                     return;
                 }
                 let label = if mode == ClipMode::Move { "粘贴（移动）" } else { "粘贴（复制）" };
@@ -1713,6 +1822,95 @@ impl App {
         });
     }
 
+    /// 后台枚举回收站。UI 线程只负责发一趟活，扫描本身在 worker 上。
+    ///
+    /// 与目录枚举同理：`$Recycle.Bin` 的直读会摸到每个盘，慢的时候几百毫秒，
+    /// 放在 `reload()` 里就是"点一下回收站要愣一下"。
+    fn spawn_recycle_scan(&mut self) {
+        // 上一趟还没回来就不再派新的：连续刷新只会堆线程，不会更快。
+        if self.recycle_rx.is_some() {
+            let tab = self.tab_mut();
+            tab.generation += 1;
+            tab.entries.clear();
+            tab.visible.clear();
+            return;
+        }
+        self.recycle_gen += 1;
+        let gen = self.recycle_gen;
+        // 分批到达是**追加**，所以起新一趟之前必须先把旧的清掉，
+        // 否则刷新一次条目就翻一倍。
+        self.recycle_items.clear();
+        self.recycle_sel.clear();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.recycle_rx = Some(rx);
+        let hwnd_raw = self.hwnd.0 as usize;
+        std::thread::spawn(move || {
+            // COM 必须**每线程**各自初始化：扫描过程要问 Shell 拿显示名和盘符信息。
+            // UI 线程上这些都靠启动时那次 CoInitialize 兜着，新开的线程没有 ——
+            // 不补上就是"回收站打开后一条都不显示"。
+            let _guard = ComGuard::init();
+            // 分盘回调：扫完一个盘就发一批，界面能边扫边显示，
+            // 不用等最后一个盘扫完才出第一条（几万条时要等好几秒）。
+            fm_core::recycle::list_streaming(|batch| {
+                let _ = tx.send(batch);
+                unsafe {
+                    windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                        Some(windows::Win32::Foundation::HWND(hwnd_raw as *mut core::ffi::c_void)),
+                        crate::WM_APP_RECYCLE,
+                        windows::Win32::Foundation::WPARAM(gen as usize),
+                        windows::Win32::Foundation::LPARAM(0),
+                    );
+                }
+            });
+            // 空批 = 扫完了
+            let _ = tx.send(Vec::new());
+            unsafe {
+                windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(windows::Win32::Foundation::HWND(hwnd_raw as *mut core::ffi::c_void)),
+                    crate::WM_APP_RECYCLE,
+                    windows::Win32::Foundation::WPARAM(gen as usize),
+                    windows::Win32::Foundation::LPARAM(1),
+                );
+            }
+        });
+        // 先把视图切成"正在读"：旧的条目不清（避免闪一下空白），
+        // 只把 loading 点亮，进度条会动。
+        let tab = self.tab_mut();
+        tab.generation += 1;
+        tab.entries.clear();
+        tab.visible.clear();
+        tab.loading = true;
+    }
+
+    /// `WM_APP_RECYCLE` 的收口：把后台枚举到的条目装进视图。
+    ///
+    /// 世代号对不上说明这次结果已经过期（用户早就切走了），直接丢。
+    ///
+    /// `done`（LPARAM=1）表示这是最后一趟，此时才收起进度条并把结果整体排序。
+    pub fn drain_recycle(&mut self, gen: u64, done: bool) {
+        let Some(rx) = self.recycle_rx.take() else {
+            return;
+        };
+        // 世代号对不上说明这一趟已经作废（早就切走了），连同通道一起丢掉
+        if gen != self.recycle_gen {
+            return;
+        }
+        while let Ok(batch) = rx.try_recv() {
+            self.recycle_items.extend(batch);
+        }
+        if done {
+            // 分批到达时每批内部有序、批与批之间没有，最后统一排一次
+            self.recycle_items.sort_by(|a, b| b.deleted.cmp(&a.deleted));
+            let tab = self.tab_mut();
+            tab.generation += 1;
+            tab.entries.clear();
+            tab.visible.clear();
+            tab.loading = false;
+        } else {
+            self.recycle_rx = Some(rx);
+        }
+    }
+
     /// 拖拽落地：把 `items` 放进 `dest`。
     ///
     /// `copy` 为假时是移动，跨卷自动退化成复制（与资源管理器一致：不同盘之间
@@ -1787,8 +1985,10 @@ impl App {
             return;
         }
 
+        // 空白处右键要问的是**这个目录的背景菜单**（第三方扩展都挂在那儿），
+        // 选中了东西才走"对这些条目"的那条路。
         self.bridge = if items.is_empty() {
-            None
+            menu::build_background_bridge(self.hwnd, &cwd)
         } else {
             menu::build_shell_bridge(self.hwnd, &parent, &items, false)
         };
@@ -1805,6 +2005,8 @@ impl App {
                 entries.extend(system);
             }
         }
+        // 再整体去重一遍：Shell 自己内部也会给重复的"打开"（不同扩展各贡献一条）
+        entries = dedupe_rows(entries);
         entries.push(menu::MenuEntry::sep());
         entries.push(shell_row("显示更多选项（原生菜单）", None, Command::ShowNativeMenu));
 
@@ -1857,6 +2059,22 @@ impl App {
         }
     }
 
+    /// 应用失焦时把还开着的菜单收掉。
+    ///
+    /// 自绘菜单是 `SW_SHOWNOACTIVATE` 的弹出窗口，**从不拿焦点**，所以 alt+tab
+    /// 切走时它收不到 WM_KILLFOCUS（那条路只在真的失焦时才走）—— 表现就是
+    /// "切到别的软件了，右键菜单还挂在屏幕上"。改由宿主的 WM_ACTIVATEAPP 收口。
+    pub fn dismiss_menus(&mut self) {
+        if let Some(h) = self.menu_hwnd.take() {
+            if unsafe { IsWindow(Some(h)) }.as_bool() {
+                unsafe {
+                    let _ = DestroyWindow(h);
+                }
+            }
+            self.bridge = None;
+        }
+    }
+
     pub fn on_menu_activation(&mut self, action: MenuAction) {
         match action {
             MenuAction::Own(cmd) => self.run_command(cmd),
@@ -1902,6 +2120,7 @@ impl App {
             Command::DeletePermanent => self.delete_selected(true),
             Command::NewFolder => self.new_folder(),
             Command::NewFile => self.new_file(),
+            Command::NewTemplate(ext) => self.new_from_template(&ext),
             Command::SelectAll => self.select_all(),
             Command::Refresh => self.reload(),
             Command::ViewModeCycle => self.cycle_view(),
@@ -1911,8 +2130,11 @@ impl App {
                     .first()
                     .and_then(|p| p.parent().map(|p| p.to_path_buf()))
                     .unwrap_or_else(|| self.tab().path.clone());
+                // 不能再在这里 reload()：原生菜单是模态的，它关闭之后用户点的
+                // "空白处"会被当成"刷新一下"——表现就是"点一下空白，文件夹内容
+                // 又重新加载了一遍"。目录变更本来就有 ReadDirectoryChangesW 监听，
+                // Shell 真的改了东西会自己通知过来。
                 let _ = menu::show_native(self.hwnd, &parent, &items);
-                self.reload();
             }
             Command::Properties => {
                 // 无选中项时打开"当前文件夹"的属性，与资源管理器空白处右键一致。
@@ -2506,22 +2728,11 @@ impl App {
             guides: Vec::new(),
             last_child: false,
             has_parent: false,
+            spacer: false,
         });
-        for (label, path) in user_folders() {
-            rows.push(SidebarRow {
-                label: label.to_string(),
-                target: path.clone(),
-                depth: 0,
-                expandable: false,
-                expanded: false,
-                key: String::new(),
-                icon: SidebarIcon::Path(PathBuf::from(path)),
-                guides: Vec::new(),
-                last_child: false,
-                has_parent: false,
-            });
-        }
-
+        // 盘符**紧跟**"此电脑"：之前它们被排在常用文件夹之后，于是这一层缩进
+        // 的行跟自己的父节点中间隔了七八行，看着就是"此电脑下面什么都没有，
+        // 下面那些缩进行不知道是谁的孩子"。
         if thispc {
             let mut all: Vec<_> = self.drives.values().cloned().collect();
             all.sort_by(|a, b| a.letter.cmp(&b.letter));
@@ -2542,6 +2753,7 @@ impl App {
                     guides: vec![false],
                     last_child: di + 1 == n,
                     has_parent: true,
+                    spacer: false,
                 });
                 if expanded {
                     // anc_last[0] = 此电脑（根）恒 false；anc_last[1] = 该盘符
@@ -2551,6 +2763,25 @@ impl App {
                 }
             }
         }
+        // "此电脑 + 盘符"这一组和常用文件夹之间留一格
+        rows.push(SidebarRow::spacer());
+        for (label, path) in user_folders() {
+            rows.push(SidebarRow {
+                label: label.to_string(),
+                target: path.clone(),
+                depth: 0,
+                expandable: false,
+                expanded: false,
+                key: String::new(),
+                icon: SidebarIcon::Path(PathBuf::from(path)),
+                guides: Vec::new(),
+                last_child: false,
+                has_parent: false,
+                spacer: false,
+            });
+        }
+        // 常用文件夹和回收站之间同样留一格
+        rows.push(SidebarRow::spacer());
 
         // 回收站：空 / 满用不同的系统库存图标，和资源管理器一样一眼能分辨
         let siid = if self.recycle_items.is_empty() {
@@ -2569,6 +2800,7 @@ impl App {
             guides: Vec::new(),
             last_child: false,
             has_parent: false,
+            spacer: false,
         });
         rows
     }
@@ -2622,6 +2854,7 @@ impl App {
                 guides,
                 last_child: is_last,
                 has_parent: true,
+                spacer: false,
             });
             if expanded {
                 let mut next: Vec<bool> = anc_last.to_vec();
@@ -2789,6 +3022,39 @@ fn copyable_here(app: &App) -> bool {
     !is_virtual(&app.tab().path)
 }
 
+/// 「新建」子菜单：文件夹 + 本机全部 ShellNew 模板，每项带系统自己的图标。
+///
+/// 之前硬编码成"文件夹 / 文本文档"两项：装了 Office/WPS/画图之后系统里能新建的
+/// 有十几种，菜单里却只有两个 —— 跟资源管理器对不上，也建不出 .docx/.rtf/.bmp。
+/// 现在直接扫 `HKCR\<ext>\ShellNew`，显示名和图标都问 Shell 要，与系统同源。
+fn new_rows() -> Vec<menu::MenuEntry> {
+    let mut v = vec![menu::MenuEntry {
+        text: "文件夹".to_string(),
+        glyph: None,
+        bmp: crate::icons::folder_menu_bmp(),
+        separator: false,
+        disabled: false,
+        selected: false,
+        has_submenu: false,
+        submenu: Vec::new(),
+        action: MenuAction::Own(menu::Command::NewFolder),
+    }];
+    for tpl in crate::shellnew::templates() {
+        v.push(menu::MenuEntry {
+            text: tpl.label,
+            glyph: None,
+            bmp: crate::icons::menu_bmp_for(&tpl.ext),
+            separator: false,
+            disabled: false,
+            selected: false,
+            has_submenu: false,
+            submenu: Vec::new(),
+            action: MenuAction::Own(menu::Command::NewTemplate(tpl.ext)),
+        });
+    }
+    v
+}
+
 /// 带下级菜单的条目。资源管理器的右键菜单本来就是分层的（新建/查看/排序方式都有
 /// 下拉），做成平铺会把"悬停展开"这条交互整个丢掉。
 fn submenu_row(text: &str, glyph: Option<&'static str>, children: Vec<menu::MenuEntry>) -> menu::MenuEntry {
@@ -2841,14 +3107,7 @@ fn own_menu_rows(app: &App, items: &[PathBuf]) -> Vec<menu::MenuEntry> {
         // 资源管理器里右键**某个文件/文件夹**时，菜单里没有"查看/排序方式/刷新/新建/全选"：
         // 那些是"对当前这个视图做什么"，不是"对这个东西做什么"。之前不管右键落在
         // 哪都照单全列，点"刷新"的时候看着像菜单做多了。
-        rows.push(submenu_row(
-            "新建",
-            Some("\u{E8F4}"),
-            vec![
-                shell_row("文件夹", None, Command::NewFolder),
-                shell_row("文本文档", None, Command::NewFile),
-            ],
-        ));
+        rows.push(submenu_row("新建", Some("\u{E8F4}"), new_rows()));
         rows.push(menu::MenuEntry::sep());
         rows.push(shell_row("全选", Some("\u{E762}"), Command::SelectAll));
         rows.push(shell_row("刷新", Some("\u{E72C}"), Command::Refresh));
@@ -2871,9 +3130,43 @@ fn own_menu_rows(app: &App, items: &[PathBuf]) -> Vec<menu::MenuEntry> {
         Some("\u{E946}"),
         Command::Properties,
     ));
-    rows.push(menu::MenuEntry::sep());
-    rows.push(shell_row("设置", Some("\u{E713}"), Command::OpenSettings));
+    // 「设置」从右键菜单里去掉了：它是"改软件"的入口，混在"对这个东西做什么"
+    // 的菜单里既不合语义又容易被误点（用户要求）。入口保留在「更多」菜单。
     rows
+}
+
+/// 菜单全局去重：同名的一级项只留第一条。
+///
+/// 自有条目和 Shell 条目各来一个"打开"是最常见的重复（Shell 的带加速键
+/// `打开(&O)`，肉眼就是两个「打开」）。之前只在"追加 Shell 条目"那一步比对
+/// 自有列表，而 Shell 自己内部也可能给两遍，于是去重不干净。
+fn dedupe_rows(rows: Vec<menu::MenuEntry>) -> Vec<menu::MenuEntry> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut out = Vec::with_capacity(rows.len());
+    for e in rows {
+        if e.separator {
+            out.push(e);
+            continue;
+        }
+        let key = menu::strip_accel(&e.text).trim().to_lowercase();
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        out.push(e);
+    }
+    // 去重之后可能留下"开头就是分隔线"或"两条挨着的分隔线"，一并收掉
+    let mut clean: Vec<menu::MenuEntry> = Vec::with_capacity(out.len());
+    for e in out {
+        if e.separator && (clean.is_empty() || clean.last().map(|x: &menu::MenuEntry| x.separator).unwrap_or(false)) {
+            continue;
+        }
+        clean.push(e);
+    }
+    while clean.last().map(|x| x.separator).unwrap_or(false) {
+        clean.pop();
+    }
+    clean
 }
 
 

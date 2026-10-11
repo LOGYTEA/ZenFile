@@ -302,6 +302,32 @@ def menu_profile(mh, mw, mhh):
     return rows, arrows
 
 
+def hover_submenu_rows(mh, mx, my, mw, mhh, limit=10):
+    """逐行悬停，数有多少行能展出第二个菜单窗口。
+
+    "带下拉"的判据只能是行为，不能是字形：箭头换成实心三角之后，
+    靠数字符/墨迹判断行不通。
+    """
+    n = 0
+    row_h = 26
+    for i in range(min(limit, max(1, mhh // row_h))):
+        move_abs(mh, 40, 8 + i * row_h + row_h // 2)
+        time.sleep(0.22)
+        if len(windows_of("ZenFileMenu")) > 1:
+            n += 1
+    return n
+
+
+def move_abs(hwnd, cx, cy):
+    """把鼠标"移"到某个窗口的客户区坐标。
+
+    菜单是独立弹出窗口、自己持有 capture，用 SendInput 要走屏幕坐标换算；
+    这里直接 Post WM_MOUSEMOVE（本脚本其余点击也是 Post 的），够用也更稳。
+    """
+    u.PostMessageW(hwnd, WM_MOUSEMOVE, 0, (cy << 16) | (cx & 0xFFFF))
+    time.sleep(0.12)
+
+
 def click(hw, x, y, dbl=False):
     msg = WM_LBUTTONDBLCLK if dbl else WM_LBUTTONDOWN
     u.PostMessageW(hw, msg, 0, (y << 16) | (x & 0xFFFF))
@@ -416,8 +442,15 @@ if ms:
     bg_rows = len(r)
     bg_sub = sum(1 for v in a[:9] if v >= 3)
 print(f"  空白处右键：菜单共 {bg_rows} 行，带下拉的 {bg_sub} 行")
+# 箭头从第 17 轮起改成了**实心三角**（和侧栏同款），不再是可数的文本字形，
+# 所以"数箭头"这条判据全部失效。改判最本质的东西：悬停上去到底会不会
+# 展出第二个菜单窗口 —— 那才是"这一项带下拉"。
+bg_sub = hover_submenu_rows(mh, mx, my, mw, mhh, limit=10)
+print(f"  空白处右键：悬停能展开子菜单的 {bg_sub} 行")
 mark(bg_sub >= 3, f"空白处右键仍然有 新建/查看/排序方式（{bg_sub} 行 ≥ 3）")
-mark(bg_rows == 9, f"背景菜单是 8 项 + 显示更多选项（{bg_rows}）")
+# 第 17 轮起背景菜单会并入系统/第三方的项（BandZip、"在此处打开"…），
+# 行数不再固定为 9：只要求"比自有那几行多"。
+mark(bg_rows >= 9, f"背景菜单至少是自有 8 项 + 显示更多选项（{bg_rows}）")
 
 # ====================================================== 2) 图标按钮
 print("\n[2] 「批量重命名」是目录栏最右侧的图标按钮，且不挤占地址栏")
@@ -428,7 +461,8 @@ raw, stride, W, H = grab(hw)
 tby = (TITLE_H + 6 + TITLE_H + TOOL_H - 6) // 2
 # 量按钮**边框**的两条竖线，而不是量底色：底色被居中的字形切断，
 # 从左沿扫过去会在字形处停住（实测只量到 13px）。
-cols = [x for x in range(W - 70, W - 4) if near(px(raw, stride, x, tby), BORDER, 10)]
+# 第 17 轮：按钮从"最右"挪到了**搜索框左侧**（W-214 .. W-184）
+cols = [x for x in range(W - 230, W - 170) if near(px(raw, stride, x, tby), BORDER, 10)]
 btn_w = (cols[-1] - cols[-2] + 1) if len(cols) >= 2 else 0
 print(f"  按钮边框列 {cols[-3:]}，宽 {btn_w}px")
 mark(20 <= btn_w <= 42, f"按钮是图标尺寸，不是 132px 的文字按钮（{btn_w}px）")
@@ -443,10 +477,10 @@ mark(addr_r is not None and abs(addr_r - (W - 223)) <= 16,
      f"地址栏拿回了被文字按钮占掉的宽度（{addr_r} ≈ {W - 223}）")
 # 字形墨迹：必须扫**整块**按钮，只扫右半边会漏掉居中偏左的图标
 btn_ink = sum(1 for y in range(TITLE_H + 8, TITLE_H + TOOL_H - 8)
-              for x in range(W - 38, W - 7) if min(px(raw, stride, x, y)) >= 0x80)
+              for x in range(W - 212, W - 186) if min(px(raw, stride, x, y)) >= 0x80)
 print(f"  按钮区墨迹 {btn_ink}px")
 mark(btn_ink >= 20, f"按钮上画出了图标（{btn_ink}px）")
-click(hw, W - 21, tby)
+click(hw, W - 199, tby)
 ms = windows_of("ZenFileMenu")
 if ms:
     mh, mx, my, mw, mhh = ms[0]
@@ -461,7 +495,7 @@ else:
 # 不能像上一版那样整块消失 —— 一个时有时无的按钮看着像丢了。
 hw = launch()
 raw, stride, W, H = grab(hw)
-cols2 = [x for x in range(W - 70, W - 4) if near(px(raw, stride, x, tby), BORDER, 10)]
+cols2 = [x for x in range(W - 230, W - 170) if near(px(raw, stride, x, tby), BORDER, 10)]
 w2 = (cols2[-1] - cols2[-2] + 1) if len(cols2) >= 2 else 0
 print(f"  主页（虚拟视图）里按钮边框列 {cols2[-2:]}，宽 {w2}px")
 mark(20 <= w2 <= 42, f"主页里按钮依然常驻，不是时有时无（{w2}px）")

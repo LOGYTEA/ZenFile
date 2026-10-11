@@ -17,7 +17,8 @@ use windows::core::HSTRING;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Gdi::{
     AlphaBlend, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush, DeleteDC,
-    DeleteObject, FillRect, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, HDC,
+    DeleteObject, FillRect, GetObjectW, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION,
+    BITMAP, HBITMAP, HDC,
 };
 use windows::Win32::Foundation::COLORREF;
 use windows::Win32::Storage::FileSystem::{
@@ -33,6 +34,8 @@ const SHGFI_BASE: u32 = SHGFI_ICON.0 | SHGFI_USEFILEATTRIBUTES.0;
 
 /// 按路径缓存的图标上界。超过就整表清空（在切换目录时做，不在绘制中做）。
 const DIR_CACHE_MAX: usize = 1024;
+/// 缩略图上界。每张占 `size²×4` 字节，比 HICON 费得多，上界给小一点。
+const THUMB_CACHE_MAX: usize = 256;
 
 /// 这几类文件的图标**只属于它自己**，不能按扩展名归并：
 /// 每个 exe/dll/ico 都嵌着自己的图标，.lnk 显示的是目标图标，.url 显示网站图标。
@@ -44,6 +47,10 @@ const PER_FILE_ICON_EXT: &[&str] = &[
 pub struct IconCache {
     small: HashMap<String, HICON>,
     large: HashMap<String, HICON>,
+    /// 大图标视图用的**真实缩略图**（HBITMAP，来自 IShellItemImageFactory）。
+    ///
+    /// key = "尺寸:小写路径"。值同样是 Option：`None` = 问过但没拿到，别每帧重试。
+    thumbs: HashMap<String, Option<HBITMAP>>,
     /// **具体**目录 / 驱动器根 / 需逐文件取图标的文件的图标：
     /// key = "L:<小写路径>" / "S:<小写路径>"。
     /// 值是 Option：`None` 表示"已经问过 Shell，但没拿到"，避免每帧重绘都对每个
@@ -90,6 +97,7 @@ impl IconCache {
         Self {
             small: HashMap::new(),
             large: HashMap::new(),
+            thumbs: HashMap::new(),
             dir: HashMap::new(),
         }
     }
@@ -252,6 +260,100 @@ impl IconCache {
         Some(sfi.hIcon)
     }
 
+    /// 大图标视图要的缩略图。
+    ///
+    /// `SHGetFileInfoW` 的 `SHGFI_LARGEICON` 只给 32×32；把它 `DrawIconEx` 拉到
+    /// 64/96 就是把 32 个像素插值成 96 个 —— 糊成一团还带锯齿，尺寸也和资源管理
+    /// 器对不上。资源管理器走的其实是 `IShellItemImageFactory`（图片/视频给真缩略
+    /// 图，其余给 256×256 的图标），这里跟同一条路。
+    pub fn thumb(&mut self, path: &Path, size: i32) -> Option<HBITMAP> {
+        let key = format!("{size}:{}", path.to_string_lossy().to_lowercase());
+        if let Some(v) = self.thumbs.get(&key) {
+            return *v;
+        }
+        let v = shell_thumb(path, size);
+        // 缩略图一张就是 size×size×4 字节，别让它无限长：过界整表重建。
+        if self.thumbs.len() >= THUMB_CACHE_MAX {
+            self.clear_thumbs();
+        }
+        self.thumbs.insert(key, v);
+        v
+    }
+
+    /// 画一张缩略图到 `size × size` 的格子里（等比缩放并居中）。
+    /// 失败返回 false，调用方应退回 HICON 那条路。
+    pub fn draw_thumb(&self, hdc: HDC, bmp: HBITMAP, x: i32, y: i32, size: i32) -> bool {
+        if bmp.is_invalid() || size <= 0 {
+            return false;
+        }
+        unsafe {
+            let mut bm: BITMAP = std::mem::zeroed();
+            if GetObjectW(
+                windows::Win32::Graphics::Gdi::HGDIOBJ(bmp.0),
+                std::mem::size_of::<BITMAP>() as i32,
+                Some(&mut bm as *mut _ as *mut core::ffi::c_void),
+            ) == 0
+            {
+                return false;
+            }
+            let (w, h) = (bm.bmWidth, bm.bmHeight);
+            if w <= 0 || h <= 0 {
+                return false;
+            }
+            let mem = CreateCompatibleDC(Some(hdc));
+            if mem.is_invalid() {
+                return false;
+            }
+            let old = SelectObject(mem, bmp.into());
+            let mut bf: BLENDFUNCTION = std::mem::zeroed();
+            bf.BlendOp = AC_SRC_OVER as u8;
+            bf.SourceConstantAlpha = 255;
+            bf.AlphaFormat = AC_SRC_ALPHA as u8;
+            // 等比缩放居中：缩略图不一定是正方形（宽图/竖图都是），
+            // 硬拉成正方会把人压扁。
+            let dw = if w >= h { size } else { (size * w) / h };
+            let dh = if w >= h { (size * h) / w } else { size };
+            let dx = (size - dw) / 2;
+            let dy = (size - dh) / 2;
+            let ok = AlphaBlend(hdc, x + dx, y + dy, dw, dh, mem, 0, 0, w, h, bf);
+            SelectObject(mem, old);
+            let _ = DeleteDC(mem);
+            ok.as_bool()
+        }
+    }
+
+    /// 清掉缩略图缓存。与 `clear_path_icons` 同一时机调用。
+    fn clear_thumbs(&mut self) {
+        for (_, b) in self.thumbs.drain() {
+            if let Some(b) = b {
+                if !b.is_invalid() {
+                    unsafe {
+                        let _ = DeleteObject(b.into());
+                    }
+                }
+            }
+        }
+    }
+
+    /// 文件落地之后把**路径相关**的图标缓存作废。
+    ///
+    /// `dir` 缓存存的是 `Option`：一次查询失败会记成 `None`，之后永远不再问。
+    /// 于是"刚拷进来的文件夹（此时还没有 desktop.ini）"一旦被记成 `None`，
+    /// 就算之后图标真的有了也不会再刷新 —— 表现就是"复制过来的东西没有图标，
+    /// 得重启软件才有"。复制/移动/删除完成后调一次即可。
+    pub fn clear_path_icons(&mut self) {
+        for (_, h) in self.dir.drain() {
+            if let Some(h) = h {
+                if !h.0.is_null() {
+                    unsafe {
+                        let _ = DestroyIcon(h);
+                    }
+                }
+            }
+        }
+        self.clear_thumbs();
+    }
+
     /// 缓存上界维护。**只能在切换目录时调用** —— 绘制中途销毁 HICON，会把同一帧
     /// 已经取到、还没画出去的句柄一起干掉。
     pub fn trim_dir_cache(&mut self) {
@@ -319,6 +421,38 @@ impl IconCache {
     }
 }
 
+/// 向 Shell 要一张 `size × size` 的缩略图（图片/视频/文档封面是真内容，
+/// 其余给 256×256 的大图标）。拿不到返回 None。
+fn shell_thumb(path: &Path, size: i32) -> Option<HBITMAP> {
+    use windows::Win32::Foundation::SIZE;
+    use windows::Win32::UI::Shell::{
+        IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_ICONONLY,
+        SIIGBF_RESIZETOFIT, SIIGBF_THUMBNAILONLY,
+    };
+    let s = path.to_string_lossy();
+    if s.is_empty() || size <= 0 {
+        return None;
+    }
+    unsafe {
+        let factory: IShellItemImageFactory =
+            SHCreateItemFromParsingName(&HSTRING::from(s.as_ref()), None).ok()?;
+        let want = SIZE { cx: size, cy: size };
+        // 先要真缩略图；Shell 说"这个类型没有缩略图"时再退成大号图标。
+        // 两条路都不加 SIIGBF_SCALEUP：宁可 32×32 清晰，也不要把小图放大糊掉。
+        for flags in [
+            SIIGBF_RESIZETOFIT.0 | SIIGBF_THUMBNAILONLY.0,
+            SIIGBF_RESIZETOFIT.0 | SIIGBF_ICONONLY.0,
+        ] {
+            if let Ok(hbmp) = factory.GetImage(want, windows::Win32::UI::Shell::SIIGBF(flags)) {
+                if !hbmp.is_invalid() {
+                    return Some(hbmp);
+                }
+            }
+        }
+        None
+    }
+}
+
 /// 系统库存图标（`SHGetStockIconInfo`），按 SIID 缓存。
 ///
 /// 回收站、控制面板这类目标**没有真实路径**，问不到 Shell 关联图标，只能走
@@ -344,6 +478,108 @@ pub fn stock_icon(siid: i32, large: bool) -> Option<HICON> {
         }
         cache.push((siid, large, sii.hIcon));
         Some(sii.hIcon)
+    }
+}
+
+/// 菜单里条目图标的位图缓存（`HBITMAP` 句柄，长期持有）。
+///
+/// 自绘菜单的 `MenuEntry.bmp` 要的是 HBITMAP 而不是 HICON：菜单每次弹出都会重建
+/// 条目，不缓存的话一次右键就漏十几张位图。数量受"系统里带 ShellNew 的扩展名"
+/// 限制（十几个），常驻没问题。
+static mut MENU_BMP: Option<Vec<(String, HBITMAP)>> = None;
+
+/// 把某个扩展名的系统图标烘成一张 16×16 的 32bpp 位图，供自绘菜单使用。
+pub fn menu_bmp_for(ext: &str) -> Option<isize> {
+    let key = ext.trim_start_matches('.').to_lowercase();
+    unsafe {
+        let cache = MENU_BMP.get_or_insert_with(Vec::new);
+        if let Some((_, b)) = cache.iter().find(|(k, _)| *k == key) {
+            return Some(b.0 as isize);
+        }
+        let icon = icon_for_menu(&key);
+        if icon.0.is_null() {
+            return None;
+        }
+        let b = icon_to_bmp(icon, 16)?;
+        cache.push((key, b));
+        Some(b.0 as isize)
+    }
+}
+
+/// 「新建 → 文件夹」那一项的图标（通用文件夹，不按扩展名取）。
+pub fn folder_menu_bmp() -> Option<isize> {
+    menu_bmp_for("\u{0001}folder")
+}
+
+/// 菜单位图要的 HICON：这里**不能**走 IconCache（它是 &mut 且属于 App，
+/// 菜单行是在 &App 下构建的），所以单独用 SHGetFileInfo 取一次并缓存住。
+fn icon_for_menu(key: &str) -> HICON {
+    let probe = if key.starts_with('\u{0001}') {
+        "probe_folder".to_string()
+    } else if key.is_empty() {
+        "probe".to_string()
+    } else {
+        format!("probe.{key}")
+    };
+    let attrs = if key.starts_with('\u{0001}') {
+        FILE_ATTRIBUTE_DIRECTORY
+    } else {
+        FILE_ATTRIBUTE_NORMAL
+    };
+    let flags = SHGFI_BASE | SHGFI_SMALLICON.0;
+    let mut sfi = SHFILEINFOW::default();
+    unsafe {
+        SHGetFileInfoW(
+            &HSTRING::from(probe.as_str()),
+            attrs,
+            Some(&mut sfi),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            windows::Win32::UI::Shell::SHGFI_FLAGS(flags),
+        );
+        sfi.hIcon
+    }
+}
+
+/// 把一个 HICON 画成 32bpp 位图（带 alpha），供菜单 `draw_bmp` 使用。
+fn icon_to_bmp(icon: HICON, size: i32) -> Option<HBITMAP> {
+    if icon.0.is_null() {
+        return None;
+    }
+    unsafe {
+        let src = windows::Win32::Graphics::Gdi::GetDC(None);
+        let mem = CreateCompatibleDC(Some(src));
+        let _ = windows::Win32::Graphics::Gdi::ReleaseDC(None, src);
+        if mem.is_invalid() {
+            return None;
+        }
+        // 必须是 32bpp 且 alpha 全 0 的底：DrawIconEx 只写有颜色的像素，
+        // 底不清零的话图标四周会留下一圈上一次的脏像素（就是那个"小方块"）。
+        let mut hdr: windows::Win32::Graphics::Gdi::BITMAPINFO = std::mem::zeroed();
+        hdr.bmiHeader.biSize = std::mem::size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32;
+        hdr.bmiHeader.biWidth = size;
+        hdr.bmiHeader.biHeight = -size; // 自上而下
+        hdr.bmiHeader.biPlanes = 1;
+        hdr.bmiHeader.biBitCount = 32;
+        hdr.bmiHeader.biCompression = windows::Win32::Graphics::Gdi::BI_RGB.0;
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let bmp = windows::Win32::Graphics::Gdi::CreateDIBSection(
+            Some(mem),
+            &hdr,
+            windows::Win32::Graphics::Gdi::DIB_RGB_COLORS,
+            &mut bits,
+            None,
+            0,
+        )
+        .unwrap_or_default();
+        if bmp.is_invalid() {
+            let _ = DeleteDC(mem);
+            return None;
+        }
+        let old = SelectObject(mem, bmp.into());
+        let _ = DrawIconEx(mem, 0, 0, icon, size, size, 0, None, DI_NORMAL);
+        SelectObject(mem, old);
+        let _ = DeleteDC(mem);
+        Some(bmp)
     }
 }
 

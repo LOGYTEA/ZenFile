@@ -47,6 +47,8 @@ windows = { version = "0.62", features = [
     "Win32_UI_Accessibility",
     "Win32_Security",
     "Win32_Security_Authorization",
+    # 就地粘贴的副本后缀要按界面语言来（GetUserDefaultUILanguage）
+    "Win32_Globalization",
 ] }
 
 # 面向 §12 内存/体积预算的发布配置

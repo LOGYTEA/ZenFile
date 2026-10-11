@@ -107,9 +107,24 @@ fn bin_roots() -> Vec<PathBuf> {
 
 /// 遍历回收站，返回全部条目（按删除时间倒序，最近删除的在前）。
 pub fn list() -> Vec<Item> {
+    let mut all = Vec::new();
+    list_streaming(|batch| all.extend(batch));
+    all
+}
+
+/// 分盘扫描：扫完一个盘就回调一次。
+///
+/// 回收站里几万条是常态，一次性扫完要好几秒 —— 期间列表一片空白，看着像
+/// "点了没反应"。分盘回调让调用方能**边扫边显示**（资源管理器也是这么做的）。
+/// 每个批次内部按删除时间倒序；全部扫完后再整体排一次序。
+pub fn list_streaming(mut on_batch: impl FnMut(Vec<Item>)) {
     let sid = current_sid();
-    let mut items = Vec::new();
+    // 回吐粒度。一个盘里几万条是常态，攒到盘末才回吐的话第一条要等十几秒 ——
+    // 期间列表一片空白，看起来就是"点了回收站没反应"。每攒够一批就交出去，
+    // 界面能立刻出内容。
+    const FLUSH: usize = 400;
     for root in bin_roots() {
+        let mut items = Vec::new();
         let Ok(rd) = std::fs::read_dir(&root) else { continue };
         for sid_dir in rd.flatten() {
             // 只认本用户的 SID 目录：多用户机器上不能把别人的回收站列出来。
@@ -129,12 +144,15 @@ pub fn list() -> Vec<Item> {
                 let Ok(data) = std::fs::read(e.path()) else { continue };
                 if let Some(it) = parse_info(&fname, &e.path(), &data) {
                     items.push(it);
+                    if items.len() >= FLUSH {
+                        on_batch(std::mem::take(&mut items));
+                    }
                 }
             }
         }
+        items.sort_by(|a, b| b.deleted.cmp(&a.deleted));
+        on_batch(items);
     }
-    items.sort_by(|a, b| b.deleted.cmp(&a.deleted));
-    items
 }
 
 fn parse_info(fname: &str, i_path: &Path, data: &[u8]) -> Option<Item> {

@@ -55,7 +55,7 @@ const WM_MENU_SUBCLOSED: u32 = 0x0402;
 const WM_MENU_CLOSE_CHAIN: u32 = 0x0403;
 
 /// 宿主侧自有的命令（自绘菜单的顶部图标行与常规项）。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Command {
     Open,
     /// 「打开方式」：弹出自绘的程序选择窗口
@@ -70,6 +70,8 @@ pub enum Command {
     DeletePermanent,
     NewFolder,
     NewFile,
+    /// 按系统 ShellNew 模板新建。载荷 = 含点的扩展名（".txt" / ".docx" …）
+    NewTemplate(String),
     SelectAll,
     Refresh,
     ViewModeCycle,
@@ -140,7 +142,7 @@ pub fn strip_accel(text: &str) -> String {
     out
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum MenuAction {
     Own(Command),
     /// Shell 命令偏移（InvokeCommand 用 MAKEINTRESOURCE 形式传递）
@@ -201,6 +203,57 @@ impl Drop for ShellMenuBridge {
 
 const CMD_FIRST: u32 = 0x6000;
 const CMD_LAST: u32 = 0xF000;
+
+/// 为某个**目录的空白处**构建背景上下文菜单。
+///
+/// 资源管理器在空白处右键出来的是"对这个文件夹做什么"：BandZip 的压缩项、
+/// "在此处打开 PowerShell/终端"、"Git Bash Here"、同步网盘的项……全在这一层。
+/// 之前这里直接 `None`（"没有选中文件就没得问 Shell"），于是空白处右键
+/// 只有我们自己那几行，第三方扩展一个都看不到。
+///
+/// 关键差别是菜单来源：**背景菜单**走 `IShellFolder::CreateViewObject`，
+/// 而不是对 0 个对象调 `GetUIObjectOf`（那样拿到的是文件夹"作为条目"的菜单，
+/// 内容是"打开/剪切/复制"，正是我们本来就有、要被去重掉的那些）。
+pub fn build_background_bridge(hwnd: HWND, dir: &Path) -> Option<ShellMenuBridge> {
+    unsafe {
+        let desktop: IShellFolder = SHGetDesktopFolder().ok()?;
+        let mut attrs = 0u32;
+        let mut dir_pidl: *mut windows::Win32::UI::Shell::Common::ITEMIDLIST = std::ptr::null_mut();
+        desktop
+            .ParseDisplayName(
+                hwnd,
+                None,
+                &HSTRING::from(dir.to_string_lossy().as_ref()),
+                None,
+                &mut dir_pidl,
+                &mut attrs,
+            )
+            .ok()?;
+        if dir_pidl.is_null() {
+            return None;
+        }
+        let folder: IShellFolder = desktop.BindToObject(dir_pidl, None).ok()?;
+        let ctx: IContextMenu = folder.CreateViewObject(hwnd).ok()?;
+        let hmenu = CreatePopupMenu().ok()?;
+        // 背景菜单**不能**带 CMF_ITEMMENU：那是"选了东西"的语义，
+        // 带上去很多扩展会把自己收起来（"在这里解压"之类的就不出来了）。
+        if ctx
+            .QueryContextMenu(hmenu, 0, CMD_FIRST, CMD_LAST, CMF_EXPLORE)
+            .is_err()
+        {
+            let _ = DestroyMenu(hmenu);
+            return None;
+        }
+        let bridge = ShellMenuBridge {
+            menu3: ctx.cast::<IContextMenu3>().ok(),
+            menu: Some(ctx),
+            hmenu: Some(hmenu),
+            first_id: CMD_FIRST,
+        };
+        CoTaskMemFree(Some(dir_pidl as *const core::ffi::c_void));
+        Some(bridge)
+    }
+}
 
 /// 为一组文件构建 Shell 上下文菜单（必须全部同父目录）。
 /// 返回 None 表示 Shell 拒绝（例如跨目录多选），此时退化为纯自有菜单。
@@ -957,7 +1010,7 @@ fn activate(state: &mut MenuWindow, hwnd: HWND, entry: &MenuEntry) {
         return;
     }
     let app = state.app;
-    let action = entry.action;
+    let action = entry.action.clone();
     state.activated = true;
     unsafe {
         let _ = DestroyWindow(hwnd);
@@ -1068,9 +1121,16 @@ unsafe fn paint_menu(hdc: HDC, state: &MenuWindow) {
             };
             DrawTextW(hdc, &mut text, &mut tr.clone(), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
             if e.has_submenu {
-                let mut arrow: Vec<u16> = ">".encode_utf16().collect();
-                let ar = RECT { left: state.width - (22.0 * state.scale) as i32, top, right: state.width - 6, bottom: top + state.row_h };
-                DrawTextW(hdc, &mut arrow, &mut ar.clone(), DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+                // 与侧栏**同一个**实心三角，只是方向朝右（`down = false`）。
+                // 之前是拿 ASCII 的 ">" 当箭头：字号小、笔画细、位置还随字体漂，
+                // 和侧栏那套树形箭头完全不是一个东西。
+                let ar = RECT {
+                    left: state.width - (22.0 * state.scale) as i32,
+                    top,
+                    right: state.width - 6,
+                    bottom: top + state.row_h,
+                };
+                crate::paint::draw_tree_chevron(hdc, &ar, t.text_dim, false);
             }
             top += state.row_h;
         }

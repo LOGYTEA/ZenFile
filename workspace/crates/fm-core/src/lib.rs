@@ -44,7 +44,8 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// 大小列用什么单位显示。
 ///
 /// 七个档位：自动 / B / KB / MB / GB / TB / PB。
-/// `Auto` 与资源管理器一致 —— 不足 1 KB 直接写"N 字节"（这就是"B"那一档），
+/// `Auto` 的自适应档位：B / KB / MB / GB / TB / PB —— 与资源管理器一致。
+/// 注意最底下那一档是 **B**，不是"字节"（用户明确要求不要出现"字节"二字）。
 /// 之后每上一级换一个单位。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum SizeUnit {
@@ -97,7 +98,7 @@ impl SizeUnit {
     pub fn label(&self) -> &'static str {
         match self {
             SizeUnit::Auto => "自动（B/KB/MB/GB/TB/PB）",
-            SizeUnit::Bytes => "字节（B）",
+            SizeUnit::Bytes => "B",
             SizeUnit::KB => "KB",
             SizeUnit::MB => "MB",
             SizeUnit::GB => "GB",
@@ -110,16 +111,16 @@ impl SizeUnit {
     pub fn format(&self, bytes: u64) -> String {
         let v = bytes as f64;
         match self {
-            SizeUnit::Bytes => format!("{} 字节", bytes),
+            SizeUnit::Bytes => format!("{} B", bytes),
             SizeUnit::KB => format!("{} KB", trim(v / KB_F)),
             SizeUnit::MB => format!("{} MB", trim(v / MB_F)),
             SizeUnit::GB => format!("{} GB", trim(v / GB_F)),
             SizeUnit::TB => format!("{} TB", trim(v / TB_F)),
             SizeUnit::PB => format!("{} PB", trim(v / PB_F)),
             SizeUnit::Auto => {
-                // 不足 1 KB 就写字节 —— 资源管理器的"912 字节"就是这一档
+                // 不足 1 KB 就停在 B 这一档
                 if v < KB_F {
-                    format!("{} 字节", bytes)
+                    format!("{} B", bytes)
                 } else if v < MB_F {
                     format!("{} KB", trim(v / KB_F))
                 } else if v < GB_F {

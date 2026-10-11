@@ -16,6 +16,7 @@ mod openwith;
 mod rename;
 mod paint;
 mod props;
+mod shellnew;
 mod sysview;
 mod theme;
 
@@ -56,12 +57,16 @@ const WM_TRAY: u32 = WM_APP + 1;
 /// 后台文件操作（复制/移动/拖拽落地）完成。由 worker 线程 Post 回来，
 /// UI 线程在这条消息里收口：报错 + 重列当前目录。**不能**在 worker 里直接碰 UI。
 pub const WM_APP_IO_DONE: u32 = WM_APP + 2;
+/// 后台枚举回收站完成。WPARAM = 世代号，对不上说明结果已过期。
+pub const WM_APP_RECYCLE: u32 = WM_APP + 3;
 const TIMER_DRAIN: usize = 1;
 /// 对外显示的产品名。托盘提示、窗口标题、标题栏落款共用这一份，改一处就够。
 pub const APP_TITLE: &str = "ZenFile";
 /// 目录栏下沿进度条的动画节拍。一直挂着，但只有 busy() 时才真的重画。
 const TIMER_BUSY: usize = 2;
 const HOTKEY_MAIN: i32 = 1;
+/// 系统双击时限之上一点点：低于它是"连着两下"（= 打开），高于它算"两次慢速单击"（= 改名）。
+const DOUBLE_CLICK_MS: u64 = 500;
 
 /// fm-app 自己的自检项（`fm-core::selftest` 碰不到 UI 层这边的模块）。
 fn app_selftest() -> i32 {
@@ -468,7 +473,18 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         crate::WM_APP_IO_DONE => {
             let app = &mut *app_ptr;
             app.drain_io();
+            // 文件真的落地了：路径图标缓存要作废。
+            // dir 缓存存的是 Option，一次查询失败会被记成 None 并且**再也不问** ——
+            // 刚拷进来的那一瞬间 Shell 还没给它图标，于是永久变成"没图标"，
+            // 只有重启软件（缓存跟着进程一起没）才恢复。
+            app.icons.clear_path_icons();
             app.reload();
+            let _ = InvalidateRect(Some(hwnd), None, true);
+            LRESULT(0)
+        }
+        crate::WM_APP_RECYCLE => {
+            let app = &mut *app_ptr;
+            app.drain_recycle(wparam.0 as u64, lparam.0 != 0);
             let _ = InvalidateRect(Some(hwnd), None, true);
             LRESULT(0)
         }
@@ -501,15 +517,32 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         }
         // 分隔线上换 ↔ 光标。WM_SETCURSOR 不带坐标（lparam 低位是命中码），
         // 所以直接复用 WM_MOUSEMOVE 记下的悬停位 —— 反正它也是同一个来源。
+        // 光标一律自己定，不再退回 DefWindowProc。
+        // 之前只有"悬停在分隔线上"才 SetCursor(↔)，其余情况返回 0 让系统去套
+        // 窗口类的 hCursor —— 而 SetCursor 一旦把光标改成 ↔，只要鼠标不跨到别的
+        // 窗口，系统不会主动再设一次，于是拖过一次侧栏之后鼠标在软件里就**永远
+        // 是拉伸图标**。现在每次 WM_SETCURSOR 都显式给出该用的那支光标。
         WM_SETCURSOR => {
             let app = &*app_ptr;
-            if app.drag_split.is_some() || app.hover_split.is_some() {
-                if let Ok(c) = LoadCursorW(None, IDC_SIZEWE) {
-                    SetCursor(Some(c));
-                    return LRESULT(1);
+            // lparam 低位是这次命中码（HTLEFT/HTRIGHT/…），由 handle_hit_test 给出
+            let hit = (lparam.0 & 0xFFFF) as u32;
+            let id = match hit {
+                10 | 11 => IDC_SIZEWE,   // HTLEFT / HTRIGHT
+                12 | 15 => IDC_SIZENS,   // HTTOP / HTBOTTOM
+                13 | 17 => IDC_SIZENWSE, // HTTOPLEFT / HTBOTTOMRIGHT
+                14 | 16 => IDC_SIZENESW, // HTTOPRIGHT / HTBOTTOMLEFT
+                _ => {
+                    if app.drag_split.is_some() || app.hover_split.is_some() {
+                        IDC_SIZEWE
+                    } else {
+                        IDC_ARROW
+                    }
                 }
+            };
+            if let Ok(c) = LoadCursorW(None, id) {
+                SetCursor(Some(c));
             }
-            LRESULT(0)
+            LRESULT(1)
         }
         WM_TIMER => {
             if wparam.0 == TIMER_BUSY {
@@ -541,6 +574,25 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             app.reload();
             let _ = InvalidateRect(Some(hwnd), None, true);
             LRESULT(1)
+        }
+        // 整个应用被切走（alt+tab / 点到别的窗口）：还挂着的菜单要立刻收掉。
+        // 自绘菜单是 SW_SHOWNOACTIVATE 弹出的，压根没拿过焦点，所以永远等不到
+        // 它自己的 WM_KILLFOCUS —— 只能由宿主的这一条消息统一收口。
+        WM_ACTIVATEAPP => {
+            if wparam.0 == 0 {
+                let app = &mut *app_ptr;
+                app.dismiss_menus();
+            }
+            LRESULT(0)
+        }
+        // 窗口本身失活（点到同线程别的窗口、或系统菜单弹出）同样收菜单，
+        // 与 WM_ACTIVATEAPP 互为补充：前者管"应用级"，这一条管"窗口级"。
+        WM_ACTIVATE => {
+            if (wparam.0 & 0xFFFF) == 0 {
+                let app = &mut *app_ptr;
+                app.dismiss_menus();
+            }
+            LRESULT(0)
         }
         WM_COMMAND => {
             let source = (wparam.0 & 0xFFFF) as i32;
@@ -649,8 +701,19 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             } else {
                 None
             };
-            let hover_collapse = app.cfg.ui.sidebar_visible
-                && paint::sidebar_collapse_hit(&l, app.metrics.scale, x, y);
+            // 回收站：条目悬停 + 顶部三个按钮的悬停
+            let (hover_rec, hover_rec_btn) = if app.tab().recycle {
+                (
+                    if x >= l.view.left && x < l.view.right && y >= l.view.top {
+                        paint::recycle_hit(app, &l, y)
+                    } else {
+                        None
+                    },
+                    paint::recycle_button_hit(app, &l, x, y),
+                )
+            } else {
+                (None, 0u8)
+            };
             // 地址栏面包屑悬停：只在非编辑态、且光标确实落在地址框里时算
             let hover_addr = if !app.addr_editing && inside(&l.address, x, y) {
                 let bar = paint::address_bar(app, &l);
@@ -666,11 +729,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 || hover_sidebar != app.sidebar_hover
                 || hover_addr != app.addr_hover
                 || hover_split != app.hover_split
-                || hover_collapse != app.hover_sidebar_collapse
                 || hover_bulk != app.hover_bulk
                 || hover_row != app.hover_row
+                || hover_rec != app.hover_recycle
+                || hover_rec_btn != app.hover_recycle_btn
             {
-                app.hover_sidebar_collapse = hover_collapse;
+                app.hover_recycle = hover_rec;
+                app.hover_recycle_btn = hover_rec_btn;
                 app.hover_bulk = hover_bulk;
                 app.hover_row = hover_row;
                 app.hover_split = hover_split;
@@ -777,6 +842,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 app.cfg.ui.sidebar_visible,
                 app.cfg.ui.statusbar_visible,
             );
+            // 重命名编辑框还开着时，点任何地方都是"先收掉它"。
+            // 我们的 WM_LBUTTONDOWN 走完就 return，从不交给 DefWindowProc，
+            // 于是焦点压根不会从 EDIT 上挪开 —— KILLFOCUS 永远不来，框就一直
+            // 挂在列表上（用户看到的"点空白处/回车也关不掉"）。这一下点击
+            // 只做收尾，不再往下派发，和资源管理器一致。
+            if app.rename_hwnd.is_some() {
+                app.commit_rename_from_editor();
+                app.invalidate();
+                return LRESULT(0);
+            }
             // 分隔线（导航窗格宽度 / 表头列宽）：排在虚拟视图分支之前，
             // 否则打开设置页之后整条消息在设置分支里就 return 了。
             if let Some(which) = paint::split_hit(app, &l, x, y) {
@@ -836,6 +911,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     }
                 } else {
                     app.recycle_sel.clear();
+                    // 空白处起手 = 拉框选。回收站之前也是直接 return，
+                    // 于是"长按框选在回收站不生效"。
+                    app.begin_drag(x, y, app::DragKind::Marquee, false);
+                    SetCapture(hwnd);
                 }
                 let _ = InvalidateRect(Some(hwnd), None, true);
                 return LRESULT(0);
@@ -888,12 +967,6 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 show_bulk_rename_menu(hwnd, app, &l);
                 return LRESULT(0);
             }
-            // 导航窗格右上角的折叠按钮：压在首行之上那条预留带里，先判它
-            if app.cfg.ui.sidebar_visible && paint::sidebar_collapse_hit(&l, app.metrics.scale, x, y) {
-                app.toggle_sidebar();
-                let _ = InvalidateRect(Some(hwnd), None, true);
-                return LRESULT(0);
-            }
             if app.cfg.ui.sidebar_visible && x < l.sidebar.right && y > l.sidebar.top {
                 if sidebar_click(app, x, y) {
                     // 必须重画：点箭头只改树的状态，不像 navigate 那样自己会触发
@@ -904,11 +977,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             }
             // 首页是平铺布局，行列式命中在这里不适用
             if app.tab().home && y >= l.view.top {
-                if home_select(app, &l, x, y) {
-                    let _ = InvalidateRect(Some(hwnd), None, true);
-                } else {
-                    let _ = InvalidateRect(Some(hwnd), None, true);
+                let hit = home_select(app, &l, x, y);
+                // 空白处起手同样要能拉框选 —— 首页之前直接 return，于是"长按框选
+                // 在首页不生效"。磁贴布局不是行列式的，框选命中走 home_layout
+                // 的磁贴矩形（见 select_marquee）。
+                if !hit && !ctrl && !shift {
+                    app.tab_mut().selected.clear();
                 }
+                app.begin_drag(x, y, app::DragKind::Marquee, ctrl);
+                SetCapture(hwnd);
+                let _ = InvalidateRect(Some(hwnd), None, true);
                 return LRESULT(0);
             }
             let header_h = header_height(app);
@@ -918,6 +996,33 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 return LRESULT(0);
             }
             if let Some(row) = view_row_at(app, &l, x, y, view_top) {
+                // 「再点一下已经选中的名字 = 改名」。
+                // 判据是**间隔**：连着两下（小于双击时限）是打开，隔一会儿再点
+                // 才是改名。不判间隔的话双击打开就永远变成改名了。
+                let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
+                let entry_idx = app.tab().visible.get(row).copied();
+                let sole_selected = entry_idx
+                    .map(|i| app.tab().selected.len() == 1 && app.tab().selected.contains(&crate::app::key_of(&app.tab().entries[i].clone())))
+                    .unwrap_or(false);
+                let mut renamed = false;
+                if !ctrl && !shift && sole_selected {
+                    if let (Some(i), Some((prev_i, prev_t))) = (entry_idx, app.last_click) {
+                        if prev_i == i && now.saturating_sub(prev_t) > DOUBLE_CLICK_MS {
+                            app.begin_rename();
+                            app.last_click = None;
+                            renamed = true;
+                        }
+                    }
+                    if !renamed {
+                        app.last_click = entry_idx.map(|i| (i, now));
+                    }
+                } else {
+                    app.last_click = None;
+                }
+                if renamed {
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                    return LRESULT(0);
+                }
                 app.toggle_select(row, ctrl, shift);
                 // 左键拖拽的起点：按下先记账，超过阈值才真的开始（见 WM_MOUSEMOVE）
                 app.begin_drag(x, y, app::DragKind::Items, ctrl);
@@ -1099,6 +1204,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         }
         WM_RBUTTONUP => {
             let app = &mut *app_ptr;
+            // 同上：开着重命名框时右键也先把它收掉（焦点同样不会自己挪）。
+            if app.rename_hwnd.is_some() {
+                app.commit_rename_from_editor();
+                app.invalidate();
+                return LRESULT(0);
+            }
             let (x, y) = client_xy(hwnd, lparam);
             let l = paint::compute_layout(
                 app.last_size.0,
@@ -1198,6 +1309,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         }
         WM_KEYDOWN => {
             let app = &mut *app_ptr;
+            // 地址框/搜索框正在编辑时，按键属于那个 EDIT（回车、ESC 由它自己的
+            // 子类过程处理）。主窗口再插一脚会把字母当快捷键、还会顺手把地址栏
+            // 文本刷回当前路径 —— 输入到一半的内容就这么没了。
+            if app.addr_editing {
+                return LRESULT(0);
+            }
             handle_key(app, wparam.0 as i32);
             paint::sync_address(app);
             LRESULT(0)
@@ -1356,16 +1473,53 @@ fn finish_drag(app: &mut App, l: &paint::Layout, x: i32, y: i32) {
 }
 
 /// 框选：矩形与条目矩形相交的都选中。
+///
+/// 三种布局的"条目矩形"算法完全不同（列表行 / 网格磁贴 / 首页磁贴），
+/// 回收站更是另一套（按下标 + id 选中）。四个分支各自用自己的几何，
+/// 绝不拿列表那套去套首页 —— 那正是"框选在首页/回收站不生效"的根因。
 fn select_marquee(app: &mut App, l: &paint::Layout, drag: &app::Drag) {
     let r = paint::marquee_rect(drag);
-    let view_top = l.view.top + header_height(app);
-    let n = app.tab().visible.len();
+    let hits = |a: &RECT, b: &RECT| a.right > b.left && a.left < b.right && a.bottom > b.top && a.top < b.bottom;
+
+    if app.tab().recycle {
+        let row_h = paint::recycle_row_h(app.metrics.scale);
+        let top = paint::recycle_list_top(app.metrics.scale, l.view.top);
+        let mut ids: Vec<String> = Vec::new();
+        for (i, it) in app.recycle_items.iter().enumerate() {
+            let ir = RECT { left: l.view.left, top: top + i as i32 * row_h, right: l.view.right, bottom: top + (i as i32 + 1) * row_h };
+            if hits(&ir, &r) {
+                ids.push(it.id.clone());
+            }
+        }
+        if ids.is_empty() {
+            return;
+        }
+        app.recycle_sel.clear();
+        for id in ids {
+            app.recycle_sel.insert(id);
+        }
+        return;
+    }
+
     let mut keys: Vec<String> = Vec::new();
-    for i in 0..n {
-        let ir = paint::item_rect(app, l, i, view_top);
-        if ir.right > r.left && ir.left < r.right && ir.bottom > r.top && ir.top < r.bottom {
-            if let Some(e) = app.tab().visible.get(i).and_then(|k| app.tab().entries.get(*k)) {
-                keys.push(crate::app::key_of(e));
+    if app.tab().home {
+        let (_, tiles) = paint::home_layout(app, &l.view);
+        for t in &tiles {
+            if hits(&t.rect, &r) {
+                if let Some(e) = app.tab().entries.get(t.index) {
+                    keys.push(crate::app::key_of(e));
+                }
+            }
+        }
+    } else {
+        let view_top = l.view.top + header_height(app);
+        let n = app.tab().visible.len();
+        for i in 0..n {
+            let ir = paint::item_rect(app, l, i, view_top);
+            if hits(&ir, &r) {
+                if let Some(e) = app.tab().visible.get(i).and_then(|k| app.tab().entries.get(*k)) {
+                    keys.push(crate::app::key_of(e));
+                }
             }
         }
     }

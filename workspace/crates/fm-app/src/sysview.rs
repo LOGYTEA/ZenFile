@@ -666,6 +666,16 @@ pub fn selftest() -> Vec<(&'static str, bool, String)> {
         String::new(),
     ));
 
+    // 「新建」模板：只读扫 HKCR 的 ShellNew。断言"必有 .txt"（任何 Windows 都挂了它），
+    // 其余项随安装的软件变化，只报不判。
+    let tpls = crate::shellnew::templates();
+    let list: Vec<String> = tpls.iter().map(|t| format!("{}({})", t.label, t.ext)).collect();
+    out.push((
+        "扫得到系统「新建」模板且含 .txt",
+        tpls.iter().any(|t| t.ext == ".txt"),
+        format!("{} 项：{}", tpls.len(), list.join(", ")),
+    ));
+
     // 只读扫一次注册表：允许一个 bag 都没有（干净机器 / CI），但不许崩
     let cnt = debug_slot_count();
     out.push((
