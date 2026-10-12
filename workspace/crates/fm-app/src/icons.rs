@@ -459,11 +459,6 @@ impl IconCache {
             let dx = (size - dw) / 2;
             let dy = (size - dh) / 2;
 
-            // 尺寸正好 1:1 —— 原样贴（无重采样）
-            if dw == w && dh == h {
-                return blend_bmp(hdc, bmp, x + dx, y + dy, dw, dh, 255);
-            }
-
             // 缓存命中
             let key = (bmp.0 as usize, dw, dh);
             if let Some(sb) = self.scaled_thumbs.borrow().get(&key) {
@@ -471,6 +466,11 @@ impl IconCache {
                 return blend_bmp(hdc, sb, x + dx, y + dy, dw, dh, 255);
             }
 
+            // **没有"1:1 直贴"捷径**（第31轮）：Shell 交回来的位图即便尺寸正好，
+            // 边缘也常见 2~3px 一级的硬台阶和青绿杂边（那是 Shell 自己放大糊出来
+            // 的成品）。直贴等于把糙图原样照搬 —— 看起来"优化了一堆代码但画面
+            // 一点没变"。统一走 premultiplied 重采样（已是 pmp 时重采样是恒等+
+            // 抗锯齿），代价被 scaled_thumbs 缓存吃掉。
             // 读像素（thumb 此刻没有被选进任何 DC，可直接 GetDIBits）
             let Some(data) = read_bmp_rgba(bmp, w, h) else {
                 return false;
@@ -670,9 +670,31 @@ fn shell_thumb(path: &Path, size: i32) -> Option<HBITMAP> {
                 Ok(f) => f,
                 Err(_) => return None,
             };
-        let want = SIZE { cx: size, cy: size };
+        // **向 Shell 要 2 倍分辨率的源图，再由我们自己 box 缩小到目标尺寸。**
+        //
+        // 这才是治锯齿的关键（第31轮实锤）：直接按目标尺寸要图时，Shell 交回来的
+        // 常常就是一份"把小图放大糊出来的"成品 —— 边缘带 2~3px 一级的硬台阶，
+        // 而且 alpha 插值留下青绿杂边。我们拿到 96 就 1:1 直贴，等于把这份糙图
+        // 原样照搬到屏幕上，看起来"优化了一堆代码但画面一点没变"。
+        //
+        // 要 192 让 box 缩小真正做超采样（面积平均）：台阶被抹平，杂边也被平均掉。
+        // 拿不到 2 倍源时（老图标/特殊类型）再退回目标尺寸，并让 draw_thumb
+        // 走它自己的重采样路径。
+        let want = SIZE { cx: size * 2, cy: size * 2 };
         // 先要真缩略图；Shell 说"这个类型没有缩略图"时再退成大号图标。
-        // 两条路都不加 SIIGBF_SCALEUP：宁可 32×32 清晰，也不要把小图放大糊掉。
+        // 两条路都不加 SIIGBF_SCALEUP：宁可低分辨率清晰，也不要把小图放大糊掉。
+        for flags in [
+            SIIGBF_RESIZETOFIT.0 | SIIGBF_THUMBNAILONLY.0,
+            SIIGBF_RESIZETOFIT.0 | SIIGBF_ICONONLY.0,
+        ] {
+            if let Ok(hbmp) = factory.GetImage(want, windows::Win32::UI::Shell::SIIGBF(flags)) {
+                if !hbmp.is_invalid() {
+                    return Some(hbmp);
+                }
+            }
+        }
+        // 2 倍源要不到（部分自定义图标只登记了固定尺寸）：退回目标尺寸。
+        let want = SIZE { cx: size, cy: size };
         for flags in [
             SIIGBF_RESIZETOFIT.0 | SIIGBF_THUMBNAILONLY.0,
             SIIGBF_RESIZETOFIT.0 | SIIGBF_ICONONLY.0,
