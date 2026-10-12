@@ -413,6 +413,23 @@ pub enum DockZone {
 /// 这里按 Windows 贴靠的实际语义处理 —— 角落贴等价于"先按左右分，
 /// 新窗格再在它那一半里占上下的一半"，于是新窗格拿到的是一个
 /// **1/4 大小的规则矩形**，旧窗格 keep 住对面那一半（1/2）。
+/// 把 `r` 从 `from` 块的归一化空间线性映射到 `to` 块（贴靠后现窗格压缩用）。
+///
+/// 保相对位置与占比：`from` 里的 (相对x, 宽占比) 原样落到 `to`。这样
+/// "对侧半"里的窗格布局不变、只是等比缩小 —— 既不重叠也不留缺口。
+fn remap_rect(r: RectF, from: RectF, to: RectF) -> RectF {
+    let fx = if from.w > 0.0 { (r.x - from.x) / from.w } else { 0.0 };
+    let fy = if from.h > 0.0 { (r.y - from.y) / from.h } else { 0.0 };
+    let fw = if from.w > 0.0 { r.w / from.w } else { 1.0 };
+    let fh = if from.h > 0.0 { r.h / from.h } else { 1.0 };
+    RectF {
+        x: to.x + fx * to.w,
+        y: to.y + fy * to.h,
+        w: fw * to.w,
+        h: fh * to.h,
+    }
+}
+
 fn split_rect(r: RectF, zone: DockZone) -> (RectF, RectF) {
     let (ow, oh) = (r.w, r.h);
     match zone {
@@ -1202,11 +1219,21 @@ impl App {
                 self.focus_pane = dst;
             }
             DockZone::Left | DockZone::Right | DockZone::Top | DockZone::Bottom => {
-                let old = self.panes[dst].rect;
-                let (a, b) = split_rect(old, zone);
-                self.panes[dst].rect = a;
-                self.panes.insert(dst + 1, Pane { tabs: vec![t], active: 0, rect: b });
-                self.focus_pane = dst + 1;
+                // **窗口级 1/2 贴靠**（第27轮）：把整个窗格块沿 zone 二分 ——
+                // zone 侧半给新标签，对侧半 = 现有窗格按原比例**压缩重排**
+                //（线性映射，相对布局不变）。
+                //
+                // 早先只对焦点窗格二分：源窗格被拖空收掉后，它腾出的地盘没有
+                // 任何窗格接收 —— 那一带 pane_index_at=None，点上去全无反应
+                //（用户 #2"贴完两边都操作不了"，日志实锤缺 0..0.25 无主）。
+                // 全局二分后 block 恒被铺满：不重叠、不缺口。
+                // 1/4 四角贴靠已砍掉（用户要求只做 1/2），这里全是 1/2。
+                let (keep, give) = split_rect(block, zone);
+                for p in self.panes.iter_mut() {
+                    p.rect = remap_rect(p.rect, block, keep);
+                }
+                self.panes.push(Pane { tabs: vec![t], active: 0, rect: give });
+                self.focus_pane = self.panes.len() - 1;
             }
             _ => self.dock_quarter(dst, t, zone, block),
         }
@@ -1459,6 +1486,17 @@ impl App {
         self.cfg.ui.radius.insert(id.to_string(), v);
         let _ = fm_core::config::Config::save_user_patch(&serde_json::json!({
             "ui": { "radius": { id: v } }
+        }));
+    }
+
+    /// 改「选中行首竖线」的形状并写回用户层（设置-交互页）。
+    ///
+    /// 每次改都把整个 sel_bar 对象深合并进去 —— save_user_patch 是 deep_merge，
+    /// 单字段 patch 也行，整体写更不容易漏状态。
+    pub fn set_sel_bar(&mut self, f: impl FnOnce(&mut fm_core::config::SelBarConfig)) {
+        f(&mut self.cfg.ui.sel_bar);
+        let _ = fm_core::config::Config::save_user_patch(&serde_json::json!({
+            "ui": { "sel_bar": self.cfg.ui.sel_bar }
         }));
     }
 

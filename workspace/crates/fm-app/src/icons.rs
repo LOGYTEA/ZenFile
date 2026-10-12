@@ -10,6 +10,7 @@
 //! 色块（遮罩未生效，即用户反馈的"图标边上的小方块"）。改用 SHGFI_ICON +
 //! DrawIconEx，遮罩由 GDI 处理，边角透明。
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -28,7 +29,7 @@ use windows::Win32::UI::Shell::{
     SHGetFileInfoW, SHFILEINFOW, SHGFI_DISPLAYNAME, SHGFI_ICON, SHGFI_LARGEICON,
     SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES,
 };
-use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, DrawIconEx, HICON, DI_NORMAL};
+use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, DrawIconEx, GetIconInfo, HICON, DI_NORMAL};
 
 const SHGFI_BASE: u32 = SHGFI_ICON.0 | SHGFI_USEFILEATTRIBUTES.0;
 
@@ -36,6 +37,8 @@ const SHGFI_BASE: u32 = SHGFI_ICON.0 | SHGFI_USEFILEATTRIBUTES.0;
 const DIR_CACHE_MAX: usize = 1024;
 /// 缩略图上界。每张占 `size²×4` 字节，比 HICON 费得多，上界给小一点。
 const THUMB_CACHE_MAX: usize = 256;
+/// 放大位图上界（96²×4 ≈ 36KB/张，384 张 ≈ 14MB）。满了整表清空重来。
+const UPSCALED_CACHE_MAX: usize = 384;
 
 /// 这几类文件的图标**只属于它自己**，不能按扩展名归并：
 /// 每个 exe/dll/ico 都嵌着自己的图标，.lnk 显示的是目标图标，.url 显示网站图标。
@@ -56,6 +59,11 @@ pub struct IconCache {
     /// 值是 Option：`None` 表示"已经问过 Shell，但没拿到"，避免每帧重绘都对每个
     /// 路径重复发起一次 Shell 查询。
     dir: HashMap<String, Option<HICON>>,
+    /// **放大后的图标位图**（premultiplied 双线性插值结果，见 `upscaled_bmp`）：
+    /// key = (HICON 句柄值, 目标尺寸)。HICON 由上面几张表长期持有、指针即身份；
+    /// 指针失效（Drop）时整表一起清。`RefCell` 是为了 draw/&self 签名不动 ——
+    /// 调用点遍布 paint 里十几处 `&App` 函数，改成 `&mut` 要传染整条链。
+    upscaled: RefCell<HashMap<(usize, i32), HBITMAP>>,
 }
 
 impl Default for IconCache {
@@ -89,6 +97,14 @@ impl Drop for IconCache {
                 }
             }
         }
+        // 放大位图缓存（HBITMAP）：和 HICON 分开销毁，别混进上面的 DestroyIcon
+        for (_, b) in self.upscaled.get_mut().drain() {
+            if !b.is_invalid() {
+                unsafe {
+                    let _ = DeleteObject(b.into());
+                }
+            }
+        }
     }
 }
 
@@ -99,6 +115,7 @@ impl IconCache {
             large: HashMap::new(),
             thumbs: HashMap::new(),
             dir: HashMap::new(),
+            upscaled: RefCell::new(HashMap::new()),
         }
     }
 
@@ -376,17 +393,49 @@ impl IconCache {
     }
 
     pub fn draw(&self, hdc: HDC, icon: HICON, x: i32, y: i32, size: i32) {
-        if icon.0.is_null() {
+        if icon.0.is_null() || size <= 0 {
             return;
         }
         unsafe {
-            // 32×32 拉到大图标 96px：默认 BLACKONWHITE 锯齿很重。DrawIconEx 走
-            // StretchBlt，stretch mode 设到 HALFTONE 才生效。
-            let _ = SetStretchBltMode(hdc, HALFTONE);
-            let _ = SetBrushOrgEx(hdc, 0, 0, None);
-            // DI_NORMAL：用图标自带的遮罩绘制，边角保持透明
+            // 放大（大图标视图 48/96px）走高质量插值路径：DrawIconEx 直接拉伸
+            // 是 mask/最近邻那套，边缘硬切还带 alpha halo —— 图标外圈一圈
+            // 白/绿杂边、锯齿很重（用户截图反馈的就是它）。
+            if size > 32 {
+                if let Some(bmp) = self.upscaled_bmp(icon, size) {
+                    if blend_bmp(hdc, bmp, x, y, size, 255) {
+                        return;
+                    }
+                }
+                // 取像素失败（老式 mask-only 图标之类）→ 退回老路
+                let _ = SetStretchBltMode(hdc, HALFTONE);
+                let _ = SetBrushOrgEx(hdc, 0, 0, None);
+                let _ = DrawIconEx(hdc, x, y, icon, size, size, 0, None, DI_NORMAL);
+                return;
+            }
+            // ≤32 是原尺寸（或缩到行图标）：DrawIconEx 本身就够
             let _ = DrawIconEx(hdc, x, y, icon, size, size, 0, None, DI_NORMAL);
         }
+    }
+
+    /// 取（或生成）放大后的 premultiplied 位图。
+    fn upscaled_bmp(&self, icon: HICON, size: i32) -> Option<HBITMAP> {
+        let key = (icon.0 as usize, size);
+        if let Some(b) = self.upscaled.borrow().get(&key) {
+            return Some(*b);
+        }
+        let bmp = render_upscaled(icon, size)?;
+        let mut c = self.upscaled.borrow_mut();
+        if c.len() >= UPSCALED_CACHE_MAX {
+            for (_, b) in c.drain() {
+                if !b.is_invalid() {
+                    unsafe {
+                        let _ = DeleteObject(b.into());
+                    }
+                }
+            }
+        }
+        c.insert(key, bmp);
+        Some(bmp)
     }
 
     /// 淡化绘制（隐藏项 / 受保护的系统文件用）。
@@ -397,6 +446,15 @@ impl IconCache {
         if icon.0.is_null() || alpha >= 255 {
             self.draw(hdc, icon, x, y, size);
             return;
+        }
+        // 放大 + 淡出（隐藏的大图标）：同样先走高质量插值位图，再带
+        // SourceConstantAlpha 贴出 —— 老路径里 DrawIconEx 拉伸的锯齿照样在。
+        if size > 32 {
+            if let Some(bmp) = self.upscaled_bmp(icon, size) {
+                if unsafe { blend_bmp(hdc, bmp, x, y, size, alpha) } {
+                    return;
+                }
+            }
         }
         unsafe {
             let src = windows::Win32::Graphics::Gdi::GetDC(None);
@@ -550,6 +608,216 @@ fn icon_for_menu(key: &str) -> HICON {
         );
         sfi.hIcon
     }
+}
+
+// ---------------------------------------------------------------- 高质量放大
+
+/// 把 HICON 以**原生尺寸**画进 32bpp DIB 并读出像素（top-down BGRA）。
+///
+/// 透明底先清零：DrawIconEx 只写有颜色的像素，底不清零会留下一次的脏像素。
+/// alpha 通道**全 0**（老式 mask-only 图标，GDI 不写 alpha）时返回 None ——
+/// 这种图没有可用的 alpha，双线性插值会把它糊成一块黑，调用方退回
+/// DrawIconEx 老路。
+fn icon_native_rgba(icon: HICON, ow: i32, oh: i32) -> Option<Vec<u8>> {
+    if ow <= 0 || oh <= 0 || icon.0.is_null() {
+        return None;
+    }
+    unsafe {
+        let src = windows::Win32::Graphics::Gdi::GetDC(None);
+        let mem = CreateCompatibleDC(Some(src));
+        let _ = windows::Win32::Graphics::Gdi::ReleaseDC(None, src);
+        if mem.is_invalid() {
+            return None;
+        }
+        let mut hdr: windows::Win32::Graphics::Gdi::BITMAPINFO = std::mem::zeroed();
+        hdr.bmiHeader.biSize =
+            std::mem::size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32;
+        hdr.bmiHeader.biWidth = ow;
+        hdr.bmiHeader.biHeight = -oh; // 自上而下
+        hdr.bmiHeader.biPlanes = 1;
+        hdr.bmiHeader.biBitCount = 32;
+        hdr.bmiHeader.biCompression = windows::Win32::Graphics::Gdi::BI_RGB.0;
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let bmp = windows::Win32::Graphics::Gdi::CreateDIBSection(
+            Some(mem),
+            &hdr,
+            windows::Win32::Graphics::Gdi::DIB_RGB_COLORS,
+            &mut bits,
+            None,
+            0,
+        )
+        .unwrap_or_default();
+        if bmp.is_invalid() || bits.is_null() {
+            let _ = DeleteDC(mem);
+            return None;
+        }
+        std::ptr::write_bytes(bits as *mut u8, 0, (ow * oh * 4) as usize);
+        let old = SelectObject(mem, bmp.into());
+        // cxDesired/cyDesired = 0 → 按图标原生尺寸画，不缩放（无损取样）
+        let ok = DrawIconEx(mem, 0, 0, icon, 0, 0, 0, None, DI_NORMAL).is_ok();
+        SelectObject(mem, old);
+        let n = (ow * oh * 4) as usize;
+        let data = if ok {
+            std::slice::from_raw_parts(bits as *const u8, n).to_vec()
+        } else {
+            Vec::new()
+        };
+        let _ = DeleteObject(bmp.into());
+        let _ = DeleteDC(mem);
+        if data.is_empty() {
+            return None;
+        }
+        if !data.iter().skip(3).step_by(4).any(|&a| a > 0) {
+            return None;
+        }
+        Some(data)
+    }
+}
+
+/// premultiplied 双线性放大（方形：sw=sh → dw×dw）。
+///
+/// **必须在 premultiplied 空间插值**：straight alpha 直接对 RGB 插值会把
+/// "透明区的底色"混进可见边缘 —— 那就是图标外圈白/绿杂边（halo）的来源。
+fn upscale_pmp(src: &[u8], sw: i32, sh: i32, dw: i32) -> Vec<u8> {
+    let mut out = vec![0u8; (dw * dw * 4) as usize];
+    if sw <= 0 || sh <= 0 || dw <= 0 {
+        return out;
+    }
+    for dy in 0..dw {
+        let syf = ((dy as f32 + 0.5) * sh as f32 / dw as f32 - 0.5).clamp(0.0, (sh - 1) as f32);
+        let y0 = syf as i32;
+        let y1 = (y0 + 1).min(sh - 1);
+        let fy = syf - y0 as f32;
+        for dx in 0..dw {
+            let sxf = ((dx as f32 + 0.5) * sw as f32 / dw as f32 - 0.5).clamp(0.0, (sw - 1) as f32);
+            let x0 = sxf as i32;
+            let x1 = (x0 + 1).min(sw - 1);
+            let fx = sxf - x0 as f32;
+            let corners = [
+                (x0, y0, (1.0 - fx) * (1.0 - fy)),
+                (x1, y0, fx * (1.0 - fy)),
+                (x0, y1, (1.0 - fx) * fy),
+                (x1, y1, fx * fy),
+            ];
+            let mut ab = 0f32;
+            let mut ag = 0f32;
+            let mut ar = 0f32;
+            let mut aa = 0f32;
+            for (cx, cy, w) in corners {
+                let o = ((cy * sw + cx) * 4) as usize;
+                let a = src[o + 3] as f32;
+                let k = a / 255.0 * w;
+                ab += src[o] as f32 * k;
+                ag += src[o + 1] as f32 * k;
+                ar += src[o + 2] as f32 * k;
+                aa += a * w;
+            }
+            let o = ((dy * dw + dx) * 4) as usize;
+            out[o] = ab.round().clamp(0.0, 255.0) as u8;
+            out[o + 1] = ag.round().clamp(0.0, 255.0) as u8;
+            out[o + 2] = ar.round().clamp(0.0, 255.0) as u8;
+            out[o + 3] = aa.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
+}
+
+/// 把 premultiplied 像素包成 32bpp DIB（供 AlphaBlend 的 AC_SRC_ALPHA 用）。
+fn pmp_to_bmp(data: &[u8], size: i32) -> Option<HBITMAP> {
+    unsafe {
+        let src = windows::Win32::Graphics::Gdi::GetDC(None);
+        let mem = CreateCompatibleDC(Some(src));
+        let _ = windows::Win32::Graphics::Gdi::ReleaseDC(None, src);
+        if mem.is_invalid() {
+            return None;
+        }
+        let mut hdr: windows::Win32::Graphics::Gdi::BITMAPINFO = std::mem::zeroed();
+        hdr.bmiHeader.biSize =
+            std::mem::size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32;
+        hdr.bmiHeader.biWidth = size;
+        hdr.bmiHeader.biHeight = -size;
+        hdr.bmiHeader.biPlanes = 1;
+        hdr.bmiHeader.biBitCount = 32;
+        hdr.bmiHeader.biCompression = windows::Win32::Graphics::Gdi::BI_RGB.0;
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let bmp = windows::Win32::Graphics::Gdi::CreateDIBSection(
+            Some(mem),
+            &hdr,
+            windows::Win32::Graphics::Gdi::DIB_RGB_COLORS,
+            &mut bits,
+            None,
+            0,
+        )
+        .unwrap_or_default();
+        let _ = DeleteDC(mem);
+        if bmp.is_invalid() || bits.is_null() {
+            if !bmp.is_invalid() {
+                let _ = DeleteObject(bmp.into());
+            }
+            return None;
+        }
+        let n = (size * size * 4) as usize;
+        if data.len() < n {
+            let _ = DeleteObject(bmp.into());
+            return None;
+        }
+        std::ptr::copy_nonoverlapping(data.as_ptr(), bits as *mut u8, n);
+        Some(bmp)
+    }
+}
+
+/// 原生取像素 → premultiplied 双线性放大 → DIB 位图。失败返回 None（调用方退老路）。
+fn render_upscaled(icon: HICON, size: i32) -> Option<HBITMAP> {
+    // 1) 原生尺寸（GetIconInfo → hbmColor 的宽高；拿不到就按 32）
+    let (mut ow, mut oh) = (32i32, 32i32);
+    unsafe {
+        let mut ii: windows::Win32::UI::WindowsAndMessaging::ICONINFO = std::mem::zeroed();
+        if GetIconInfo(icon, &mut ii).is_ok() {
+            if !ii.hbmColor.is_invalid() {
+                let mut bm: BITMAP = std::mem::zeroed();
+                let got = GetObjectW(
+                    windows::Win32::Graphics::Gdi::HGDIOBJ(ii.hbmColor.0),
+                    std::mem::size_of::<BITMAP>() as i32,
+                    Some(&mut bm as *mut _ as *mut core::ffi::c_void),
+                );
+                if got > 0 && bm.bmWidth > 0 && bm.bmHeight > 0 {
+                    ow = bm.bmWidth;
+                    oh = bm.bmHeight;
+                }
+            }
+            if !ii.hbmColor.is_invalid() {
+                let _ = DeleteObject(ii.hbmColor.into());
+            }
+            if !ii.hbmMask.is_invalid() {
+                let _ = DeleteObject(ii.hbmMask.into());
+            }
+        }
+    }
+    // 2) 无损取样 + 插值 + 打包
+    let data = icon_native_rgba(icon, ow, oh)?;
+    let out = upscale_pmp(&data, ow, oh, size);
+    pmp_to_bmp(&out, size)
+}
+
+/// 把缓存位图贴到目标 DC。`alpha` = 整体不透明度（隐藏项淡出用）。
+///
+/// 源是 **premultiplied** 32bpp（`upscaled_bmp` 保证），所以 AlphaFormat
+/// 必须是 AC_SRC_ALPHA —— 直接 AC_SRC_OVER 贴 straight alpha 会出暗边。
+unsafe fn blend_bmp(hdc: HDC, bmp: HBITMAP, x: i32, y: i32, size: i32, alpha: u8) -> bool {
+    let mem = CreateCompatibleDC(Some(hdc));
+    if mem.is_invalid() {
+        return false;
+    }
+    let old = SelectObject(mem, bmp.into());
+    let mut bf: BLENDFUNCTION = std::mem::zeroed();
+    bf.BlendOp = AC_SRC_OVER as u8;
+    bf.BlendFlags = 0;
+    bf.SourceConstantAlpha = alpha;
+    bf.AlphaFormat = AC_SRC_ALPHA as u8;
+    let ok = AlphaBlend(hdc, x, y, size, size, mem, 0, 0, size, size, bf);
+    SelectObject(mem, old);
+    let _ = DeleteDC(mem);
+    ok.as_bool()
 }
 
 /// 把一个 HICON 画成 32bpp 位图（带 alpha），供菜单 `draw_bmp` 使用。

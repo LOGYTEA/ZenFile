@@ -66,6 +66,38 @@ pub struct UiConfig {
     /// 而且"没配过的项用默认值"正好靠 map 的缺省天然成立。
     #[serde(default)]
     pub radius: std::collections::BTreeMap<String, u32>,
+    /// 「选中行首竖线」的形状（设置-交互页调整）。
+    ///
+    /// 竖线画在选中/焦点行的行首底色上：宽 = 水平厚度、高 = 纵向长度
+    /// （0 = 跟行背景同高；**始终 clamp 在行背景内**，调大也不会悬空到
+    /// 行背景外面）、stroke = 空心时的描边线宽、hollow = 只描边不填色。
+    #[serde(default)]
+    pub sel_bar: SelBarConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SelBarConfig {
+    /// 水平厚度（DIP）
+    #[serde(default = "default_sel_w")]
+    pub w: u32,
+    /// 高度（DIP，0 = 跟行背景同高）
+    #[serde(default)]
+    pub h: u32,
+    /// 空心描边线宽（DIP，仅 hollow 时生效）
+    #[serde(default = "default_sel_stroke")]
+    pub stroke: u32,
+    /// 空心：只描边不填色
+    #[serde(default)]
+    pub hollow: bool,
+}
+
+fn default_sel_w() -> u32 { 3 }
+fn default_sel_stroke() -> u32 { 2 }
+
+impl Default for SelBarConfig {
+    fn default() -> Self {
+        Self { w: 3, h: 0, stroke: 2, hollow: false }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

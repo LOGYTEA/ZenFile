@@ -18,7 +18,7 @@ use windows::Win32::Graphics::Gdi::HDC;
 use windows::Win32::Graphics::Gdi::{
     CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, GetStockObject, Rectangle,
     RoundRect, SelectObject, SetBkMode, SetTextColor, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX,
-    DT_SINGLELINE, DT_VCENTER, HBRUSH, NULL_BRUSH, PS_SOLID, TRANSPARENT,
+    DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HBRUSH, NULL_BRUSH, PS_SOLID, TRANSPARENT,
 };
 
 use crate::app::{App, SETTINGS_TABS};
@@ -838,6 +838,9 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
         crate::app::SETTINGS_TAB_ADVANCED => {
             g.rows = advanced_rows(app, &content);
         }
+        crate::app::SETTINGS_TAB_INTERACT => {
+            g.rows = interact_rows(app, &content);
+        }
         crate::app::SETTINGS_TAB_PLUGIN => {
             g.rows = plugin_rows(app, &content);
         }
@@ -887,6 +890,25 @@ pub fn hit(app: &App, l: &Layout, x: i32, y: i32) -> Option<Hit> {
     if g.slider.right > g.slider.left && inside(&g.slider, x, y) {
         return Some(Hit::RadiusSlider(x));
     }
+    // 「交互」页：行右端 [−][+] 两颗小按钮，点按钮才动值；点标签区 = 无操作
+    //（4099 占位，防它掉进 main.rs 里 3000+ 的系统菜单 Row 分支）。
+    if app.settings_tab == crate::app::SETTINGS_TAB_INTERACT {
+        let bw = (26.0 * app.metrics.scale).round() as i32;
+        for r in &g.rows {
+            if inside(&r.rect, x, y) {
+                let a = r.action;
+                return if x >= r.rect.right - bw {
+                    Some(Hit::Row(a + 2)) // [+]
+                } else if x >= r.rect.right - 2 * bw {
+                    Some(Hit::Row(a + 1)) // [−]
+                } else if a == 4009 {
+                    Some(Hit::Row(4010)) // 空心行点标签也切换
+                } else {
+                    Some(Hit::Row(4099)) // 无操作占位
+                };
+            }
+        }
+    }
     for r in &g.rows {
         if r.action != 0 && inside(&r.rect, x, y) {
             return Some(Hit::Row(r.action));
@@ -913,6 +935,68 @@ fn row(rect: RECT, label: &str, value: String, action: u32, toggle: Option<bool>
 }
 
 /// 「高级」：沿用原来的开关与多选项，只是搬进新标签。
+/// 「交互」页的四行参数：**选中行首竖线**的形状。
+///
+/// action 编码（避开 1000 插件 / 2000 快捷键 / 3000 系统菜单段）：
+///   宽 base=4000（−=4001  +=4002）
+///   高 base=4003（−=4004  +=4005）
+///   粗细 base=4006（−=4007 +=4008）
+///   空心 base=4009（−=4010 +=4011，两颗按钮都只是切换）
+/// hit 里点行的标签区返回 4099（无操作占位，防止掉进别的 Row 分支）。
+fn interact_rows(app: &App, content: &RECT) -> Vec<paint::SettingRow> {
+    let s = app.metrics.scale;
+    let rh = (34.0 * s).round() as i32;
+    let sb = &app.cfg.ui.sel_bar;
+    let h_val = if sb.h == 0 {
+        "自动（跟行高）".to_string()
+    } else {
+        format!("{} DIP", sb.h)
+    };
+    let items: [(&str, String, u32); 4] = [
+        ("竖线宽度（厚度）", format!("{} DIP", sb.w), 4000),
+        ("竖线高度", h_val, 4003),
+        ("描边粗细（空心时生效）", format!("{} DIP", sb.stroke), 4006),
+        ("空心（只描边不填色）", if sb.hollow { "开".to_string() } else { "关".to_string() }, 4009),
+    ];
+    let mut out = Vec::new();
+    let mut y = content.top;
+    for (label, value, action) in items {
+        out.push(
+            row(
+                RECT { left: content.left, top: y, right: content.right, bottom: y + rh },
+                label,
+                value,
+                action,
+                None,
+            ),
+        );
+        y += rh + (6.0 * s).round() as i32;
+    }
+    out
+}
+
+/// 执行「交互」页参数行的一次步进（由 hit 的 Row action 直接驱动）。
+pub fn apply_sel_bar_action(app: &mut App, a: u32) {
+    match a {
+        4001 | 4002 => {
+            let d = if a == 4002 { 1 } else { -1 };
+            app.set_sel_bar(|sb| sb.w = ((sb.w as i32) + d).clamp(1, 12) as u32);
+        }
+        4004 | 4005 => {
+            let d = if a == 4005 { 1 } else { -1 };
+            app.set_sel_bar(|sb| sb.h = ((sb.h as i32) + d).clamp(0, 48) as u32);
+        }
+        4007 | 4008 => {
+            let d = if a == 4008 { 1 } else { -1 };
+            app.set_sel_bar(|sb| sb.stroke = ((sb.stroke as i32) + d).clamp(1, 6) as u32);
+        }
+        4009..=4011 => {
+            app.set_sel_bar(|sb| sb.hollow = !sb.hollow);
+        }
+        _ => {}
+    }
+}
+
 fn advanced_rows(app: &App, content: &RECT) -> Vec<paint::SettingRow> {
     let s = app.metrics.scale;
     let rh = (34.0 * s).round() as i32;
@@ -1084,21 +1168,7 @@ pub fn paint(app: &mut App, hdc: HDC, l: &Layout) {
         }
         crate::app::SETTINGS_TAB_LOOK => paint_look(app, hdc, &g, th, s),
         crate::app::SETTINGS_TAB_INTERACT => {
-            // 按用户要求**先留空**：这一页的开关还没想好怎么排。
-            // 空白页也要写一句话说明"这是有意的空"，否则看着像没做出来。
-            let r = RECT {
-                left: g.content.left,
-                top: g.content.top,
-                right: g.content.right,
-                bottom: g.content.top + (34.0 * s).round() as i32,
-            };
-            set_color(hdc, th.text_dim);
-            paint::draw_text(
-                hdc,
-                "（这一页先留空 —— 交互类的开关还没定好怎么分）",
-                r,
-                DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER,
-            );
+            paint_interact(app, hdc, &g, th, s);
         }
         _ => paint_about(app, hdc, &g, th, s),
     }
@@ -1474,10 +1544,16 @@ fn paint_preview_canvas(app: &mut App, hdc: HDC, r: &RECT, th: Theme, s: f32) {
         let _ = FillRect(hdc, &view_r, cbg4);
         let _ = DeleteObject(cbg4.into());
         let oldf3 = SelectObject(hdc, font.into());
-        let col_name_w = (view_r.right - view_r.left) * 50 / 100;
-        let col_date_w = (view_r.right - view_r.left) * 20 / 100;
-        let col_size_w = (view_r.right - view_r.left) * 12 / 100;
-        let col_kind_w = view_r.right - view_r.left - col_name_w - col_date_w - col_size_w;
+        // 死数据四列。按**内容实际宽度**分配（画布约 565px 时）：
+        //   名称 "本地磁盘 (C:)" ≈ 95px → 39%
+        //   日期 "2026/09/03 14:22" ≈ 110px → 23%（19% 会截成 "…14:…"）
+        //   类型 "系统文件夹" ≈ 70px → 15%
+        //   大小 "221 GB / 369 GB" ≈ 105px → 23%（上一版 18% 还差几个像素，
+        //   死数据没画完整 —— 用户把这叫"渲染不全"）
+        let col_date_w = (view_r.right - view_r.left) * 23 / 100;
+        let col_size_w = (view_r.right - view_r.left) * 23 / 100;
+        let col_kind_w = (view_r.right - view_r.left) * 15 / 100;
+        let col_name_w = view_r.right - view_r.left - col_date_w - col_size_w - col_kind_w;
         // 表头
         let header_r = RECT { left: view_r.left, top: view_r.top, right: view_r.right, bottom: view_r.top + px(22.0) };
         let hbg = CreateSolidBrush(th.surface);
@@ -2049,6 +2125,64 @@ fn paint_look(app: &App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
 
     // —— 滑杆 ——
     draw_slider(app, hdc, &g.slider, th, s);
+}
+
+/// 「交互」页：**选中行首竖线**的四个参数 + 实时样例。
+///
+/// 所见即所得：样例区就是一条选中态行背景 + 按当前参数画的竖线，
+/// 参数一改（main.rs 的 Row 分支 → apply_sel_bar_action → InvalidateRect）
+/// 立刻重画，真窗口的列表行/磁贴走同一个 draw_sel_bar，所以样例即真窗口。
+fn paint_interact(app: &App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
+    let px = |v: f32| (v * s).round() as i32;
+    let btn_w = (26.0 * s).round() as i32;
+
+    // —— 四行参数（几何来自 interact_rows）——
+    for r in &g.rows {
+        fill_rect(hdc, &r.rect, th.surface);
+        // 标签
+        set_color(hdc, th.text);
+        let mut lr = r.rect;
+        lr.left += px(10.0);
+        lr.right = r.rect.right - btn_w * 2 - px(60.0);
+        paint::draw_text(hdc, &r.label, lr, DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS);
+        // 当前值（贴着按钮左边、右对齐）
+        let mut vr = r.rect;
+        vr.left = lr.right + px(4.0);
+        vr.right = r.rect.right - btn_w * 2 - px(6.0);
+        set_color(hdc, th.text_dim);
+        paint::draw_text(hdc, &r.value, vr, DT_RIGHT | DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
+        // 右端 [−][+] 两颗小按钮（点按钮才动值）
+        for (k, glyph) in ["\u{2212}", "+"].iter().enumerate() {
+            let bx = r.rect.right - btn_w * (2 - k as i32);
+            let br = RECT {
+                left: bx + px(2.0),
+                top: r.rect.top + px(5.0),
+                right: bx + btn_w - px(2.0),
+                bottom: r.rect.bottom - px(5.0),
+            };
+            fill_rect(hdc, &br, th.surface_alt);
+            set_color(hdc, th.text);
+            paint::draw_text(hdc, glyph, br, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
+        }
+    }
+
+    // —— 实时样例：一条选中态行 + 当前参数的竖线 ——
+    let base_y = g.rows.last().map(|r| r.rect.bottom).unwrap_or(g.content.top) + px(20.0);
+    let mut head = RECT { left: g.content.left, top: base_y, right: g.content.right, bottom: base_y + px(20.0) };
+    set_color(hdc, th.text_dim);
+    paint::draw_text(hdc, "预览（真窗口的列表行/磁贴就是这个形状）：", head, DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
+    let sr = RECT {
+        left: g.content.left,
+        top: base_y + px(26.0),
+        right: (g.content.left + px(420.0)).min(g.content.right),
+        bottom: base_y + px(26.0) + px(28.0),
+    };
+    rr(hdc, &sr, app.radius_of("content.selected"), th.selection_bg, None);
+    unsafe { paint::draw_sel_bar(app, hdc, sr, th) };
+    let mut tr = sr;
+    tr.left += px(16.0);
+    set_color(hdc, th.selection_text);
+    paint::draw_text(hdc, "选中的条目 —— 竖线实时跟着参数走", tr, DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
 }
 
 /// 圆角矩形：填充 + 可选描边。`RoundRect` 的椭圆宽高是**直径**的两倍关系，

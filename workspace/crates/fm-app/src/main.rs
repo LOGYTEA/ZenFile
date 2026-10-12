@@ -944,18 +944,22 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let app = &mut *app_ptr;
             let (x, y) = client_xy(hwnd, lparam);
             let l = paint::layout_for(app);
+            // 圆角滑杆拖动。**必须排在 settings_drag 判定之前**：按下滑杆时
+            // 只置了 radius_drag 标志、并没有设 settings_drag —— 早先这段
+            // 处理整个被包在 `settings_drag.is_some()` 里，于是按下能写进
+            // 一次值、按住拖全程无反应（用户报的"圆角改了没反应"就是它）。
+            if app.tab().settings && app.settings_radius_drag {
+                let id = app.settings_radius_sel.clone();
+                let g = settings::geom(app, &l);
+                let max = settings::radius_max(&id).max(1);
+                let w = (g.slider.right - g.slider.left).max(1);
+                let frac = ((x - g.slider.left) as f32 / w as f32).clamp(0.0, 1.0);
+                app.set_radius(&id, (frac * max as f32).round() as u32);
+                let _ = InvalidateRect(Some(hwnd), None, true);
+                return LRESULT(0);
+            }
             // 设置页排布编辑器：正在拖卡片，只更新位置并重画，别的命中一概不理。
             if app.tab().settings && app.settings_drag.is_some() {
-                if app.settings_radius_drag {
-                    let id = app.settings_radius_sel.clone();
-                    let g = settings::geom(app, &l);
-                    let max = settings::radius_max(&id).max(1);
-                    let w = (g.slider.right - g.slider.left).max(1);
-                    let frac = ((x - g.slider.left) as f32 / w as f32).clamp(0.0, 1.0);
-                    app.set_radius(&id, (frac * max as f32).round() as u32);
-                    let _ = InvalidateRect(Some(hwnd), None, true);
-                    return LRESULT(0);
-                }
                 if let Some(d) = &mut app.settings_drag {
                     d.cur = (x, y);
                 }
@@ -1387,6 +1391,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                         let w = (g.slider.right - g.slider.left).max(1);
                         let frac = ((sx - g.slider.left) as f32 / w as f32).clamp(0.0, 1.0);
                         app.set_radius(&id, (frac * max as f32).round() as u32);
+                        let _ = InvalidateRect(Some(hwnd), None, true);
+                    }
+                    // 「交互」页的竖线参数步进（4001..4011）。必须排在
+                    // 下面 3000+/2000+/1000+ 的 guard **之前** —— 否则会先
+                    // 被 >=3000 拦走当成系统菜单开关。
+                    Some(settings::Hit::Row(action)) if (4001..=4099).contains(&action) => {
+                        settings::apply_sel_bar_action(app, action);
                         let _ = InvalidateRect(Some(hwnd), None, true);
                     }
                     Some(settings::Hit::Row(action)) if action >= 3000 => {
@@ -1984,14 +1995,15 @@ fn view_row_at(app: &App, l: &paint::Layout, x: i32, y: i32, view_top: i32) -> O
     } else {
         let row = app.row_hit(y, view_top, l.view.bottom - view_top)?;
         // 详细信息/列表视图：右侧空白处不应当成"命中行"。
-        // 之前是 row_hit 只看 y、x 一路放行，于是"大小"那列右边的整片空白点上去
-        // 都算选中该行（用户截图反馈的就是这个）。
-        // item_rect 返回的 right 才是绘制时这一行实际占的右沿 —— 跟绘制共用一份
-        // 几何，改一次不至于错位。Details 视图会按"最后一列结束处"截断；List
-        // 视图 item_rect 仍然铺到 l.view.right（行式列表就该整行可点）。
-        let r = paint::item_rect(app, l, row, view_top);
-        if mode == fm_core::ViewMode::Details && x >= r.right {
-            return None;
+        // 视觉上行背景现在**铺满整行**（见 paint 那边的注释），所以不能再用
+        // item_rect 的 right 判（它是 l.view.right，恒真 = 判断从来没生效过 ——
+        // 用户"说过几遍"的那条）。改用**列区右沿**：最后一列（大小）结束处。
+        if mode == fm_core::ViewMode::Details {
+            let icon_size = (16.0 * app.metrics.scale) as i32;
+            let cols = paint::detail_cols(app, l, icon_size);
+            if x >= cols.size + cols.size_w {
+                return None;
+            }
         }
         Some(row)
     }

@@ -25,6 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::HICON;
 use crate::app::{human, App};
 use crate::icons::wide;
 use crate::theme::Metrics;
+use crate::theme::Theme;
 
 // ---------------------------------------------------------------- 字体
 
@@ -727,15 +728,14 @@ pub fn dock_zone_at(l: &Layout, x: i32, y: i32) -> crate::app::DockZone {
     let right = x >= r.right - mx;
     let top = y < r.top + my;
     let bottom = y >= r.bottom - my;
+    // **四向，不做 1/4 四角**（用户明确要求：四格布局先砍掉，只留左右/上下
+    // 二分）。顺序上左右先于上下：不然左上角会先命中 `top` 落成"上半"，
+    // 贴左边时角上那段手感很怪。四角区域自然归入左右边。
     match (top, bottom, left, right) {
-        (true, _, true, _) => TopLeft,
-        (true, _, _, true) => TopRight,
-        (_, true, true, _) => BottomLeft,
-        (_, true, _, true) => BottomRight,
-        (true, _, _, _) => Top,
-        (_, true, _, _) => Bottom,
         (_, _, true, _) => Left,
         (_, _, _, true) => Right,
+        (true, _, _, _) => Top,
+        (_, true, _, _) => Bottom,
         _ => Center,
     }
 }
@@ -1555,6 +1555,65 @@ pub(crate) unsafe fn fill_radius(
     SelectObject(hdc, old_pen);
     let _ = DeleteObject(br.into());
     let _ = DeleteObject(pen.into());
+}
+
+/// 选中/焦点条目**行首的强调竖线**（列表行、大图标磁贴共用这一套）。
+///
+/// 形状四参数由「设置-交互」页调整：宽（厚度）/ 高（纵向长度，0 = 跟宿主
+/// 背景同高）/ 粗细（空心时的描边线宽）/ 是否空心。
+///
+/// **高度始终 clamp 在宿主背景（行背景/磁贴底色）之内** —— 用户明确要求
+/// 这条线不许超出选中内容的底色，否则看着像悬空了一截。
+pub(crate) unsafe fn draw_sel_bar(app: &App, hdc: HDC, host: RECT, t: Theme) {
+    let sb = &app.cfg.ui.sel_bar;
+    let sc = app.metrics.scale;
+    let host_h = host.bottom - host.top;
+    if host_h <= 0 || host.right <= host.left {
+        return;
+    }
+    let bar_w = (((sb.w as f32) * sc).round().max(1.0) as i32)
+        .min((host.right - host.left).max(1));
+    // 行背景的圆角会把左上/左下角"啃掉"一块弧；竖线画在最左沿，**顶通到底
+    // 会把那条弧填平** —— 用户眼里就是"改圆角没反应"（实测 rad=0/14 两帧
+    // 角区面积只差 13px）。按弧方程把竖线两端缩进：
+    //   行背景有效半径 r = (rad*2).min(宽).min(高) / 2（与 fill_radius 同口径）
+    //   x=bar_w 处弧的纵向内缩 = r - sqrt(r² - (r - bar_w)²)
+    let r_row = ((app.radius_of("content.selected") as i32) * 2)
+        .min(host.right - host.left)
+        .min(host_h)
+        / 2;
+    let arc_inset = if r_row > 0 && bar_w < r_row {
+        let f = r_row as f32;
+        let ww = bar_w as f32;
+        (f - (f * f - (f - ww) * (f - ww)).max(0.0).sqrt()).round() as i32
+    } else {
+        0
+    };
+    let box_h = (host_h - arc_inset * 2).max(1);
+    let bar_h = if sb.h == 0 {
+        box_h
+    } else {
+        (((sb.h as f32) * sc).round().max(1.0) as i32).min(box_h)
+    };
+    let top = host.top + arc_inset + (box_h - bar_h) / 2;
+    let r = RECT { left: host.left, top, right: host.left + bar_w, bottom: top + bar_h };
+    if sb.hollow {
+        // 空心：只描边不填色。线宽太粗会盖满整个条，clamp 到条的短边以内。
+        let stroke = (((sb.stroke as f32) * sc).round().max(1.0) as i32)
+            .min(bar_w)
+            .min(bar_h);
+        let p = CreatePen(PS_SOLID, stroke, t.accent);
+        let op = SelectObject(hdc, p.into());
+        let ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        // GDI Rectangle 画的是 [left, right) —— +1 让可见宽正好 bar_w，
+        // 与实心版同一口径。
+        let _ = Rectangle(hdc, r.left, r.top, r.right + 1, r.bottom + 1);
+        let _ = SelectObject(hdc, ob);
+        let _ = SelectObject(hdc, op);
+        let _ = DeleteObject(p.into());
+    } else {
+        fill_radius(app, hdc, "content.selected", &r, t.accent, None);
+    }
 }
 
 /// 文本绘制统一入口：内部完成 UTF-16 转换。
@@ -2568,15 +2627,8 @@ fn paint_home(app: &mut App, hdc: HDC, l: &Layout) {
                     None,
                 );
                 // 与列表行 / 菜单悬停项同一套语言：选中态在左沿压一条强调竖线
-                let bw = (3.0 * scale).round().max(2.0) as i32;
-                fill_radius(
-                    app,
-                    hdc,
-                    "content.selected",
-                    &RECT { left: tile.rect.left, top: tile.rect.top, right: tile.rect.left + bw, bottom: tile.rect.bottom },
-                    t.accent,
-                    None,
-                );
+                //（形状与列表行同源，「设置-交互」页统一调）
+                draw_sel_bar(app, hdc, tile.rect, t);
             }
             SetTextColor(hdc, if sel { t.selection_text } else { t.text });
             app.icons.draw(hdc, icons[n], tile.icon_x, tile.icon_y, tile.icon_size);
@@ -2913,16 +2965,13 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
                         g.tile_w,
                     )
                 }
-                // 行式布局的选中/悬停条**只到最后一列的右沿**为止。
-                // 铺满整行的话，鼠标扫过表头右侧那一片空白也会亮起一条，
-                // 而那片地方其实不属于任何一列（资源管理器就是截止在最右列）。
+                // 行式布局的选中/悬停条**铺满整行**（与表头通长）。
+                // 早先截断在最后一列的右沿，表头通长、行只画到 700px 处就断 ——
+                // 看着就是"渲染不全"（用户截图反馈）。右侧超出列区那片的点击
+                // 判空白挪到 view_row_at（按 detail_cols 列区右沿），视觉与
+                // 命中解耦：画要铺满，点要分得清空白。
                 None => {
-                    let w = if mode == fm_core::ViewMode::Details {
-                        ((cols.size + cols.size_w).min(l.view.right) - l.view.left).max(10)
-                    } else {
-                        l.view.right - l.view.left
-                    };
-                    (l.view.left, list_top + i as i32 * row_h - scroll, w)
+                    (l.view.left, list_top + i as i32 * row_h - scroll, l.view.right - l.view.left)
                 }
             };
             if y > l.view.bottom || y + tile_h < list_top {
@@ -2950,18 +2999,10 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
                     None,
                 );
                 // 行首一条竖线：和自绘右键菜单的悬停项**同一套语言**
-                // （那里是"底色 + 3px 竖线"）。只有一层底色时，暗色主题下
+                // （那里是"底色 + 竖线"）。只有一层底色时，暗色主题下
                 // "选中了哪几行"要逐个比对亮度才看得出来；加了竖线，扫一眼
-                // 左边缘就知道。
-                let bw = (3.0 * app.metrics.scale).round().max(2.0) as i32;
-                fill_radius(
-                    app,
-                    hdc,
-                    "content.selected",
-                    &RECT { left: r.left, top: r.top, right: r.left + bw, bottom: r.bottom },
-                    t.accent,
-                    None,
-                );
+                // 左边缘就知道。形状（宽/高/粗细/空心）由「设置-交互」页调。
+                draw_sel_bar(app, hdc, r, t);
             }
             SetTextColor(hdc, if selected { t.selection_text } else { t.text });
 
