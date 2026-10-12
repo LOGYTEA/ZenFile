@@ -508,12 +508,8 @@ pub struct Geom {
     pub ui_right: RECT,
     /// 界面页：中间的窗口实时预览
     pub ui_preview: RECT,
-    /// 界面页：最下面三条最长的带
-    pub ui_bars: [RECT; 3],
-    /// 界面页：三条带里各自的条目矩形
-    pub ui_bar_items: [Vec<RECT>; 3],
-    /// 界面页：**中间预览里**那三条带（标题栏/工具栏/状态栏）的屏幕矩形。
-    /// 预览不是装饰 —— 它和下面三条整条一样是投放目标。
+    /// 界面页：**预览里**那三条带（标题栏/工具栏/状态栏）的屏幕矩形。
+    /// 预览不是装饰 —— 它就是唯一的投放目标（1:1，比三条 30px 的整条好点多了）。
     pub ui_pv_bars: [RECT; 3],
     /// 打开方式里每一条候选程序
     pub ow_rows: Vec<RECT>,
@@ -619,8 +615,6 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
         ui_top: RECT::default(),
         ui_right: RECT::default(),
         ui_preview: RECT::default(),
-        ui_bars: [RECT::default(); 3],
-        ui_bar_items: [Vec::new(), Vec::new(), Vec::new()],
         ui_pv_bars: [RECT::default(); 3],
     };
 
@@ -671,36 +665,38 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
             g.rows = system_rows(app, &g.sys_panel);
         }
         crate::app::SETTINGS_TAB_UI => {
-            // 中间是这个窗口的**实时预览**，组件按长短分三条带围在它四周。
+            // 上面两条调色板（小组件 / 长组件），下面一整块 **1:1 的真窗口预览**。
+            //
+            // 上一版是"预览缩到 0.49 倍 + 底部三条 30px 整条"：预览小到看不清，
+            // 而且是手绘示意图（侧栏没字、内容区没列头），和真窗口长得不一样。
+            // 现在预览占满整页宽、用真绘制函数原尺寸画 —— 它就是软件窗口本身，
+            // 也是唯一的投放目标。三条整条删了：同一个信息画两遍，还把预览挤瘪。
             let gap = px(10.0);
-            let h_top = px(84.0);
-            let h_bot = px(150.0);
+            let h_top = px(48.0);
+            let h_long = px(50.0);
             g.ui_top = RECT {
                 left: content.left,
                 top: content.top,
                 right: content.right,
                 bottom: content.top + h_top,
             };
-            let mid_top = g.ui_top.bottom + gap;
-            let mid_bot = content.bottom - h_bot - gap;
-            let pw = (content.right - content.left) * 58 / 100;
+            g.ui_right = RECT {
+                left: content.left,
+                top: g.ui_top.bottom + gap,
+                right: content.right,
+                bottom: g.ui_top.bottom + gap + h_long,
+            };
             g.ui_preview = RECT {
                 left: content.left,
-                top: mid_top,
-                right: content.left + pw,
-                bottom: mid_bot,
-            };
-            g.ui_right = RECT {
-                left: g.ui_preview.right + gap,
-                top: mid_top,
+                top: g.ui_right.bottom + gap,
                 right: content.right,
-                bottom: mid_bot,
+                bottom: content.bottom,
             };
-            // 预览里三条带的位置：和 draw_window_preview 共用同一份映射，
+            // 预览里三条带的位置：和 draw_window_preview 共用同一份真布局，
             // 于是"看起来在这条带上"和"判定为这条带"必然一致。
             g.ui_pv_bars = preview_bands(app, &g.ui_preview);
 
-            // —— 上面：小组件，横向流式排布，排满换行 ——
+            // —— 第一行：小组件，横向流式排布，排满换行 ——
             let mut tx = g.ui_top.left;
             let mut ty = g.ui_top.top + px(16.0);
             let sh = px(28.0);
@@ -721,43 +717,24 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
                 tx += ww + px(4.0);
             }
 
-            // —— 右边：长组件，竖着一条条排 ——
-            let mut ry = g.ui_right.top + px(16.0);
-            let rh = px(30.0);
+            // —— 第二行：长组件 ——
+            let mut lx = g.ui_right.left;
+            let ly = g.ui_right.top + px(16.0);
+            let lh = px(30.0);
             for (i, wd) in WIDGETS.iter().enumerate() {
                 if !wd.long || WIDGET_RETIRED.contains(&(i as u16)) {
                     continue;
                 }
-                if ry + rh > g.ui_right.bottom {
+                let ww = px(wd.w).max(px(56.0));
+                if lx + ww > g.ui_right.right {
                     break;
                 }
-                g.cards.push(RECT { left: g.ui_right.left, top: ry, right: g.ui_right.right, bottom: ry + rh });
+                g.cards.push(RECT { left: lx, top: ly, right: lx + ww, bottom: ly + lh });
                 g.card_ids.push(i as u32);
-                ry += rh + px(4.0);
+                lx += ww + px(4.0);
             }
 
-            // —— 最下面：三条最长的带 ——
-            let bh = px(30.0);
-            let mut by = content.bottom - h_bot;
-            for bi in 0..3 {
-                let br = RECT { left: content.left, top: by + px(16.0), right: content.right, bottom: by + px(16.0) + bh };
-                g.ui_bars[bi] = br;
-                by += px(16.0) + bh + px(6.0);
-            }
-            for bi in 0..3 {
-                for (r, wid) in layout_bar(app, bi, &g.ui_bars[bi], s) {
-                    g.ui_bar_items[bi].push(r);
-                    // id 高位标出"来自第几条带的第几格"，低位才是组件下标
-                    g.cards.push(r);
-                    g.card_ids.push(
-                        0x8000_0000u32
-                            | ((bi as u32) << 16)
-                            | ((g.ui_bar_items[bi].len() as u32 - 1) << 8)
-                            | (wid as u32),
-                    );
-                }
-            }
-            // 这一页没有「更多」区了：拖出整条就是拿掉，不需要第二个框
+            // 这一页没有「更多」区了：拖出预览带就是拿掉，不需要第二个框
             g.dock = RECT::default();
         }
         crate::app::SETTINGS_TAB_LOOK => {
@@ -1082,59 +1059,32 @@ pub fn paint(app: &mut App, hdc: HDC, l: &Layout) {
 // ---------------------------------------------------------------- 界面页
 
 /// 界面页：中间是这个软件窗口的实时预览，四周三条组件带。
-fn paint_ui_tab(app: &App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
-    // —— 中间：整窗预览 ——
-    draw_window_preview(app, hdc, &g.ui_preview, th, s);
-
-    // —— 上面：小组件 ——
+fn paint_ui_tab(app: &mut App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
+    // —— 两条调色板 ——
     band_title(
         hdc,
         &g.ui_top,
-        "小组件 —— 暗的=没装，点一下装上；拖到预览或下面的整条里可放到指定位置",
+        "小组件 —— 暗的=没装，点一下装上；拖进预览可放到指定位置",
         th,
         s,
     );
-    // —— 右边：长组件 ——
     band_title(
         hdc,
         &g.ui_right,
-        "长组件 —— 侧栏、地址栏那些；同样点一下装/不装",
+        "长组件 —— 地址栏、搜索框那些；同样点一下装/不装",
         th,
         s,
     );
 
-    // —— 最下面：三条最长的整条 ——
-    for bi in 0..3 {
-        let mut tr = g.ui_bars[bi];
-        tr.top -= (16.0 * s).round() as i32;
-        tr.bottom = g.ui_bars[bi].top;
-        band_title(hdc, &tr, BAR_NAMES[bi], th, s);
-        let bg = match bi {
-            0 => th.title_bg,
-            1 => th.chrome_bg,
-            _ => th.status_bg,
-        };
-        rr(hdc, &g.ui_bars[bi], app.radius_of("toolbar.button"), bg, None);
-        for (k, r) in g.ui_bar_items[bi].iter().enumerate() {
-            let wid = app
-                .ui_settings
-                .bars
-                .get(bi)
-                .and_then(|v| v.get(k))
-                .copied()
-                .unwrap_or(0) as usize;
-            let id = 0x8000_0000u32 | ((bi as u32) << 16) | ((k as u32) << 8) | (wid as u32);
-            let dragging = matches!(&app.settings_drag, Some(d) if d.id == id);
-            let hover = app.settings_hover_card == Some(id) && !dragging;
-            draw_widget(app, hdc, r, wid, th, s, hover, dragging);
-        }
-    }
+    // —— 中间：整个软件窗口的 1:1 实时预览（真绘制函数画的） ——
+    let pv = g.ui_preview;
+    draw_window_preview(app, hdc, &pv, th, s);
 
-    // —— 两条调色板里的组件：没装在任何带子里的画成暗的 ——
+    // —— 调色板里的组件：没装在任何带子里的画成暗的 ——
     for (i, r) in g.cards.iter().enumerate() {
         let id = g.card_ids[i];
         if id & 0x8000_0000 != 0 {
-            continue; // 整条里的上面画过了
+            continue;
         }
         let wid = (id & 0xFF) as usize;
         let dragging = matches!(&app.settings_drag, Some(d) if d.id == id);
@@ -1147,7 +1097,8 @@ fn paint_ui_tab(app: &App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
     // 不知道往哪儿松手（"拖过去没反应"有一半是这个原因）。
     if let Some(d) = &app.settings_drag {
         if let Some((bi, _)) = drop_target(app, g, d.cur.0, d.cur.1) {
-            for br in [g.ui_pv_bars[bi], g.ui_bars[bi]] {
+            {
+                let br = g.ui_pv_bars[bi];
                 if br.right > br.left && br.bottom > br.top {
                     unsafe {
                         let p = windows::Win32::Graphics::Gdi::CreatePen(
@@ -1207,25 +1158,24 @@ fn toggle_widget(app: &mut App, wid: u16) {
     after_change(app);
 }
 
-/// 落点判定：底部三条整条 **和** 中间预览里那三条带，都算。
+/// 落点判定：预览里那三条 1:1 的真带。
 ///
 /// `finish_drag()`（真的改配置）和 `paint_ui_tab()`（画投放高亮）共用这一份。
 fn drop_target(app: &App, g: &Geom, x: i32, y: i32) -> Option<(usize, Vec<RECT>)> {
     let tol = (6.0 * app.metrics.scale).round() as i32;
     for bi in 0..3 {
-        let br = &g.ui_bars[bi];
-        if br.right > br.left && x >= br.left && x < br.right && y >= br.top - tol && y < br.bottom + tol
-        {
-            return Some((bi, g.ui_bar_items[bi].clone()));
-        }
-    }
-    // 预览里的带子很薄（缩放后可能只有十几像素），给足容差才点得中
-    let k = preview_map(app, &g.ui_preview).k;
-    for bi in 0..3 {
         let br = &g.ui_pv_bars[bi];
-        if br.right > br.left && x >= br.left && x < br.right && y >= br.top - tol && y < br.bottom + tol
+        if br.right > br.left
+            && br.bottom > br.top
+            && x >= br.left
+            && x < br.right
+            && y >= br.top - tol
+            && y < br.bottom + tol
         {
-            let items = layout_bar(app, bi, br, k).into_iter().map(|(r, _)| r).collect();
+            let items = preview_item_rects(app, &g.ui_preview, bi)
+                .into_iter()
+                .map(|(_, r)| r)
+                .collect();
             return Some((bi, items));
         }
     }
@@ -1336,216 +1286,122 @@ fn draw_widget_ex(
     }
 }
 
-/// 一条带里的内容怎么摆：靠左的从左往右，靠右的（最小化/最大化/关闭）整组贴右。
+/// 预览里那份**真布局**：按预览的宽高算一份真窗口布局，再整体搬进预览矩形。
 ///
-/// 带子里和窗口预览里用的是同一份，于是"在带子里把关闭拖到最小化前面"，
-/// 预览里的三个键当场跟着换。
-fn layout_bar(app: &App, bar: usize, host: &RECT, s: f32) -> Vec<(RECT, usize)> {
-    let mut out = Vec::new();
-    let empty: Vec<u16> = Vec::new();
-    let items: &[u16] = app.ui_settings.bars.get(bar).map(|v| v.as_slice()).unwrap_or(&empty);
-    let pad = (2.0 * s).round() as i32;
-    let top = host.top + pad;
-    let bot = host.bottom - pad;
-    let mut lx = host.left + pad;
-    // 靠右那组先量总宽，再整组贴右，这样它们的左右顺序不会被放反
-    let mut rtotal = 0;
-    for wid in items {
-        if let Some(wd) = WIDGETS.get(*wid as usize) {
-            if wd.align == 1 {
-                rtotal += (wd.w * s).round() as i32 + pad;
-            }
-        }
-    }
-    let mut rx = host.right - pad - rtotal;
-    for wid in items {
-        let Some(wd) = WIDGETS.get(*wid as usize) else { continue };
-        let ww = (wd.w * s).round() as i32;
-        if wd.align == 1 {
-            if rx < lx {
-                break;
-            }
-            out.push((RECT { left: rx, top, right: rx + ww, bottom: bot }, *wid as usize));
-            rx += ww + pad;
-        } else {
-            if lx + ww > host.right - pad {
-                break;
-            }
-            out.push((RECT { left: lx, top, right: lx + ww, bottom: bot }, *wid as usize));
-            lx += ww + pad;
-        }
-    }
-    out
-}
-
-/// 预览的等比缩放映射：真窗口 (0,0,rw,rh) 缩到预览矩形里居中。
-///
-/// 上一版预览里的标题栏/工具栏/状态栏高度是拍脑袋写的 26/22/18、侧栏宽度是
-/// "占 26%"，而真窗口实际是 34/40/23 和**固定 157px**（`theme::Metrics`），
-/// 于是预览看着像那么回事、和真窗口一个都对不上。这里改成直接按真窗口尺寸
-/// 等比缩放，比例必然一致。
-struct PvMap {
-    ox: f32,
-    oy: f32,
-    k: f32,
-}
-
-fn preview_size(app: &App) -> (f32, f32) {
-    let w = if app.last_size.0 > 200 { app.last_size.0 as f32 } else { 1280.0 };
-    let h = if app.last_size.1 > 160 { app.last_size.1 as f32 } else { 800.0 };
-    (w, h)
-}
-
-fn preview_map(app: &App, host: &RECT) -> PvMap {
-    let (rw, rh) = preview_size(app);
-    let iw = (host.right - host.left) as f32;
-    let ih = (host.bottom - host.top) as f32;
-    let k = if rw > 0.0 && rh > 0.0 { (iw / rw).min(ih / rh) } else { 1.0 };
-    PvMap {
-        ox: host.left as f32 + (iw - rw * k) / 2.0,
-        oy: host.top as f32 + (ih - rh * k) / 2.0,
-        k,
-    }
-}
-
-fn pv_rect(m: &PvMap, l: f32, t: f32, r: f32, b: f32) -> RECT {
-    RECT {
-        left: (m.ox + l * m.k).round() as i32,
-        top: (m.oy + t * m.k).round() as i32,
-        right: (m.ox + r * m.k).round() as i32,
-        bottom: (m.oy + b * m.k).round() as i32,
-    }
-}
-
-/// 预览里三条带的屏幕矩形。
-///
-/// `geom()`（落点判定）和 `draw_window_preview()`（画）共用这一份 ——
+/// 画（draw_window_preview）和落点判定（preview_item_rects）共用这一份 ——
 /// 画在哪就判定在哪，不会出现"看着能放、放了没反应"。
-pub fn preview_bands(app: &App, host: &RECT) -> [RECT; 3] {
-    let m = preview_map(app, host);
-    let (rw, rh) = preview_size(app);
-    let tb = app.metrics.title_h as f32;
-    let tbb = tb + app.metrics.toolbar_h as f32;
-    [
-        pv_rect(&m, 0.0, 0.0, rw, tb),
-        pv_rect(&m, 0.0, tb, rw, tbb),
-        pv_rect(&m, 0.0, rh - app.metrics.status_h as f32, rw, rh),
-    ]
+fn preview_layout(app: &App, host: &RECT) -> paint::Layout {
+    let mut pl = paint::layout_sized(app, host.right - host.left, host.bottom - host.top);
+    paint::translate_layout(&mut pl, host.left, host.top);
+    pl
 }
 
-/// 中间那块：整个窗口按比例实时渲染。标题栏 / 工具栏 / 状态栏画的是**带子里
-/// 真的装了什么**，所以上面拖一下这里就跟着变。
+/// 预览里三条带（标题栏/工具栏/状态栏）的屏幕矩形。
+pub fn preview_bands(app: &App, host: &RECT) -> [RECT; 3] {
+    if host.right <= host.left || host.bottom <= host.top {
+        return [RECT::default(); 3];
+    }
+    let pl = preview_layout(app, host);
+    [pl.title, pl.toolbar, pl.status]
+}
+
+/// 预览带里每个组件真实占的矩形（组件 id → 矩形），用来算插入位置。
 ///
-/// 结构和真窗口一致：标题栏 → 工具栏（地址栏/搜索框就在这条里）→ 侧栏+内容
-/// → 状态栏。真窗口**没有**独立的一条"地址栏"行，上一版多画了它，于是预览
-/// 和真实窗口平白差出一整条。
-fn draw_window_preview(app: &App, hdc: HDC, r: &RECT, th: Theme, s: f32) {
+/// 直接从真布局里取（pl.back / pl.address / pl.min_btn …），和画出来的
+/// 一像素不差 —— 上一版用 layout_bar 自算一份，插进去的位置和看着的会歪。
+fn preview_item_rects(app: &App, host: &RECT, bar: usize) -> Vec<(u16, RECT)> {
+    if bar >= BAR_NAMES.len() {
+        return Vec::new();
+    }
+    let pl = preview_layout(app, host);
+    let m = app.metrics;
+    let Some(items) = app.ui_settings.bars.get(bar) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|wid| {
+            let r = match *wid {
+                W_SIDEBAR_TOGGLE => pl.sidebar_toggle,
+                W_TABS => pl.tabs,
+                W_NEW_TAB => RECT {
+                    left: pl.tabs.right,
+                    top: pl.tabs.top,
+                    right: pl.tabs.right + (26.0 * m.scale).round() as i32,
+                    bottom: pl.tabs.bottom,
+                },
+                W_MORE => pl.menu_btn,
+                W_MIN => pl.min_btn,
+                W_MAX => pl.max_btn,
+                W_CLOSE => pl.close_btn,
+                W_BACK => pl.back,
+                W_FORWARD => pl.forward,
+                W_UP => pl.up,
+                W_ADDRESS => pl.address,
+                W_BULK => pl.bulk_btn,
+                W_SEARCH => pl.search,
+                W_STATUS_TEXT => RECT {
+                    left: pl.status.left + m.pad,
+                    top: pl.status.top,
+                    right: pl.status.left + m.pad + (200.0 * m.scale).round() as i32,
+                    bottom: pl.status.bottom,
+                },
+                W_VIEW_SWITCH => paint::status_view_rects(&pl, &m).1,
+                _ => return None,
+            };
+            Some((*wid, r))
+        })
+        .collect()
+}
+
+/// 中间那块：整个软件窗口的 **1:1 实时预览**。
+///
+/// 调的是**和真窗口同一批绘制函数**（paint_title_bar / paint_toolbar /
+/// paint_sidebar / paint_panes / paint_status），布局用 layout_sized 按预览
+/// 宽高现算一份再搬进来。于是预览里是真标签、真地址栏、真侧栏图标、真列头
+/// —— 不是手绘示意图。上一版缩到 0.49 倍还画的是示意块，用户原话：
+/// "挤在一起看都看不清，和我的软件界面也不一样"。
+///
+/// 整个过程必须 SaveDC/IntersectClipRect/RestoreDC 包住（记忆 DC 全窗口共享）。
+fn draw_window_preview(app: &mut App, hdc: HDC, host: &RECT, th: Theme, s: f32) {
     let _ = s;
+    let r = *host;
     if r.right <= r.left || r.bottom <= r.top {
         return;
     }
-    fill_rect(hdc, r, th.window_bg);
-    let m = preview_map(app, r);
-    let (rw, rh) = preview_size(app);
-    let met = app.metrics;
-    let tb = met.title_h as f32;
-    let tbb = tb + met.toolbar_h as f32;
-    let sb_w = if app.cfg.ui.sidebar_visible { met.sidebar_w as f32 } else { 0.0 };
-    let st_h = if app.cfg.ui.statusbar_visible { met.status_h as f32 } else { 0.0 };
-    let vbot = rh - st_h;
-    let pad = met.pad as f32;
-
-    fill_rect(hdc, &pv_rect(&m, 0.0, 0.0, rw, rh), th.window_bg);
-
-    // 标题栏
-    let title = pv_rect(&m, 0.0, 0.0, rw, tb);
-    fill_rect(hdc, &title, th.title_bg);
-    for (wr, wid) in layout_bar(app, 0, &title, m.k) {
-        draw_widget(app, hdc, &wr, wid, th, m.k, false, false);
+    let pl = preview_layout(app, &r);
+    // 内容区必须画一个**真实目录**：此刻活动标签正是设置页本身，直接调
+    // paint_panes 会顺着 tab.settings 递归回设置页 —— 整块预览被铺成一片底色。
+    // 临时把活动标签指到第一个真实目录（paint_view 走的是只读路径），画完指回。
+    let pane = app.focus_pane;
+    let saved_tab = app.panes[pane].active;
+    let alt = (0..app.panes[pane].tabs.len()).find(|i| {
+        let t = &app.panes[pane].tabs[*i];
+        !t.settings && !t.home && !t.recycle
+    });
+    if let Some(i) = alt {
+        app.panes[pane].active = i;
     }
-
-    // 工具栏：地址栏 / 批量重命名 / 搜索框都在这一条里
-    let tbar = pv_rect(&m, 0.0, tb, rw, tbb);
-    fill_rect(hdc, &tbar, th.chrome_bg);
-    for (wr, wid) in layout_bar(app, 1, &tbar, m.k) {
-        draw_widget(app, hdc, &wr, wid, th, m.k, false, false);
-    }
-
-    // 侧栏
-    if sb_w > 0.0 {
-        let sb = pv_rect(&m, 0.0, tbb, sb_w, vbot);
-        fill_rect(hdc, &sb, th.chrome_bg);
-        let ih = met.row_h as f32;
-        for k in 0..8usize {
-            let top = tbb + pad + k as f32 * (ih + 2.0);
-            if top + ih > vbot - pad {
-                break;
-            }
-            let it = pv_rect(&m, pad, top, sb_w - pad, top + ih);
-            let (id, fill) = match k {
-                0 => ("sidebar.group", th.surface),
-                2 => ("sidebar.hover", th.hover_bg),
-                3 => ("sidebar.selected", th.selection_bg),
-                _ => ("sidebar.item", th.surface_alt),
-            };
-            rr(hdc, &it, app.radius_of(id), fill, None);
+    unsafe {
+        let saved = windows::Win32::Graphics::Gdi::SaveDC(hdc);
+        let _ = windows::Win32::Graphics::Gdi::IntersectClipRect(
+            hdc, r.left, r.top, r.right, r.bottom,
+        );
+        fill_rect(hdc, &r, th.window_bg);
+        paint::paint_title_bar(app, hdc, &pl);
+        paint::paint_toolbar(app, hdc, &pl);
+        if app.cfg.ui.sidebar_visible {
+            paint::paint_sidebar(app, hdc, &pl);
         }
-    }
-
-    // 内容区：跟着当前视图模式画（详细信息/列表画行，图标类画磁贴）
-    let ct = pv_rect(&m, sb_w, tbb, rw, vbot);
-    fill_rect(hdc, &ct, th.window_bg);
-    let list = matches!(
-        app.tab().view_mode,
-        fm_core::ViewMode::Details | fm_core::ViewMode::List
-    );
-    if list {
-        let hh = met.row_h as f32;
-        let hd = pv_rect(&m, sb_w + pad, tbb + pad, rw - pad, tbb + pad + hh);
-        rr(hdc, &hd, app.radius_of("content"), th.surface, None);
-        for k in 0..24usize {
-            let top = tbb + pad + (k + 1) as f32 * (hh + 2.0);
-            if top + hh > vbot - pad {
-                break;
-            }
-            let row = pv_rect(&m, sb_w + pad, top, rw - pad, top + hh);
-            let (id, fill) = match k {
-                1 => ("content.hover", th.hover_bg),
-                2 => ("content.selected", th.selection_bg),
-                _ => ("content.tile", th.surface_alt),
-            };
-            rr(hdc, &row, app.radius_of(id), fill, None);
+        if alt.is_some() {
+            paint::paint_panes(app, hdc, &pl);
         }
-    } else {
-        let cols = 4usize;
-        let cw = (rw - sb_w - pad * (cols as f32 + 1.0)) / cols as f32;
-        let ch = cw * 0.8;
-        for k in 0..(cols * 3) {
-            let cx = (k % cols) as f32;
-            let cy = (k / cols) as f32;
-            let l = sb_w + pad + cx * (cw + pad);
-            let top = tbb + pad + cy * (ch + pad);
-            if top + ch > vbot - pad {
-                break;
-            }
-            let tile = pv_rect(&m, l, top, l + cw, top + ch);
-            let (id, fill) = match k {
-                1 => ("content.hover", th.hover_bg),
-                3 => ("content.selected", th.selection_bg),
-                _ => ("content.tile", th.surface),
-            };
-            rr(hdc, &tile, app.radius_of(id), fill, None);
+        if app.cfg.ui.statusbar_visible {
+            paint::paint_status(app, hdc, &pl);
         }
+        let _ = windows::Win32::Graphics::Gdi::RestoreDC(hdc, saved);
     }
-
-    // 状态栏
-    if st_h > 0.0 {
-        let st = pv_rect(&m, 0.0, vbot, rw, rh);
-        fill_rect(hdc, &st, th.status_bg);
-        for (wr, wid) in layout_bar(app, 2, &st, m.k) {
-            draw_widget(app, hdc, &wr, wid, th, m.k, false, false);
-        }
-    }
+    app.panes[pane].active = saved_tab;
 }
 
 /// 排布编辑器：卡片列表 + 底部「更多」区。（界面页改成了实时预览，这里留着给别的页复用。）
@@ -2514,6 +2370,10 @@ fn after_change(app: &mut App) {
     app.ui_settings.normalize();
     app.ui_settings.save();
     apply_visibility(app);
+    // 排布变了必须重排子控件：搜索框/地址栏是真 EDIT 子窗口，靠 l.search /
+    // l.address 定位。只重绘的话装饰画回来了、EDIT 还留在旧矩形里 —— 实测
+    // "把搜索框拖回去，框画出来了但点不进去" 就是这一句没调。
+    crate::paint::reposition_chrome(app);
     app.invalidate();
 }
 

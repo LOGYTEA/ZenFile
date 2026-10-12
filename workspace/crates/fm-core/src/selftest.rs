@@ -324,14 +324,43 @@ pub fn run() -> i32 {
     );
 
     // 13. 回收站：能枚举到条目就至少要保证条目自身可解析（$I/$R 成对）
+    //
+    // 判据只看**解析结果本身自洽**：名字/实体 id 非空，且 $R 与 $I 是同一对
+    // （文件名只在第 2 个字符上差 $R/$I）。
+    //
+    // 这里**不能**用 `r_path.exists()` 复查：Windows 自己会按配额/存储感知持续
+    // 清掉最旧的条目（实测本机 38390 → 38092 → 37370，一分钟内掉一千多条），
+    // 枚举完再 stat 一遍等于跟系统的清理赛跑 —— 第22轮就是这么偶发 FAIL 的，
+    // 而且提示语还写死成"$I/$R 均成对"，挂了也看不出到底错在哪。
     let t0 = std::time::Instant::now();
     let items = crate::recycle::list();
     let listed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let paired = items.iter().all(|i| i.r_path.exists() && i.i_path.exists());
+    let mut bad_name = 0usize;
+    let mut bad_pair = 0usize;
+    for it in &items {
+        if it.name.is_empty() || it.id.is_empty() {
+            bad_name += 1;
+        }
+        let rn = it.r_path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let inp = it.i_path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        // 同一对：去掉第二个字符（$R/$I）后必须完全相同
+        let same = rn.len() == inp.len()
+            && rn.len() > 2
+            && rn.as_bytes()[0] == b'$'
+            && inp.as_bytes()[0] == b'$'
+            && rn.as_bytes()[2..] == inp.as_bytes()[2..]
+            && (rn.as_bytes()[1] == b'R' && inp.as_bytes()[1] == b'I');
+        if !same {
+            bad_pair += 1;
+        }
+    }
     h.check(
         "recycle::list",
-        items.iter().all(|i| !i.name.is_empty()) && paired,
-        &format!("{} 项，$I/$R 均成对，枚举 {:.0} ms", items.len(), listed_ms),
+        bad_name == 0 && bad_pair == 0,
+        &format!(
+            "{} 项，空名 {}、配对异常 {}，枚举 {:.0} ms",
+            items.len(), bad_name, bad_pair, listed_ms
+        ),
     );
 
     // 14. 驱动器清单：类型、卷标、容量必须能从 Win32 一路读出来

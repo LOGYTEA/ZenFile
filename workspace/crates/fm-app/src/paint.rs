@@ -227,6 +227,25 @@ pub struct Layout {
 
 pub const TAB_W: i32 = 180;
 
+/// 把整份布局平移 (dx, dy)。
+///
+/// 设置页的「界面」预览要按真实窗口画一遍 —— 用 layout_sized 按预览的
+/// 宽高算一份真布局，再整体搬到预览矩形里，然后调用**和真窗口同一批绘制
+/// 函数**。于是预览和软件长得一模一样，不是因为画了两份像的。
+pub fn translate_layout(l: &mut Layout, dx: i32, dy: i32) {
+    for r in [
+        &mut l.title, &mut l.toolbar, &mut l.sidebar, &mut l.view, &mut l.status,
+        &mut l.back, &mut l.forward, &mut l.up, &mut l.address, &mut l.search,
+        &mut l.min_btn, &mut l.max_btn, &mut l.close_btn, &mut l.menu_btn,
+        &mut l.sidebar_toggle, &mut l.bulk_btn, &mut l.tabs,
+    ] {
+        r.left += dx;
+        r.top += dy;
+        r.right += dx;
+        r.bottom += dy;
+    }
+}
+
 pub fn compute_layout(w: i32, h: i32, m: &Metrics, sidebar: bool, status: bool) -> Layout {
     let title_h = m.title_h;
     let toolbar_h = m.toolbar_h;
@@ -639,6 +658,14 @@ pub fn paint(app: &mut App, hdc: HDC, width: i32, height: i32) {
         SelectObject(mem, old_bmp);
         let _ = DeleteObject(bmp.into());
         let _ = DeleteDC(mem);
+        // 地址框 / 搜索框的空态提示（放大镜 + "搜索 X"）画在**子 EDIT 自己身上**，
+        // 而主窗口带 WS_CLIPCHILDREN，父窗口重绘永远不碰它们那两块。提示词跟着
+        // 当前标签变（"搜索设置" / "搜索 Windows"），标签切换却只重绘父窗口 ——
+        // 不在这里显式让子 EDIT 跟着重画，提示词就停在旧标签的文字上（实测：
+        // 把搜索框从排布里摘掉再装回，提示一直是"搜索设置"）。
+        // 子 EDIT 重画不会再失效父窗口，这里不会成环。
+        let _ = InvalidateRect(Some(app.hwnd_search), None, true);
+        let _ = InvalidateRect(Some(app.hwnd_address), None, true);
     }
 }
 
@@ -1109,7 +1136,7 @@ fn header_height_of(app: &App) -> i32 {
     }
 }
 
-fn paint_title_bar(app: &mut App, hdc: HDC, l: &Layout) {
+pub fn paint_title_bar(app: &mut App, hdc: HDC, l: &Layout) {
     let t = app.theme;
     unsafe {
         let brush = CreateSolidBrush(t.title_bg);
@@ -1287,7 +1314,7 @@ fn paint_tab_strip(app: &mut App, hdc: HDC, l: &Layout, pi: usize) {
 /// 画内容区。分栏时逐个窗格来：先把 `focus_pane` 指到那一个窗格、
 /// 再把 `Layout::view` 覆写成它的矩形，于是下面那一大片只认
 /// `app.tab()` / `l.view` 的旧代码一行都不用改。
-fn paint_panes(app: &mut App, hdc: HDC, l: &Layout) {
+pub fn paint_panes(app: &mut App, hdc: HDC, l: &Layout) {
     if app.panes.len() <= 1 {
         paint_view(app, hdc, l);
         return;
@@ -1716,7 +1743,7 @@ fn paint_address(app: &mut App, hdc: HDC, l: &Layout) {
     }
 }
 
-fn paint_toolbar(app: &mut App, hdc: HDC, l: &Layout) {
+pub fn paint_toolbar(app: &mut App, hdc: HDC, l: &Layout) {
     let t = app.theme;
     unsafe {
         let brush = CreateSolidBrush(t.chrome_bg);
@@ -1944,7 +1971,7 @@ pub fn draw_sort_arrow(hdc: HDC, r: &RECT, color: COLORREF, descending: bool) {
     }
 }
 
-fn paint_sidebar(app: &mut App, hdc: HDC, l: &Layout) {
+pub fn paint_sidebar(app: &mut App, hdc: HDC, l: &Layout) {
     let t = app.theme;
     let scale = app.metrics.scale;
     unsafe {
@@ -3889,7 +3916,7 @@ fn paint_view_switch(app: &App, hdc: HDC, l: &Layout) {
     }
 }
 
-fn paint_status(app: &App, hdc: HDC, l: &Layout) {
+pub fn paint_status(app: &App, hdc: HDC, l: &Layout) {
     let t = &app.theme;
     unsafe {
         let brush = CreateSolidBrush(t.status_bg);
@@ -4093,6 +4120,12 @@ fn position_children(app: &App) {
     unsafe {
         let _ = SetWindowPos(app.hwnd_address, None, l.address.left, l.address.top, l.address.right - l.address.left, l.address.bottom - l.address.top, SWP_NOZORDER | SWP_NOACTIVATE);
         let _ = SetWindowPos(app.hwnd_search, None, l.search.left, l.search.top, l.search.right - l.search.left, l.search.bottom - l.search.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        // 两个子 EDIT 的空态提示（放大镜 + "搜索 X"）画在**它们自己身上**，而
+        // 主窗口带 WS_CLIPCHILDREN，父窗口重绘永远不碰那一块 —— 换标签、挪
+        // 位置之后必须显式让它们重画。否则提示词停在旧标签的文字上（实测：
+        // 把搜索框从排布里摘掉再装回，提示停在"搜索设置"不回来）。
+        let _ = InvalidateRect(Some(app.hwnd_address), None, true);
+        let _ = InvalidateRect(Some(app.hwnd_search), None, true);
     }
 }
 

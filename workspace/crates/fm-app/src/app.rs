@@ -1174,6 +1174,10 @@ impl App {
         if src_pane >= self.panes.len() || src_tab >= self.panes[src_pane].tabs.len() {
             return false;
         }
+        // 角贴要按"所有窗格合起来"的整块来四等分，必须**在 remove 之前**量好：
+        // 拖空的源窗格一被收掉，它的地盘就从 panes 里消失了，那时再算就只剩
+        // 目标窗格那一块（实测右半边整块变背景色，点上去没有任何窗格响应）。
+        let block = self.panes_block();
         let dst = self.focus_pane.min(self.panes.len() - 1);
         // 一个窗格里就这一个标签还往它自己身上贴 = 什么都没发生
         if src_pane == dst && self.panes[dst].tabs.len() <= 1 && self.panes.len() == 1 {
@@ -1204,10 +1208,33 @@ impl App {
                 self.panes.insert(dst + 1, Pane { tabs: vec![t], active: 0, rect: b });
                 self.focus_pane = dst + 1;
             }
-            _ => self.dock_quarter(dst, t, zone),
+            _ => self.dock_quarter(dst, t, zone, block),
         }
         self.ensure_pane();
         true
+    }
+
+    /// 所有窗格合起来的外接矩形（归一化坐标）。四角贴靠按这一整块四等分。
+    ///
+    /// 不能只看"鼠标底下那一格"：跨窗格拖时源窗格会被 remove，它的地盘就没了主人
+    /// —— 那一块会变成点不动的死区（实测左右分栏后把右边的标签拖到左上角，
+    /// 右半边 4x4 网格墨迹全 0）。
+    fn panes_block(&self) -> RectF {
+        let mut x0 = f32::MAX;
+        let mut y0 = f32::MAX;
+        let mut x1 = f32::MIN;
+        let mut y1 = f32::MIN;
+        for p in &self.panes {
+            x0 = x0.min(p.rect.x);
+            y0 = y0.min(p.rect.y);
+            x1 = x1.max(p.rect.x + p.rect.w);
+            y1 = y1.max(p.rect.y + p.rect.h);
+        }
+        if x1 > x0 && y1 > y0 {
+            RectF { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
+        } else {
+            RectF::FULL
+        }
     }
 
     /// 四角贴靠：整块切成 **2x2 四等分**，四格铺满、一格不空。
@@ -1217,8 +1244,8 @@ impl App {
     /// 四等分之后每格都是一个真窗格：拖进来的那个落在松手的那一格，
     /// 原来那个挪到**对角**（离新标签最远），其余两格沿用原来正在看的目录
     /// （VS Code 的 2x2 网格也是这个行为）。
-    fn dock_quarter(&mut self, dst: usize, dragged: Tab, zone: DockZone) {
-        let r = self.panes[dst].rect;
+    fn dock_quarter(&mut self, dst: usize, dragged: Tab, zone: DockZone, block: RectF) {
+        let r = block;
         let (hw, hh) = (r.w * 0.5, r.h * 0.5);
         let quads = [
             RectF { x: r.x, y: r.y, w: hw, h: hh },                 // 0 左上
@@ -1233,32 +1260,51 @@ impl App {
             _ => 3,
         };
         let keep = 3 - want; // 对角
-        let fill = self.panes[dst].tabs.get(self.panes[dst].active).cloned();
-        self.panes[dst].rect = quads[keep];
-        let mut focus = dst;
-        let mut at = dst + 1;
+        let target = std::mem::take(&mut self.panes[dst].tabs);
+        let target_active = self.panes[dst].active;
+        let fill = target.get(target_active).cloned();
+        // 其余窗格的标签整排整排地摊进剩下两格（按窗格顺序，保持视觉顺序不乱）
+        let mut spare: Vec<Vec<Tab>> = self
+            .panes
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != dst)
+            .map(|(_, p)| p.tabs.clone())
+            .filter(|t| !t.is_empty())
+            .collect();
+        let mut built: Vec<Pane> = Vec::new();
+        let mut focus = 0usize;
         for i in 0..4usize {
-            if i == keep {
-                continue;
-            }
-            let tabs = if i == want {
-                vec![dragged.clone()]
+            let (tabs, active) = if i == keep {
+                let a = target_active.min(target.len().saturating_sub(1));
+                (target.clone(), a)
+            } else if i == want {
+                (vec![dragged.clone()], 0usize)
             } else {
-                match &fill {
-                    Some(t) => vec![t.clone()],
-                    None => Vec::new(),
+                match spare.pop() {
+                    Some(t) if !t.is_empty() => (t, 0usize),
+                    _ => match &fill {
+                        Some(f) => (vec![f.clone()], 0usize),
+                        None => (Vec::new(), 0usize),
+                    },
                 }
             };
             if tabs.is_empty() {
                 continue;
             }
-            self.panes.insert(at, Pane { tabs, active: 0, rect: quads[i] });
             if i == want {
-                focus = at;
+                focus = built.len();
             }
-            at += 1;
+            built.push(Pane { tabs, active, rect: quads[i] });
         }
-        self.focus_pane = focus;
+        // 格子不够时剩下的标签并进对角那一格，绝不能静悄悄丢掉
+        for rest in spare {
+            if let Some(p) = built.get_mut(keep) {
+                p.tabs.extend(rest);
+            }
+        }
+        self.panes = built;
+        self.focus_pane = focus.min(self.panes.len().saturating_sub(1));
     }
 
     /// 直接把一个目录贴成一个新窗格（把**文件夹**拖进内容区时走这里）。
