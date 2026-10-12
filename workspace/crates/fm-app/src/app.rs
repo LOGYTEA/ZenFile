@@ -712,6 +712,13 @@ pub struct App {
     /// **去过**这个文件夹时才存在，写不进去的时候（没去过 / 解析不出节点）
     /// 至少本进程里来回切换不该被默认值吃掉。
     pub view_overrides: HashMap<String, ViewMode>,
+    /// 每个目录的**滚动位置记忆**：路径(小写,无尾斜杠) -> scroll 像素。
+    ///
+    /// 用户要求：从子文件夹返回上一级时，要回到"打开它之前"的那一行，
+    /// 而不是跳到列表最顶。以前 `apply_history` 无条件 `scroll = 0`，
+    /// 于是每次返回都把用户"滚到一半的位置"扔掉。这里按目录各记一份，
+    /// 前进/后退时取回来（纯内存，不落盘 —— 跨进程的滚动位置没有价值）。
+    pub scroll_memory: HashMap<String, i32>,
 }
 
 /// 哪一条分隔线。
@@ -1120,6 +1127,7 @@ impl App {
             drag: None,
             drop_target: None,
             view_overrides,
+            scroll_memory: HashMap::new(),
         }
     }
 
@@ -1667,6 +1675,17 @@ impl App {
             display_title(&path)
         };
         {
+            // 离开前记住这个目录的滚动位置：从子文件夹走"上一级"进来时
+            // apply_history 会取回它（与返回键同一条路）。纯内存，不落盘。
+            let cur_key = norm_key(&self.tab().path);
+            if !cur_key.is_empty() {
+                let cur_scroll = self.tab().scroll;
+                self.scroll_memory.insert(cur_key, cur_scroll);
+            }
+            // （历史记录本身在这里 append，所以此刻查表拿到的是"上一次
+            //  离开这个目录"时存的值 —— 正是想要的语义。必须在
+            //  tab_mut() 之前取值：可变借用会一直持有到块尾。）
+            let want_scroll = self.scroll_memory.get(&norm_key(&path)).copied().unwrap_or(0);
             let tab = self.tab_mut();
             tab.home = is_home_path(&path);
             tab.recycle = is_recycle_path(&path);
@@ -1674,7 +1693,8 @@ impl App {
             tab.path = path.clone();
             tab.title = title;
             tab.selected.clear();
-            tab.scroll = 0;
+            // 打开一个目录时回到它上次的滚动位置；没记过 = 顶部。
+            tab.scroll = want_scroll;
             tab.focus_row = 0;
             tab.filter.clear();
             tab.search_root = None;
@@ -1732,6 +1752,15 @@ impl App {
     }
 
     fn apply_history(&mut self, target: &Path, select: Option<PathBuf>) {
+        // 离开前先把当前目录的滚动位置存起来（回头再回来要用）。
+        let cur_key = norm_key(&self.tab().path);
+        if !cur_key.is_empty() {
+            let cur_scroll = self.tab().scroll;
+            self.scroll_memory.insert(cur_key, cur_scroll);
+        }
+        // **取回这个目录上次的滚动位置**（没记过 = 0 = 顶部）。
+        // 用户明确要求"返回上一级要回到打开它之前的位置"，原来这里硬写 0。
+        let want = self.scroll_memory.get(&norm_key(target)).copied().unwrap_or(0);
         let tab = self.tab_mut();
         tab.home = is_home_path(target);
         tab.path = target.to_path_buf();
@@ -1741,7 +1770,7 @@ impl App {
             display_title(target)
         };
         tab.selected.clear();
-        tab.scroll = 0;
+        tab.scroll = want;
         tab.focus_row = 0;
         tab.filter.clear();
         self.pending_select = select;
@@ -1750,6 +1779,9 @@ impl App {
         self.apply_view_for(target);
         self.reload();
         self.try_pending_select();
+        // 滚动位置是"目录"的属性，**排序一变行高/顺序就变**，老位置会指到
+        // 完全无关的行 —— 与其猜，不如重新钳一次（clamp_scroll_to 走同一函数）。
+        self.clamp_scroll_to(&crate::paint::layout_for(self));
         self.invalidate();
     }
 

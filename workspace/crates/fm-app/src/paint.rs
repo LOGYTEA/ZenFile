@@ -6,13 +6,14 @@
 use windows::core::HSTRING;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
-    CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse, FillRect, GetDC,
+    BitBlt, CombineRgn, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
+    CreateRectRgn, CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse,
+    FillRect, FillRgn, GetDC,
     GetTextExtentPoint32W, IntersectClipRect, InvalidateRect, LineTo, MoveToEx, PS_SOLID, Rectangle,
     ReleaseDC, RestoreDC, RoundRect, SaveDC, SelectObject, SetBkMode, SetTextColor, DT_CENTER,
     DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DRAW_TEXT_FORMAT,
     FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FONT_QUALITY, GetStockObject, HBITMAP,
-    HDC, HFONT, NULL_BRUSH, NULL_PEN, Polygon, SRCCOPY, TRANSPARENT,
+    HDC, HFONT, NULL_BRUSH, NULL_PEN, Polygon, SRCCOPY, TRANSPARENT, RGN_AND,
 };
 use windows::Win32::Foundation::POINT;
 use windows::Win32::System::SystemInformation::GetTickCount64;
@@ -1562,41 +1563,50 @@ pub(crate) unsafe fn fill_radius(
 /// 形状四参数由「设置-交互」页调整：宽（厚度）/ 高（纵向长度，0 = 跟宿主
 /// 背景同高）/ 粗细（空心时的描边线宽）/ 是否空心。
 ///
-/// **高度始终 clamp 在宿主背景（行背景/磁贴底色）之内** —— 用户明确要求
-/// 这条线不许超出选中内容的底色，否则看着像悬空了一截。
+/// **竖条必须完全落在宿主底色之内，且不能短得看不见**（用户要求："不要显示到
+/// 白色框外边，不允许超出"）。
+///
+/// 做法是**用 Region 裁剪**，而不是拍脑袋算纵向内缩：
+/// 先造一个跟底色**完全同参数**的圆角矩形 Region（`CreateRoundRectRgn`
+/// 与 `fill_radius` 同一套半径算法），再和"左起 bar_w 宽、纵向 inset..bottom-inset"
+/// 的矩形求交（RGN_AND）。结果：
+///   - 左端形状与底色弧**逐像素同形**，物理上不可能戳到框外；
+///   - 圆角多大就自动贴多少，不用维护内缩公式（之前那个半吊子公式在
+///     rad=14 / 行高 21 时只算出 1px，竖线几乎整个消失）。
 pub(crate) unsafe fn draw_sel_bar(app: &App, hdc: HDC, host: RECT, t: Theme) {
     let sb = &app.cfg.ui.sel_bar;
     let sc = app.metrics.scale;
+    let host_w = host.right - host.left;
     let host_h = host.bottom - host.top;
-    if host_h <= 0 || host.right <= host.left {
+    if host_h <= 0 || host_w <= 0 {
         return;
     }
-    let bar_w = (((sb.w as f32) * sc).round().max(1.0) as i32)
-        .min((host.right - host.left).max(1));
-    // 行背景的圆角会把左上/左下角"啃掉"一块弧；竖线画在最左沿，**顶通到底
-    // 会把那条弧填平** —— 用户眼里就是"改圆角没反应"（实测 rad=0/14 两帧
-    // 角区面积只差 13px）。按弧方程把竖线两端缩进：
-    //   行背景有效半径 r = (rad*2).min(宽).min(高) / 2（与 fill_radius 同口径）
-    //   x=bar_w 处弧的纵向内缩 = r - sqrt(r² - (r - bar_w)²)
-    let r_row = ((app.radius_of("content.selected") as i32) * 2)
-        .min(host.right - host.left)
-        .min(host_h)
-        / 2;
-    let arc_inset = if r_row > 0 && bar_w < r_row {
-        let f = r_row as f32;
-        let ww = bar_w as f32;
-        (f - (f * f - (f - ww) * (f - ww)).max(0.0).sqrt()).round() as i32
-    } else {
-        0
-    };
-    let box_h = (host_h - arc_inset * 2).max(1);
+    let bar_w = (((sb.w as f32) * sc).round().max(1.0) as i32).min(host_w);
+    // 与 fill_radius 完全同口径的有效半径（椭圆直径 = 半径×2，再被宽高夹住）
+    let r = ((app.radius_of("content.selected") as i32) * 2).min(host_w).min(host_h) / 2;
+    // 纵向内缩：留出圆角占掉的高度，但**至少给竖条留一半高度**，否则 rad 大于
+    // 行高一半时（rad=14 / 行高 21 → 有效半径 10）竖线会被压没。
+    let inset = (r).min((host_h - bar_w.max(1)) / 2).max(0);
+    let inner_top = host.top + inset;
+    let inner_bot = host.bottom - inset;
     let bar_h = if sb.h == 0 {
-        box_h
+        inner_bot - inner_top
     } else {
-        (((sb.h as f32) * sc).round().max(1.0) as i32).min(box_h)
+        (((sb.h as f32) * sc).round().max(1.0) as i32).min(inner_bot - inner_top)
     };
-    let top = host.top + arc_inset + (box_h - bar_h) / 2;
-    let r = RECT { left: host.left, top, right: host.left + bar_w, bottom: top + bar_h };
+    if bar_h <= 0 {
+        return;
+    }
+    let bar_top = inner_top + (inner_bot - inner_top - bar_h) / 2;
+    let clip = CreateRoundRectRgn(
+        host.left, host.top, host.right, host.bottom, r * 2, r * 2,
+    );
+    let band = CreateRectRgn(host.left, bar_top, host.left + bar_w, bar_top + bar_h);
+    let _ = CombineRgn(Some(clip), Some(clip), Some(band), RGN_AND);
+    let _ = DeleteObject(band.into());
+
+    let saved = SaveDC(hdc);
+    let _ = SelectObject(hdc, clip.into());
     if sb.hollow {
         // 空心：只描边不填色。线宽太粗会盖满整个条，clamp 到条的短边以内。
         let stroke = (((sb.stroke as f32) * sc).round().max(1.0) as i32)
@@ -1607,13 +1617,23 @@ pub(crate) unsafe fn draw_sel_bar(app: &App, hdc: HDC, host: RECT, t: Theme) {
         let ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
         // GDI Rectangle 画的是 [left, right) —— +1 让可见宽正好 bar_w，
         // 与实心版同一口径。
-        let _ = Rectangle(hdc, r.left, r.top, r.right + 1, r.bottom + 1);
+        let _ = Rectangle(
+            hdc,
+            host.left,
+            bar_top,
+            host.left + bar_w + 1,
+            bar_top + bar_h + 1,
+        );
         let _ = SelectObject(hdc, ob);
         let _ = SelectObject(hdc, op);
         let _ = DeleteObject(p.into());
     } else {
-        fill_radius(app, hdc, "content.selected", &r, t.accent, None);
+        let br = CreateSolidBrush(t.accent);
+        let _ = FillRgn(hdc, clip, br);
+        let _ = DeleteObject(br.into());
     }
+    let _ = RestoreDC(hdc, saved);
+    let _ = DeleteObject(clip.into());
 }
 
 /// 文本绘制统一入口：内部完成 UTF-16 转换。
@@ -2970,13 +2990,23 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
                         g.tile_w,
                     )
                 }
-                // 行式布局的选中/悬停条**铺满整行**（与表头通长）。
-                // 早先截断在最后一列的右沿，表头通长、行只画到 700px 处就断 ——
-                // 看着就是"渲染不全"（用户截图反馈）。右侧超出列区那片的点击
-                // 判空白挪到 view_row_at（按 detail_cols 列区右沿），视觉与
-                // 命中解耦：画要铺满，点要分得清空白。
+                // 行式布局的高亮条右沿：**与表头分隔线同口径**。
+                //
+                // 详细列表：截止到最后一列（大小）右沿 = `detail_cols().size + size_w`
+                // —— 表头的竖分隔线也画在这里，行若越过它就会在表头右边空地上
+                // 多出一条"一整条"的横杠（用户截图反馈："渲染有变成一整条了"）。
+                // `view_row_at` 的空白判定用的正是同一个值，绘制与命中天然一致。
+                //
+                // 列表视图没有列分隔，整行就该整行可点可画（行式列表的语义）。
                 None => {
-                    (l.view.left, list_top + i as i32 * row_h - scroll, l.view.right - l.view.left)
+                    let w = if mode == fm_core::ViewMode::Details {
+                        let icon_size = (16.0 * app.metrics.scale) as i32;
+                        let cols = detail_cols(app, l, icon_size);
+                        ((cols.size + cols.size_w).min(l.view.right) - l.view.left).max(10)
+                    } else {
+                        l.view.right - l.view.left
+                    };
+                    (l.view.left, list_top + i as i32 * row_h - scroll, w)
                 }
             };
             if y > l.view.bottom || y + tile_h < list_top {

@@ -1631,6 +1631,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 if !hit && !ctrl && !shift {
                     app.tab_mut().selected.clear();
                 }
+                // **点空白要把焦点态一起撤掉**（与列表视图同一句）：磁贴的
+                // 高亮是 `sel || focused` 两条腿，只清 selected 的话焦点那一条
+                // 还撑着，选中看着"消不掉"（用户反馈：从磁盘退出到主页，
+                // 选中磁盘再点空白 = 高亮不消失）。
+                if !hit {
+                    app.focus_visible = false;
+                }
                 app.begin_drag(x, y, app::DragKind::Marquee, ctrl);
                 SetCapture(hwnd);
                 let _ = InvalidateRect(Some(hwnd), None, true);
