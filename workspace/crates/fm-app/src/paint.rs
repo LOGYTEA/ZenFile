@@ -229,6 +229,23 @@ pub const TAB_W: i32 = 180;
 
 /// 把整份布局平移 (dx, dy)。
 ///
+/// 设置页的「界面」预览要按真实窗口画一遍 —— 用 layout_sized 按预览的
+/// 宽高算一份真布局，再整体搬到预览矩形里，然后调用**和真窗口同一批绘制
+/// 函数**。于是预览和软件长得一模一样，不是因为画了两份像的。
+pub fn translate_layout(l: &mut Layout, dx: i32, dy: i32) {
+    for r in [
+        &mut l.title, &mut l.toolbar, &mut l.sidebar, &mut l.view, &mut l.status,
+        &mut l.back, &mut l.forward, &mut l.up, &mut l.address, &mut l.search,
+        &mut l.min_btn, &mut l.max_btn, &mut l.close_btn, &mut l.menu_btn,
+        &mut l.sidebar_toggle, &mut l.bulk_btn, &mut l.tabs,
+    ] {
+        r.left += dx;
+        r.top += dy;
+        r.right += dx;
+        r.bottom += dy;
+    }
+}
+
 pub fn compute_layout(w: i32, h: i32, m: &Metrics, sidebar: bool, status: bool) -> Layout {
     let title_h = m.title_h;
     let toolbar_h = m.toolbar_h;
@@ -1101,7 +1118,14 @@ fn draw_drag_image(
 
 /// 框选矩形（把起点/当前点规整成左上-右下）。
 pub fn marquee_rect(drag: &crate::app::Drag) -> RECT {
-    marquee_rect_from(drag.origin, drag.cur)
+    let (x0, y0) = drag.origin;
+    let (x1, y1) = drag.cur;
+    RECT {
+        left: x0.min(x1),
+        top: y0.min(y1),
+        right: x0.max(x1),
+        bottom: y0.max(y1),
+    }
 }
 
 /// 同上，但只吃两个 i32 坐标；让框选逻辑在持有 `&app::Drag` 借用的同时
@@ -2598,24 +2622,26 @@ fn paint_home(app: &mut App, hdc: HDC, l: &Layout) {
                 sr.bottom = bar.top - 2;
                 DrawTextW(hdc, &mut sub, &mut sr, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
 
-                // 容量条：轨道 + **已用**占比。
+                // 容量条：轨道 + **剩余**占比。
                 //
-                // 用户要的："蓝色区域展示的是已占用的内存"。文案维持"X 可用，共 Y"，
-                // 但条反过来填已用 —— 之前填可用、报"236 GB 可用"、条只到 36%，
-                // 看着像"条坏了"；现在报"已用 263 GB"读起来更直观。
-                //
-                // 精度：宽度走整数四舍五入 `(used*w + total/2)/total`；
-                // 之前用 f64 乘完截断，最多差 1px，条本身不长一眼就看出错位。
-                // 轨道画一圈 1px 描边；没描边时空盘看着像"条没画出来"。
+                // 两点精度要求：
+                // 1) 宽度一律走**整数四舍五入**（`(used*w + total/2)/total`）。
+                //    之前用 f64 乘完直接 `as i32` 截断，最多差 1px；条本身不长，
+                //    一眼能看出条和数字对不上。
+                // 2) 轨道画一圈 1px 描边。没有描边时，填充比例为 0 的盘看着像
+                //    "条没画出来"，很难判断是真的没空间还是渲染没生效。
                 let bg = CreateSolidBrush(t.surface_alt);
                 FillRect(hdc, &bar, bg);
                 let _ = DeleteObject(bg.into());
                 if let Some(d) = drive {
                     if let (Some(total), Some(free)) = (d.total, d.available) {
                         if total > 0 {
-                            let used = total.saturating_sub(free);
+                            // 条**填的是剩余空间**（不是已用）。旁边的文案写的是
+                            // "X 可用，共 Y"，条和数字口径一致才读得懂：以前按
+                            // 已用填，数字报"236 GB 可用"、条却只填到 36%，
+                            // 看着像"条坏了"。
                             let full = bar.right - bar.left;
-                            let w = ((used as u128 * full as u128 + (total as u128) / 2)
+                            let w = ((free as u128 * full as u128 + (total as u128) / 2)
                                 / total as u128) as i32;
                             if w > 0 && w <= full {
                                 let fill = RECT { right: bar.left + w, ..bar };
