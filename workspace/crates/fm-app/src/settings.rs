@@ -1317,12 +1317,55 @@ fn canvas_item_rects(app: &App, g: &Geom) -> Vec<(usize, RECT)> {
 /// round 25：死数据画 C:\Windows 详细列表预览。
 /// 上方顶 chrome（标题栏 26）+ 左侧侧栏（120）+ 中部列表（不可滚动）；
 /// 圆角渲染（按外观页"全局"圆角）。
-fn paint_preview_canvas(app: &App, hdc: HDC, r: &RECT, th: Theme, s: f32) {
-    let _ = app;
+/// 预览画布死数据行/侧栏项的图标来源。
+///
+/// 目录一律走**真实路径**（`dir_icon` → `SHGetFileInfoW`，红线：不带
+/// `SHGFI_USEFILEATTRIBUTES`，否则 desktop.ini 的自定义图标全丢）；
+/// 回收站、此电脑这类没有真实路径的系统对象才走库存图标。
+enum RowIcon<'a> {
+    Real { path: &'a str, drive: bool },
+    Stock(i32),
+}
+
+/// 取死数据行的图标（14px 小图标）。
+fn preview_row_icon(app: &mut App, src: &RowIcon<'_>) -> windows::Win32::UI::WindowsAndMessaging::HICON {
+    use windows::Win32::UI::WindowsAndMessaging::HICON;
+    use windows::Win32::UI::Shell::{SIID_DRIVEFIXED, SIID_FOLDER};
+    match *src {
+        RowIcon::Real { path, drive } => {
+            let p = std::path::Path::new(path);
+            if p.exists() {
+                app.icons.dir_icon(p, false)
+            } else {
+                // 死数据里的 D:\ 这台机器可能没有：盘符行给硬盘图标，其余给通用文件夹
+                crate::icons::stock_icon(
+                    if drive { SIID_DRIVEFIXED.0 } else { SIID_FOLDER.0 },
+                    false,
+                )
+                .unwrap_or_else(HICON::default)
+            }
+        }
+        RowIcon::Stock(s) => crate::icons::stock_icon(s, false).unwrap_or_else(HICON::default),
+    }
+}
+
+fn paint_preview_canvas(app: &mut App, hdc: HDC, r: &RECT, th: Theme, s: f32) {
     if r.right <= r.left || r.bottom <= r.top { return; }
     let px = |v: f32| (v * s).round() as i32;
     let w = r.right - r.left;
     let h = r.bottom - r.top;
+    // 死数据行对应的**真实路径**（图标按真实路径问 Shell，与真窗口同款）
+    let up = std::env::var("USERPROFILE").unwrap_or_default();
+    let p_profile = up.clone();
+    let p_desktop = format!("{}\\Desktop", up);
+    let p_downloads = format!("{}\\Downloads", up);
+    let p_docs = format!("{}\\Documents", up);
+    let p_pics = format!("{}\\Pictures", up);
+    let p_music = format!("{}\\Music", up);
+    let p_videos = format!("{}\\Videos", up);
+    let p_win = "C:\\Windows".to_string();
+    let p_c = "C:\\".to_string();
+    let p_d = "D:\\".to_string();
     unsafe {
         // 底板（surface）+ 圆角
         let bg = CreateSolidBrush(th.surface);
@@ -1402,10 +1445,26 @@ fn paint_preview_canvas(app: &App, hdc: HDC, r: &RECT, th: Theme, s: f32) {
         let oldf2 = SelectObject(hdc, font.into());
         let sfont_h = px(14.0);
         let mut sy = sidebar_r.top + px(8.0);
+        // 侧栏 8 项的图标（与真窗口一致：真实路径 + 此电脑库存图标）
+        let side_icons = [
+            RowIcon::Real { path: &p_profile, drive: false },
+            RowIcon::Real { path: &p_desktop, drive: false },
+            RowIcon::Real { path: &p_downloads, drive: false },
+            RowIcon::Real { path: &p_docs, drive: false },
+            RowIcon::Real { path: &p_pics, drive: false },
+            RowIcon::Real { path: &p_music, drive: false },
+            RowIcon::Real { path: &p_videos, drive: false },
+            RowIcon::Stock(windows::Win32::UI::Shell::SIID_DESKTOPPC.0),
+        ];
+        let isz = px(14.0);
         for (i, name) in ["主文件夹", "桌面", "下载", "文档", "图片", "音乐", "视频", "此电脑"].iter().enumerate() {
             set_color(hdc, if i == 7 { th.text } else { th.text_dim });
-            let sr2 = RECT { left: sidebar_r.left + px(6.0), top: sy, right: sidebar_r.right - px(4.0), bottom: sy + sfont_h + px(2.0) };
-            paint::draw_text(hdc, name, sr2, DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
+            let ih = preview_row_icon(app, &side_icons[i]);
+            if !ih.0.is_null() {
+                app.icons.draw(hdc, ih, sidebar_r.left + px(6.0), sy + (sfont_h + px(2.0) - isz) / 2, isz);
+            }
+            let sr2 = RECT { left: sidebar_r.left + px(6.0) + isz + px(5.0), top: sy, right: sidebar_r.right - px(4.0), bottom: sy + sfont_h + px(2.0) };
+            paint::draw_text(hdc, name, sr2, DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS);
             sy += sfont_h + px(8.0);
         }
         SelectObject(hdc, oldf2);
@@ -1431,29 +1490,43 @@ fn paint_preview_canvas(app: &App, hdc: HDC, r: &RECT, th: Theme, s: f32) {
             paint::draw_text(hdc, label, lr, DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS);
             hx += w;
         }
-        // 死数据 11 行
-        let rows = [
-            ("文件夹", "2026/09/03 14:22", "文件夹", ""),
-            ("主文件夹", "2026/09/03 14:22", "文件夹", ""),
-            ("桌面", "2026/09/03 14:22", "文件夹", ""),
-            ("下载", "2026/09/03 14:22", "文件夹", ""),
-            ("文档", "2026/09/03 14:22", "文件夹", ""),
-            ("图片", "2026/09/03 14:22", "文件夹", ""),
-            ("音乐", "2026/09/03 14:22", "文件夹", ""),
-            ("视频", "2026/09/03 14:22", "文件夹", ""),
-            ("本地磁盘 (C:)", "2026/09/03 14:22", "本地磁盘", "221 GB / 369 GB"),
-            ("本地磁盘 (D:)", "2026/09/03 14:22", "本地磁盘", "393 GB / 954 GB"),
-            ("回收站", "2026/09/03 14:22", "系统文件夹", ""),
+        // 死数据 11 行（第 5 项 = 图标来源，真实路径直问 Shell）
+        let rows: [(&str, &str, &str, &str, RowIcon); 11] = [
+            ("文件夹", "2026/09/03 14:22", "文件夹", "", RowIcon::Real { path: &p_win, drive: false }),
+            ("主文件夹", "2026/09/03 14:22", "文件夹", "", RowIcon::Real { path: &p_profile, drive: false }),
+            ("桌面", "2026/09/03 14:22", "文件夹", "", RowIcon::Real { path: &p_desktop, drive: false }),
+            ("下载", "2026/09/03 14:22", "文件夹", "", RowIcon::Real { path: &p_downloads, drive: false }),
+            ("文档", "2026/09/03 14:22", "文件夹", "", RowIcon::Real { path: &p_docs, drive: false }),
+            ("图片", "2026/09/03 14:22", "文件夹", "", RowIcon::Real { path: &p_pics, drive: false }),
+            ("音乐", "2026/09/03 14:22", "文件夹", "", RowIcon::Real { path: &p_music, drive: false }),
+            ("视频", "2026/09/03 14:22", "文件夹", "", RowIcon::Real { path: &p_videos, drive: false }),
+            ("本地磁盘 (C:)", "2026/09/03 14:22", "本地磁盘", "221 GB / 369 GB", RowIcon::Real { path: &p_c, drive: true }),
+            ("本地磁盘 (D:)", "2026/09/03 14:22", "本地磁盘", "393 GB / 954 GB", RowIcon::Real { path: &p_d, drive: true }),
+            ("回收站", "2026/09/03 14:22", "系统文件夹", "", RowIcon::Stock(
+                if app.recycle_items.is_empty() {
+                    windows::Win32::UI::Shell::SIID_RECYCLER.0
+                } else {
+                    windows::Win32::UI::Shell::SIID_RECYCLERFULL.0
+                })),
         ];
         let row_h = px(18.0);
         let mut ry = header_r.bottom + px(2.0);
         for row in &rows {
             if ry + row_h > view_r.bottom { break; }
             set_color(hdc, th.text);
-            let mut cx = view_r.left + px(8.0);
+            // 名称列：图标 14px 顶着列头"名称"的左缘画，文字缩进到图标右边
+            //（列头不缩进 —— 资源管理器里列头文字与行图标左对齐）
+            let isz = px(14.0);
+            let ix = view_r.left + px(8.0);
+            let ih = preview_row_icon(app, &row.4);
+            if !ih.0.is_null() {
+                app.icons.draw(hdc, ih, ix, ry + (row_h - isz) / 2, isz);
+            }
+            let mut cx = ix;
             for (i, txt) in [row.0, row.1, row.2, row.3].iter().enumerate() {
                 let cw = [col_name_w, col_date_w, col_kind_w, col_size_w][i];
-                let lr = RECT { left: cx, top: ry, right: cx + cw - px(8.0), bottom: ry + row_h };
+                let tx0 = if i == 0 { ix + isz + px(6.0) } else { cx };
+                let lr = RECT { left: tx0, top: ry, right: cx + cw - px(8.0), bottom: ry + row_h };
                 paint::draw_text(hdc, txt, lr, DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS);
                 cx += cw;
             }
