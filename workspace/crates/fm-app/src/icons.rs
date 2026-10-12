@@ -17,8 +17,8 @@ use windows::core::HSTRING;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Gdi::{
     AlphaBlend, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush, DeleteDC,
-    DeleteObject, FillRect, GetObjectW, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION,
-    BITMAP, HBITMAP, HDC,
+    DeleteObject, FillRect, GetObjectW, SelectObject, SetBrushOrgEx, SetStretchBltMode,
+    AC_SRC_ALPHA, AC_SRC_OVER, BITMAP, BLENDFUNCTION, HBITMAP, HDC, HALFTONE,
 };
 use windows::Win32::Foundation::COLORREF;
 use windows::Win32::Storage::FileSystem::{
@@ -305,6 +305,10 @@ impl IconCache {
                 return false;
             }
             let old = SelectObject(mem, bmp.into());
+            // 大图标是 96px，原图常是 1920×1080：默认 BLACKONWHITE 拉伸倍数大
+            // 锯齿非常重。HALFTONE + SetBrushOrgEx 才能让缩出来像样。
+            let _ = SetStretchBltMode(hdc, HALFTONE);
+            let _ = SetBrushOrgEx(hdc, 0, 0, None);
             let mut bf: BLENDFUNCTION = std::mem::zeroed();
             bf.BlendOp = AC_SRC_OVER as u8;
             bf.SourceConstantAlpha = 255;
@@ -376,6 +380,10 @@ impl IconCache {
             return;
         }
         unsafe {
+            // 32×32 拉到大图标 96px：默认 BLACKONWHITE 锯齿很重。DrawIconEx 走
+            // StretchBlt，stretch mode 设到 HALFTONE 才生效。
+            let _ = SetStretchBltMode(hdc, HALFTONE);
+            let _ = SetBrushOrgEx(hdc, 0, 0, None);
             // DI_NORMAL：用图标自带的遮罩绘制，边角保持透明
             let _ = DrawIconEx(hdc, x, y, icon, size, size, 0, None, DI_NORMAL);
         }
@@ -405,6 +413,10 @@ impl IconCache {
             let r = RECT { left: 0, top: 0, right: size, bottom: size };
             FillRect(mem, &r, b);
             let _ = DeleteObject(b.into());
+            // 32×32 HICON 拉到 96px：默认 BLACKONWHITE 边缘会糊。
+            // DrawIconEx 走 StretchBlt，stretch mode 设了才生效。
+            let _ = SetStretchBltMode(mem, HALFTONE);
+            let _ = SetBrushOrgEx(mem, 0, 0, None);
             let _ = DrawIconEx(mem, 0, 0, icon, size, size, 0, None, DI_NORMAL);
 
             let mut bf: BLENDFUNCTION = std::mem::zeroed();

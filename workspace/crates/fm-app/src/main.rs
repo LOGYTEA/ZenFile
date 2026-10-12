@@ -972,7 +972,21 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             // 必须排在别的命中之前 —— 拖拽期间不该改变选中集。
             if app.drag.is_some() {
                 let ctrl_now = (wparam.0 & 0x0008) != 0 || GetKeyState(0x11) < 0;
+                let was_active = app.drag.as_ref().map(|d| d.active).unwrap_or(false);
                 app.update_drag(x, y, ctrl_now);
+                // 框选要**边拖边更新选中集**：不更新用户拖到哪条都没反应，
+                // 松开才一次性全亮（资源管理器是每帧都更新）。只对 Marquee
+                // 调 select_marquee（Items 拖的是条目，不该改选中）。
+                // 必须 drag.active 已置位之后才算（4px 阈值内还在按，没真拖）。
+                if let Some(d) = app.drag.as_ref() {
+                    if d.active && matches!(d.kind, app::DragKind::Marquee) {
+                        // 把 d 的不可变借用放掉再调（select_marquee 要 &mut App）。
+                        // 只需要 origin/cur 两个 i32，clone 一下比整体 clone Drag 轻。
+                        let origin = d.origin;
+                        let cur = d.cur;
+                        select_marquee_into(app, &l, origin, cur);
+                    }
+                }
                 let target = drop_target_at(app, &l, x, y);
                 // 拖着文件悬在某个标签上：记下"从第几毫秒开始悬着"，
                 // 满 600ms 由 WM_TIMER 自动把那个标签翻出来（资源管理器同款）。
@@ -1962,7 +1976,18 @@ fn view_row_at(app: &App, l: &paint::Layout, x: i32, y: i32, view_top: i32) -> O
         let g = paint::icon_grid(l, &app.metrics, mode);
         paint::grid_hit(&g, l, x, y, view_top, tab.scroll, tab.visible.len())
     } else {
-        app.row_hit(y, view_top, l.view.bottom - view_top)
+        let row = app.row_hit(y, view_top, l.view.bottom - view_top)?;
+        // 详细信息/列表视图：右侧空白处不应当成"命中行"。
+        // 之前是 row_hit 只看 y、x 一路放行，于是"大小"那列右边的整片空白点上去
+        // 都算选中该行（用户截图反馈的就是这个）。
+        // item_rect 返回的 right 才是绘制时这一行实际占的右沿 —— 跟绘制共用一份
+        // 几何，改一次不至于错位。Details 视图会按"最后一列结束处"截断；List
+        // 视图 item_rect 仍然铺到 l.view.right（行式列表就该整行可点）。
+        let r = paint::item_rect(app, l, row, view_top);
+        if mode == fm_core::ViewMode::Details && x >= r.right {
+            return None;
+        }
+        Some(row)
     }
 }
 
@@ -2244,8 +2269,15 @@ fn finish_drag(app: &mut App, l: &paint::Layout, x: i32, y: i32) {
 /// 三种布局的"条目矩形"算法完全不同（列表行 / 网格磁贴 / 首页磁贴），
 /// 回收站更是另一套（按下标 + id 选中）。四个分支各自用自己的几何，
 /// 绝不拿列表那套去套首页 —— 那正是"框选在首页/回收站不生效"的根因。
+///
+/// 既给松手时 `end_drag` 用，也给框选过程中 `WM_MOUSEMOVE` 实时调用：
+/// 用户拖着框走的每一步都要能看到哪些条目被命中，松手才看到就是"卡了"。
 fn select_marquee(app: &mut App, l: &paint::Layout, drag: &app::Drag) {
-    let r = paint::marquee_rect(drag);
+    select_marquee_into(app, l, drag.origin, drag.cur);
+}
+
+fn select_marquee_into(app: &mut App, l: &paint::Layout, origin: (i32, i32), cur: (i32, i32)) {
+    let r = paint::marquee_rect_from(origin, cur);
     let hits = |a: &RECT, b: &RECT| a.right > b.left && a.left < b.right && a.bottom > b.top && a.top < b.bottom;
 
     if app.tab().recycle {
