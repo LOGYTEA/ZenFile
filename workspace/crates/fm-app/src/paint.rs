@@ -2924,6 +2924,11 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
             });
             // 超过 32px 才值得问 Shell 要缩略图：小于等于 32 时 HICON 本身就是
             // 原尺寸，再要一张图纯属浪费（而且每张缩略图要占 size²×4 字节）。
+            //
+            // **目录也走 thumb**：文件夹的"内容图案"（download 里的 ISO 光盘、
+            // games 里的齿轮…）只有 IShellItemImageFactory 的 THUMBNAILONLY 给，
+            // 资源管理器显示的就是它 —— 禁掉目录 thumb 会丢图案，颜色观感和
+            // Explorer 对不上（用户反馈）。质量由 draw_thumb 的重采样负责。
             icon_thumbs.push(if icon_size > 32 {
                 app.icons.thumb(&path, icon_size)
             } else {

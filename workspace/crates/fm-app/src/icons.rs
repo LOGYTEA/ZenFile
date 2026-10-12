@@ -270,6 +270,41 @@ impl IconCache {
         if s.is_empty() {
             return None;
         }
+        // 大图标走 `SHDefExtractIcon`：与资源管理器**同源** —— 会按
+        // desktop.ini 的 IconResource / 文件夹类型默认取图标（Win10 黄色
+        // 默认款），且给的是放大尺寸。SHGFI_LARGEICON 只有 32px，放大发虚；
+        // 而 IShellItemImageFactory 那条 thumb 路给文件夹的是另一套浅蓝
+        // "通用文件夹"图标，颜色和 Explorer 对不上（用户反馈）。
+        if large {
+            unsafe {
+                use windows::core::PCWSTR;
+                use windows::Win32::UI::Shell::SHDefExtractIconW;
+                let w = wide(&s);
+                let mut hl = HICON::default();
+                let mut hs = HICON::default();
+                let got = SHDefExtractIconW(
+                    PCWSTR(w.as_ptr()),
+                    0,
+                    0,
+                    Some(&mut hl as *mut _),
+                    Some(&mut hs as *mut _),
+                    96,
+                );
+                if got.is_ok() && !hl.0.is_null() {
+                    if !hs.0.is_null() {
+                        let _ = DestroyIcon(hs);
+                    }
+                    return Some(hl);
+                }
+                // 失败的半成品句柄都要收掉
+                if !hl.0.is_null() {
+                    let _ = DestroyIcon(hl);
+                }
+                if !hs.0.is_null() {
+                    let _ = DestroyIcon(hs);
+                }
+            }
+        }
         let flags = SHGFI_ICON
             | if large {
                 SHGFI_LARGEICON
@@ -545,13 +580,20 @@ fn shell_thumb(path: &Path, size: i32) -> Option<HBITMAP> {
         IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_ICONONLY,
         SIIGBF_RESIZETOFIT, SIIGBF_THUMBNAILONLY,
     };
-    let s = path.to_string_lossy();
+    // **路径归一化成反斜杠**：SHCreateItemFromParsingName 对正斜杠盘符路径
+    // （"E:/download"，从启动参数/面包屑传进来时很常见）直接失败 → thumb
+    // 返回 None → 文件夹的内容图案（download 的 ISO 光盘、games 的齿轮…）
+    // 整个丢失，只剩纯蓝图标，和资源管理器对不上（用户反馈"颜色完全对不上"）。
+    let s = path.to_string_lossy().replace('/', "\\");
     if s.is_empty() || size <= 0 {
         return None;
     }
     unsafe {
         let factory: IShellItemImageFactory =
-            SHCreateItemFromParsingName(&HSTRING::from(s.as_ref()), None).ok()?;
+            match SHCreateItemFromParsingName(&HSTRING::from(s.as_str()), None) {
+                Ok(f) => f,
+                Err(_) => return None,
+            };
         let want = SIZE { cx: size, cy: size };
         // 先要真缩略图；Shell 说"这个类型没有缩略图"时再退成大号图标。
         // 两条路都不加 SIIGBF_SCALEUP：宁可 32×32 清晰，也不要把小图放大糊掉。
