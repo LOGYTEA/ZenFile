@@ -55,7 +55,11 @@ pub struct IconCache {
     /// 大图标视图用的**真实缩略图**（HBITMAP，来自 IShellItemImageFactory）。
     ///
     /// key = "尺寸:小写路径"。值同样是 Option：`None` = 问过但没拿到，别每帧重试。
-    thumbs: HashMap<String, Option<HBITMAP>>,
+    /// 缩略图缓存：值 = (位图, 询问时刻)。
+    /// `None` 位图只记 **2 秒**（thumb() 按 elapsed 判定）—— 旧的"失败永久
+    /// 缓存"让一次偶发失败（目录刚创建 / Shell 忙 / 慢盘首问）把该图标
+    /// 整个会话都钉在 32px HICON 拉 96 的糊锯齿上（第30轮实锤）。
+    thumbs: HashMap<String, (Option<HBITMAP>, std::time::Instant)>,
     /// **具体**目录 / 驱动器根 / 需逐文件取图标的文件的图标：
     /// key = "L:<小写路径>" / "S:<小写路径>"。
     /// 值是 Option：`None` 表示"已经问过 Shell，但没拿到"，避免每帧重绘都对每个
@@ -218,7 +222,8 @@ impl IconCache {
     /// 按真实路径向 Shell 取图标（目录、驱动器根、exe/lnk 等共用这一条路）。
     fn path_icon(&mut self, path: &Path, large: bool) -> Option<HICON> {
         let prefix = if large { "L:" } else { "S:" };
-        let norm = path.to_string_lossy().to_lowercase();
+        // 归一化进 key：`E:/x` 与 `E:\x` 是同一个目录，别各存一份 HICON
+        let norm = path.to_string_lossy().replace('/', "\\").to_lowercase();
         let dkey = format!("{prefix}{norm}");
         // 先拷出来再可变借用自己，否则撞 borrow checker
         let cached: Option<Option<HICON>> = self.dir.get(&dkey).copied();
@@ -238,14 +243,16 @@ impl IconCache {
     /// 靠的是 Shell 读 `desktop.ini` 里的 `LocalizedResourceName`。这里走同一条路，
     /// 不用自己解析 ini（系统那份是 UTF-16LE 带 BOM，自己解必错）。
     pub fn display_name(path: &Path) -> Option<String> {
-        let s = path.to_string_lossy();
+        // 正斜杠入口（地址栏/启动参数）会让 SHGetFileInfoW 返回 0，
+        // 与 shell_thumb 同一道归一化（第30轮日志实锤）。
+        let s = path.to_string_lossy().replace('/', "\\");
         if s.is_empty() {
             return None;
         }
         let mut sfi = SHFILEINFOW::default();
         let res = unsafe {
             SHGetFileInfoW(
-                &HSTRING::from(s.as_ref()),
+                &HSTRING::from(s.as_str()),
                 FILE_ATTRIBUTE_DIRECTORY,
                 Some(&mut sfi),
                 std::mem::size_of::<SHFILEINFOW>() as u32,
@@ -265,8 +272,57 @@ impl IconCache {
     }
 
     /// 向 Shell 查询某个真实目录的图标；拿不到返回 None（调用方回退通用图标）。
+    /// 系统 JUMBO 图像列表（256px）里该路径的原生图标。
+    ///
+    /// `SHDefExtractIcon` 对文件夹恒 E_FAIL、`SHGFI_LARGEICON` 只有 32px
+    /// （放大到 96 = 糊锯齿）。JUMBO 列表就是资源管理器画大图标用的那张表：
+    /// `SHGFI_SYSICONINDEX` 拿系统图像列表索引 → 同一索引到 JUMBO 表取原生
+    /// 256px，然后走现有的"缩小 box 平均"管线降到 96 —— 源够大，边缘就锐。
+    /// 任何一步失败返回 None，自然落到 SHGFI 32px 兜底。
+    fn shell_jumbo_icon(s: &str) -> Option<HICON> {
+        use windows::Win32::UI::Controls::{IImageList, ILD_IMAGE, ILD_TRANSPARENT};
+        use windows::Win32::UI::Shell::{SHGetImageList, SHGFI_SYSICONINDEX, SHIL_JUMBO};
+        if s.is_empty() {
+            return None;
+        }
+        unsafe {
+            let mut sfi = SHFILEINFOW::default();
+            let res = SHGetFileInfoW(
+                &HSTRING::from(s),
+                FILE_ATTRIBUTE_DIRECTORY,
+                Some(&mut sfi),
+                std::mem::size_of::<SHFILEINFOW>() as u32,
+                SHGFI_SYSICONINDEX,
+            );
+            if res == 0 || sfi.iIcon < 0 {
+                return None;
+            }
+            let list: IImageList = match SHGetImageList(SHIL_JUMBO as i32) {
+                Ok(l) => l,
+                Err(e) => {
+                    return None;
+                }
+            };
+            let h = match list.GetIcon(sfi.iIcon, ILD_TRANSPARENT.0 | ILD_IMAGE.0) {
+                Ok(h) => h,
+                Err(e) => {
+                    return None;
+                }
+            };
+            if h.0.is_null() {
+                None
+            } else {
+                Some(h)
+            }
+        }
+    }
+
     fn shell_path_icon(&mut self, path: &Path, large: bool) -> Option<HICON> {
-        let s = path.to_string_lossy();
+        // 正斜杠归一化（地址栏 / 启动参数 / 单实例转发都可能传 `E:/x`）：
+        // SHGetFileInfoW 对正斜杠路径 res=0 直接失败，图标链会整体退到
+        // 32px 通用款再拉 96 —— 就是用户看到的糊锯齿（第30轮日志实锤：
+        // `jumbo(E:/download): shgfi fail res=0`，而 thumb 链第28轮就修了）。
+        let s = path.to_string_lossy().replace('/', "\\");
         if s.is_empty() {
             return None;
         }
@@ -303,6 +359,13 @@ impl IconCache {
                 if !hs.0.is_null() {
                     let _ = DestroyIcon(hs);
                 }
+                // SHDefExtractIcon 对**文件夹**恒 E_FAIL（第28轮实锤）；
+                // 退而求其次走系统 JUMBO 图像列表（256px，资源管理器画
+                // 大图标用的同一张表）—— 再不行才落 SHGFI 的 32px，
+                // 因为 32 拉到 96 就是用户截图里那种糊锯齿（第30轮复现实锤）。
+                if let Some(h) = Self::shell_jumbo_icon(&s) {
+                    return Some(h);
+                }
             }
         }
         let flags = SHGFI_ICON
@@ -314,7 +377,7 @@ impl IconCache {
         let mut sfi = SHFILEINFOW::default();
         let res = unsafe {
             SHGetFileInfoW(
-                &HSTRING::from(s.as_ref()),
+                &HSTRING::from(s.as_str()),
                 FILE_ATTRIBUTE_DIRECTORY,
                 Some(&mut sfi),
                 std::mem::size_of::<SHFILEINFOW>() as u32,
@@ -334,16 +397,29 @@ impl IconCache {
     /// 器对不上。资源管理器走的其实是 `IShellItemImageFactory`（图片/视频给真缩略
     /// 图，其余给 256×256 的图标），这里跟同一条路。
     pub fn thumb(&mut self, path: &Path, size: i32) -> Option<HBITMAP> {
+        // 诊断开关：ZENFILE_NO_THUMB=1 强制全部走 HICON 回退路径，
+        // 用于复现"thumb 失败时"的图标质量（第30轮锯齿诊断，定位后删）。
+        if std::env::var_os("ZENFILE_NO_THUMB").is_some() {
+            return None;
+        }
         let key = format!("{size}:{}", path.to_string_lossy().to_lowercase());
-        if let Some(v) = self.thumbs.get(&key) {
-            return *v;
+        // 命中：成功位图直接用；失败条目 2 秒内当"还在失败"，过期则删掉重问
+        // （否则一次偶发失败会把该图标整个会话钉在 32px 拉 96 的糊上）。
+        let expired = match self.thumbs.get(&key) {
+            Some((Some(b), _)) => return Some(*b),
+            Some((None, t)) if t.elapsed() < std::time::Duration::from_secs(2) => return None,
+            Some((None, _)) => true,
+            None => false,
+        };
+        if expired {
+            self.thumbs.remove(&key);
         }
         let v = shell_thumb(path, size);
         // 缩略图一张就是 size×size×4 字节，别让它无限长：过界整表重建。
         if self.thumbs.len() >= THUMB_CACHE_MAX {
             self.clear_thumbs();
         }
-        self.thumbs.insert(key, v);
+        self.thumbs.insert(key, (v, std::time::Instant::now()));
         v
     }
 
@@ -426,7 +502,7 @@ impl IconCache {
 
     /// 清掉缩略图缓存。与 `clear_path_icons` 同一时机调用。
     fn clear_thumbs(&mut self) {
-        for (_, b) in self.thumbs.drain() {
+        for (_, (b, _)) in self.thumbs.drain() {
             if let Some(b) = b {
                 if !b.is_invalid() {
                     unsafe {
