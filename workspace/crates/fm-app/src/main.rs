@@ -943,13 +943,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         WM_MOUSEMOVE => {
             let app = &mut *app_ptr;
             let (x, y) = client_xy(hwnd, lparam);
-            let l = paint::compute_layout(
-                app.last_size.0,
-                app.last_size.1,
-                &app.metrics,
-                app.cfg.ui.sidebar_visible,
-                app.cfg.ui.statusbar_visible,
-            );
+            let l = paint::layout_for(app);
             // 设置页排布编辑器：正在拖卡片，只更新位置并重画，别的命中一概不理。
             if app.tab().settings && app.settings_drag.is_some() {
                 if app.settings_radius_drag {
@@ -1207,13 +1201,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         WM_NCMOUSEMOVE => {
             let app = &mut *app_ptr;
             let (x, y) = screen_xy(hwnd, lparam);
-            let l = paint::compute_layout(
-                app.last_size.0,
-                app.last_size.1,
-                &app.metrics,
-                app.cfg.ui.sidebar_visible,
-                app.cfg.ui.statusbar_visible,
-            );
+            let l = paint::layout_for(app);
             let h = caption_hit(&l, x, y);
             if h != app.hover_caption {
                 app.hover_caption = h;
@@ -1225,13 +1213,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         WM_NCLBUTTONDOWN => {
             let app = &mut *app_ptr;
             let (x, y) = screen_xy(hwnd, lparam);
-            let l = paint::compute_layout(
-                app.last_size.0,
-                app.last_size.1,
-                &app.metrics,
-                app.cfg.ui.sidebar_visible,
-                app.cfg.ui.statusbar_visible,
-            );
+            let l = paint::layout_for(app);
             let hit = caption_hit(&l, x, y);
             // 没落在三大金刚键上就是 HTCAPTION（标题栏空白处）。**必须交回
             // DefWindowProc**：拖窗口的模态循环是系统在这条消息里启动的，我们
@@ -1246,13 +1228,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         WM_NCLBUTTONUP => {
             let app = &mut *app_ptr;
             let (x, y) = screen_xy(hwnd, lparam);
-            let l = paint::compute_layout(
-                app.last_size.0,
-                app.last_size.1,
-                &app.metrics,
-                app.cfg.ui.sidebar_visible,
-                app.cfg.ui.statusbar_visible,
-            );
+            let l = paint::layout_for(app);
             let hit = caption_hit(&l, x, y);
             // 按下和抬起必须在同一个键上，否则拖出去再松手也会触发动作
             let which = if hit != 0 && hit == app.pressed_caption { hit } else { 0 };
@@ -1267,13 +1243,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         WM_NCLBUTTONDBLCLK => {
             let app = &mut *app_ptr;
             let (x, y) = screen_xy(hwnd, lparam);
-            let l = paint::compute_layout(
-                app.last_size.0,
-                app.last_size.1,
-                &app.metrics,
-                app.cfg.ui.sidebar_visible,
-                app.cfg.ui.statusbar_visible,
-            );
+            let l = paint::layout_for(app);
             let hit = caption_hit(&l, x, y);
             if hit != 0 {
                 run_caption(hwnd, hit);
@@ -1286,13 +1256,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         WM_LBUTTONDOWN => {
             let app = &mut *app_ptr;
             let (x, y) = client_xy(hwnd, lparam);
-            let l = paint::compute_layout(
-                app.last_size.0,
-                app.last_size.1,
-                &app.metrics,
-                app.cfg.ui.sidebar_visible,
-                app.cfg.ui.statusbar_visible,
-            );
+            let l = paint::layout_for(app);
             // 分栏时"点哪一边哪一边就是当前窗格"。必须在任何命中测试之前做：
             // 下面所有分支读的都是 app.tab()，也就是**焦点窗格**的那个标签。
             if app.split() {
@@ -1627,13 +1591,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 let app = &mut *app_ptr;
                 if app.settings_drag.is_some() {
                     let _ = ReleaseCapture();
-                    let l = paint::compute_layout(
-                        app.last_size.0,
-                        app.last_size.1,
-                        &app.metrics,
-                        app.cfg.ui.sidebar_visible,
-                        app.cfg.ui.statusbar_visible,
-                    );
+                    let l = paint::layout_for(app);
                     settings::finish_drag(app, &l, x, y);
                     let _ = InvalidateRect(Some(hwnd), None, true);
                     return LRESULT(0);
@@ -1644,13 +1602,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 let app = &mut *app_ptr;
                 if app.drag.is_some() {
                     let _ = ReleaseCapture();
-                    let l = paint::compute_layout(
-                        app.last_size.0,
-                        app.last_size.1,
-                        &app.metrics,
-                        app.cfg.ui.sidebar_visible,
-                        app.cfg.ui.statusbar_visible,
-                    );
+                    let l = paint::layout_for(app);
                     finish_drag(app, &l, x, y);
                     let _ = InvalidateRect(Some(hwnd), None, true);
                     return LRESULT(0);
@@ -1672,18 +1624,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             }
             let (l, plus) = {
                 let app = &*app_ptr;
-                let l = paint::compute_layout(
-                    app.last_size.0,
-                    app.last_size.1,
-                    &app.metrics,
-                    app.cfg.ui.sidebar_visible,
-                    app.cfg.ui.statusbar_visible,
-                );
+                let l = paint::layout_for(app);
                 let plus = l.new_tab_rect(app.tab_count(), &app.metrics);
                 (l, plus)
             };
             if y < l.title.bottom {
-                if plus.right < l.tabs.right && inside(&plus, x, y) {
+                if l.new_tab_visible && plus.right < l.tabs.right && inside(&plus, x, y) {
                     let app = &mut *app_ptr;
                     app.new_tab();
                     paint::sync_address(app);
@@ -1711,13 +1657,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             // 鼠标中键：点标签 = 关闭该标签（资源管理器/浏览器的通用约定）
             let app = &mut *app_ptr;
             let (x, y) = client_xy(hwnd, lparam);
-            let l = paint::compute_layout(
-                app.last_size.0,
-                app.last_size.1,
-                &app.metrics,
-                app.cfg.ui.sidebar_visible,
-                app.cfg.ui.statusbar_visible,
-            );
+            let l = paint::layout_for(app);
             if let Some(i) = hit_tab(app, &l, x, y) {
                 app.close_tab(i);
                 app.hover_tab = None;
@@ -1729,13 +1669,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         WM_LBUTTONDBLCLK => {
             let app = &mut *app_ptr;
             let (x, y) = client_xy(hwnd, lparam);
-            let l = paint::compute_layout(
-                app.last_size.0,
-                app.last_size.1,
-                &app.metrics,
-                app.cfg.ui.sidebar_visible,
-                app.cfg.ui.statusbar_visible,
-            );
+            let l = paint::layout_for(app);
             if y < l.title.bottom {
                 // 双击标签栏空白处 = 新建标签（同资源管理器）；
                 // 双击标签本身 = 最大化/还原。绝不能在这里关标签 —— 双击是"打开"手势，
@@ -1813,13 +1747,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 return LRESULT(0);
             }
             let (x, y) = client_xy(hwnd, lparam);
-            let l = paint::compute_layout(
-                app.last_size.0,
-                app.last_size.1,
-                &app.metrics,
-                app.cfg.ui.sidebar_visible,
-                app.cfg.ui.statusbar_visible,
-            );
+            let l = paint::layout_for(app);
             let header_h = header_height(app);
             let view_top = l.view.top + header_h;
 
@@ -1904,13 +1832,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         WM_MOUSEWHEEL => {
             let app = &mut *app_ptr;
             let delta = (wparam.0 >> 16) as i16 as i32;
-            let l = paint::compute_layout(
-                app.last_size.0,
-                app.last_size.1,
-                &app.metrics,
-                app.cfg.ui.sidebar_visible,
-                app.cfg.ui.statusbar_visible,
-            );
+            let l = paint::layout_for(app);
             // 光标在导航窗格里时滚轮滚的是**树**，不是右边的文件列表 ——
             // 否则展开几层之后树就再也滚不出来了。
             let mut pt = windows::Win32::Foundation::POINT {
@@ -2705,13 +2627,7 @@ fn over_text_input(app: &App, hwnd: HWND) -> bool {
         return false;
     }
     let _ = unsafe { ScreenToClient(hwnd, &mut pt) };
-    let l = paint::compute_layout(
-        app.last_size.0,
-        app.last_size.1,
-        &app.metrics,
-        app.cfg.ui.sidebar_visible,
-        app.cfg.ui.statusbar_visible,
-    );
+    let l = paint::layout_for(app);
     // 编辑态下地址栏里已经是一个真 EDIT，父窗口不该再抢它的光标
     (!app.addr_editing && inside(&l.address, pt.x, pt.y)) || inside(&l.search, pt.x, pt.y)
 }
@@ -2742,7 +2658,7 @@ unsafe fn handle_hit_test(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     };
     let _ = ScreenToClient(hwnd, &mut pt);
     let (w, h) = app.last_size;
-    let l = paint::compute_layout(w, h, &app.metrics, app.cfg.ui.sidebar_visible, app.cfg.ui.statusbar_visible);
+    let l = paint::layout_for(app);
     let border = (4.0 * app.metrics.scale).round() as i32;
     let plus = l.new_tab_rect(app.tab_count(), &app.metrics);
     // 分栏之后窗口顶部那条标签栏是空的（每条标签归各自的窗格画），
@@ -2864,13 +2780,7 @@ fn header_click(app: &mut App, l: &paint::Layout, x: i32) {
 }
 
 fn sidebar_click(app: &mut App, x: i32, y: i32) -> bool {
-    let l = paint::compute_layout(
-        app.last_size.0,
-        app.last_size.1,
-        &app.metrics,
-        app.cfg.ui.sidebar_visible,
-        app.cfg.ui.statusbar_visible,
-    );
+    let l = paint::layout_for(app);
     // 命中判定复用绘制端那一份排列（`App::sidebar_rows`），不在这里重算 ——
     // 树会展开/收起，本地再算一遍必然和画出来的行错位。
     let hit = paint::sidebar_hit(app, &l, x, y, app.metrics.scale);
@@ -2900,13 +2810,7 @@ fn sidebar_click(app: &mut App, x: i32, y: i32) -> bool {
 /// 单击只导航（见 `sidebar_click`），双击才动树 —— 这是资源管理器的导航窗格语义：
 /// "点一下是进去看看，双击是把它摊开"。混在一起的话想进个目录就顺带把树撑开。
 fn sidebar_dblclick(app: &mut App, x: i32, y: i32) -> bool {
-    let l = paint::compute_layout(
-        app.last_size.0,
-        app.last_size.1,
-        &app.metrics,
-        app.cfg.ui.sidebar_visible,
-        app.cfg.ui.statusbar_visible,
-    );
+    let l = paint::layout_for(app);
     let Some((index, _)) = paint::sidebar_hit(app, &l, x, y, app.metrics.scale) else {
         return false;
     };

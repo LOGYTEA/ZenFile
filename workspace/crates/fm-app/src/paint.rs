@@ -221,6 +221,8 @@ pub struct Layout {
     /// 右键菜单里不再放这一项 —— 右键菜单要留给"对选中项做什么"的高频动作。
     pub bulk_btn: RECT,
     pub tabs: RECT,
+    /// 标签条右端那个「+」此刻是否显示（「界面」页可以把它收进「更多」）。
+    pub new_tab_visible: bool,
 }
 
 pub const TAB_W: i32 = 180;
@@ -282,6 +284,173 @@ pub fn compute_layout(w: i32, h: i32, m: &Metrics, sidebar: bool, status: bool) 
         min_btn: RECT { left: w - btn_w * 3, top: 0, right: w - btn_w * 2, bottom: title_h },
         max_btn: RECT { left: w - btn_w * 2, top: 0, right: w - btn_w, bottom: title_h },
         close_btn: RECT { left: w - btn_w, top: 0, right: w, bottom: title_h },
+        new_tab_visible: true,
+    }
+}
+
+/// 真窗口的布局入口：先按尺寸算一份，再套用「界面」页那三条带的排布。
+///
+/// 之前 `ui_settings.bars` 只有设置页自己在读 —— 用户在编排页里把组件拖来拖去、
+/// 拖进拖出「更多」，真窗口一个像素都不动，整页等于空壳。现在**布局和命中都从
+/// 这里走**，于是"挪位置 / 收起来 / 放回来"立刻在真窗口上生效。
+pub fn layout_for(app: &App) -> Layout {
+    layout_sized(app, app.last_size.0, app.last_size.1)
+}
+
+/// 同上，但尺寸由调用方给（ 拿到的是客户区尺寸，可能还没落到
+///  上）。WM_PAINT 必须走这个 —— 之前它自己算了一份不带排布的
+/// 布局，于是设置页改的排布对真窗口完全无效。
+pub fn layout_sized(app: &App, width: i32, height: i32) -> Layout {
+    let mut l = compute_layout(
+        width,
+        height,
+        &app.metrics,
+        app.cfg.ui.sidebar_visible,
+        app.cfg.ui.statusbar_visible,
+    );
+    apply_chrome(&mut l, app);
+    l
+}
+
+/// 组件此刻该不该出现：**在某条带里** 且 **没被收进「更多」**。
+///
+/// 画和命中都问这一个函数 —— 两边各判一次，收起来的按钮迟早会出现
+/// "看得见点不到"或"点得到看不见"。
+pub fn chrome_on(app: &App, id: u16) -> bool {
+    !app.ui_settings.ui_hidden.contains(&(id as u8)) && app.ui_settings.bars.iter().any(|b| b.contains(&id))
+}
+
+/// 把「界面」页的排布套到布局上。
+///
+/// 组件被收起来就地赋一个零矩形：绘制时零矩形画不出东西，命中时零矩形点不中，
+/// 于是"隐藏"不用在十几处绘制代码里各加一个 if。
+fn apply_chrome(l: &mut Layout, app: &App) {
+    use crate::settings::{
+        W_ADDRESS, W_BACK, W_BULK, W_CLOSE, W_FORWARD, W_MAX, W_MIN, W_MORE, W_NEW_TAB,
+        W_SEARCH, W_SIDEBAR_TOGGLE, W_TABS, W_UP,
+    };
+    let s = app.metrics.scale;
+    let z = RECT::default();
+    let pad = (6.0 * s).round() as i32;
+    let nav = (30.0 * s).round() as i32;
+    let btn_w = (44.0 * s).round() as i32;
+    let toggle_w = (40.0 * s).round() as i32;
+    let search_w = (170.0 * s).round() as i32;
+    let bulk_w = (30.0 * s).round() as i32;
+    let plus_w = (32.0 * s).round() as i32;
+    let gap2 = (2.0 * s).round() as i32;
+    let gap8 = (8.0 * s).round() as i32;
+    let w = l.title.right.max(1);
+    let hid = &app.ui_settings.ui_hidden;
+
+    let band = |i: usize| -> Vec<u16> { app.ui_settings.bars.get(i).cloned().unwrap_or_default() };
+    let take = |v: &[u16], ids: &[u16]| -> Vec<u16> {
+        v.iter()
+            .copied()
+            .filter(|i| ids.contains(i) && !hid.contains(&(*i as u8)))
+            .collect()
+    };
+
+    // ————————————————————————————— 标题栏
+    let t0 = band(0);
+    // 右端一排固定宽的按钮，按带里的顺序从左往右摆
+    let right = take(&t0, &[W_MORE, W_MIN, W_MAX, W_CLOSE]);
+    let right_start = w - btn_w * right.len() as i32;
+    l.menu_btn = z;
+    l.min_btn = z;
+    l.max_btn = z;
+    l.close_btn = z;
+    let mut x = right_start;
+    for id in &right {
+        let r = RECT { left: x, top: 0, right: x + btn_w, bottom: l.title.bottom };
+        match *id {
+            W_MORE => l.menu_btn = r,
+            W_MIN => l.min_btn = r,
+            W_MAX => l.max_btn = r,
+            _ => l.close_btn = r,
+        }
+        x += btn_w;
+    }
+    // 左端：侧栏开关（固定宽）→ 标签条（吃掉剩下全部）→ 「+」
+    if t0.contains(&W_SIDEBAR_TOGGLE) && !hid.contains(&(W_SIDEBAR_TOGGLE as u8)) {
+        l.sidebar_toggle = RECT { left: 0, top: 0, right: toggle_w, bottom: l.title.bottom };
+        l.tabs.left = toggle_w;
+    } else {
+        l.sidebar_toggle = z;
+        l.tabs.left = 0;
+    }
+    let plus_reserve = if t0.contains(&W_NEW_TAB) && !hid.contains(&(W_NEW_TAB as u8)) {
+        plus_w
+    } else {
+        0
+    };
+    l.new_tab_visible = plus_reserve > 0;
+    l.tabs.right = (right_start - plus_reserve).max(l.tabs.left + 1);
+    if !t0.contains(&W_TABS) || hid.contains(&(W_TABS as u8)) {
+        l.tabs = z;
+        l.new_tab_visible = false;
+    }
+
+    // ————————————————————————————— 工具栏
+    let t1 = band(1);
+    let left = take(&t1, &[W_BACK, W_FORWARD, W_UP]);
+    l.back = z;
+    l.forward = z;
+    l.up = z;
+    let mut x = pad;
+    for id in &left {
+        let r = RECT {
+            left: x,
+            top: l.toolbar.top + pad,
+            right: x + nav,
+            bottom: l.toolbar.bottom - pad,
+        };
+        match *id {
+            W_BACK => l.back = r,
+            W_FORWARD => l.forward = r,
+            _ => l.up = r,
+        }
+        x += nav + gap2;
+    }
+    let left_end = if left.is_empty() { pad } else { x };
+
+    // 右端一组：按带里的顺序从左往右占，整体右对齐
+    let r1 = take(&t1, &[W_BULK, W_SEARCH]);
+    let mut total = 0;
+    for (k, id) in r1.iter().enumerate() {
+        total += if *id == W_SEARCH { search_w } else { bulk_w };
+        if k + 1 < r1.len() {
+            total += gap8;
+        }
+    }
+    l.bulk_btn = z;
+    l.search = z;
+    let right_left = w - pad - total;
+    let mut x = right_left;
+    for id in &r1 {
+        let wd = if *id == W_SEARCH { search_w } else { bulk_w };
+        let r = RECT {
+            left: x,
+            top: l.toolbar.top + pad,
+            right: x + wd,
+            bottom: l.toolbar.bottom - pad,
+        };
+        if *id == W_SEARCH {
+            l.search = r;
+        } else {
+            l.bulk_btn = r;
+        }
+        x += wd + gap8;
+    }
+    if t1.contains(&W_ADDRESS) && !hid.contains(&(W_ADDRESS as u8)) {
+        l.address = RECT {
+            left: left_end + (10.0 * s).round() as i32,
+            top: l.toolbar.top + pad,
+            right: (right_left - gap8).max(left_end + 1),
+            bottom: l.toolbar.bottom - pad,
+        };
+    } else {
+        l.address = z;
     }
 }
 
@@ -445,13 +614,7 @@ pub fn paint(app: &mut App, hdc: HDC, width: i32, height: i32) {
         let mem = CreateCompatibleDC(Some(hdc));
         let bmp = CreateCompatibleBitmap(hdc, width, height);
         let old_bmp = SelectObject(mem, bmp.into());
-        let l = compute_layout(
-            width,
-            height,
-            &app.metrics,
-            app.cfg.ui.sidebar_visible,
-            app.cfg.ui.statusbar_visible,
-        );
+        let l = layout_sized(app, width, height);
         let t = app.theme;
         let bg = CreateSolidBrush(t.window_bg);
         let all = RECT { left: 0, top: 0, right: width, bottom: height };
@@ -1113,7 +1276,7 @@ fn paint_tab_strip(app: &mut App, hdc: HDC, l: &Layout, pi: usize) {
 
         // 新建标签（+）：紧跟最后一个标签
         let plus = l.new_tab_rect(n, &app.metrics);
-        if plus.right < l.tabs.right {
+        if l.new_tab_visible && plus.right < l.tabs.right {
             draw_chrome_button(app, hdc, &plus, ChromeGlyph::Plus, false);
         }
         // （原"- ZenFile"字样已按用户要求删掉：标题栏右侧那块地盘留给标签）
@@ -1698,13 +1861,7 @@ pub fn tick_busy_strip(hwnd: HWND, app: &App) {
     if !app.busy() {
         return;
     }
-    let l = compute_layout(
-        app.last_size.0,
-        app.last_size.1,
-        &app.metrics,
-        app.cfg.ui.sidebar_visible,
-        app.cfg.ui.statusbar_visible,
-    );
+    let l = layout_for(app);
     let scale = app.metrics.scale;
     let h = ((2.0 * scale).round() as i32).max(2);
     let r = RECT {
@@ -3743,17 +3900,27 @@ fn paint_status(app: &App, hdc: HDC, l: &Layout) {
         let old = SelectObject(hdc, font.into());
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, t.text_dim);
-        let text = app.status_text();
-        // 左侧文字要给右下角的两个按钮让出位置，否则长状态文本会压在按钮上
-        let view_left = status_view_left(l, &app.metrics);
-        draw_text(
-            hdc,
-            &text,
-            RECT { left: l.status.left + 10, top: l.status.top, right: view_left - 8, bottom: l.status.bottom },
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-        );
+        // 状态文字与视图切换是「界面」页状态栏那条带里的两个独立组件，
+        // 收起哪一个都得真的消失（并且另一个要能吃掉空出来的地盘）。
+        let show_switch = chrome_on(app, crate::settings::W_VIEW_SWITCH);
+        if chrome_on(app, crate::settings::W_STATUS_TEXT) {
+            let text = app.status_text();
+            let view_left = if show_switch {
+                status_view_left(l, &app.metrics)
+            } else {
+                l.status.right
+            };
+            draw_text(
+                hdc,
+                &text,
+                RECT { left: l.status.left + 10, top: l.status.top, right: view_left - 8, bottom: l.status.bottom },
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+        }
         SelectObject(hdc, old);
-        paint_view_switch(app, hdc, l);
+        if show_switch {
+            paint_view_switch(app, hdc, l);
+        }
     }
 }
 
@@ -3922,13 +4089,7 @@ pub(crate) fn set_edit_font(hwnd: HWND, scale: f32) {
 }
 
 fn position_children(app: &App) {
-    let l = compute_layout(
-        app.last_size.0,
-        app.last_size.1,
-        &app.metrics,
-        app.cfg.ui.sidebar_visible,
-        app.cfg.ui.statusbar_visible,
-    );
+    let l = layout_for(app);
     unsafe {
         let _ = SetWindowPos(app.hwnd_address, None, l.address.left, l.address.top, l.address.right - l.address.left, l.address.bottom - l.address.top, SWP_NOZORDER | SWP_NOACTIVATE);
         let _ = SetWindowPos(app.hwnd_search, None, l.search.left, l.search.top, l.search.right - l.search.left, l.search.bottom - l.search.top, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -3961,13 +4122,7 @@ pub fn create_rename_editor(app: &mut App, select_stem: bool) {
     let edit_class = HSTRING::from("EDIT");
     let row_h = app.metrics.row_height_for(app.tab().view_mode);
     let font = ui_font(app.metrics.scale);
-    let l = compute_layout(
-        app.last_size.0,
-        app.last_size.1,
-        &app.metrics,
-        app.cfg.ui.sidebar_visible,
-        app.cfg.ui.statusbar_visible,
-    );
+    let l = layout_for(app);
     let header_h = if app.tab().view_mode == fm_core::ViewMode::Details {
         (26.0 * app.metrics.scale) as i32
     } else {

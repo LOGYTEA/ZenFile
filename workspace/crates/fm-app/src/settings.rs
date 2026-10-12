@@ -63,7 +63,7 @@ const fn wg(name: &'static str, glyph: &'static str, wd: f32, align: u8, long: b
     Widget { name, glyph, w: wd, align, long }
 }
 
-pub const WIDGETS: [Widget; 26] = [
+pub const WIDGETS: [Widget; 29] = [
     wg("标签", "\u{E8A7}", 56.0, 0, false),
     wg("新建标签", "\u{E710}", 26.0, 0, false),
     wg("最小化", "\u{E921}", 24.0, 1, false),
@@ -90,7 +90,36 @@ pub const WIDGETS: [Widget; 26] = [
     wg("项目数", "\u{E75B}", 56.0, 0, true),
     wg("已选大小", "\u{E762}", 64.0, 0, true),
     wg("容量条", "\u{E7F1}", 96.0, 0, true),
+    wg("侧栏开关", "\u{E8B7}", 40.0, 0, false),
+    wg("批量重命名", "\u{E8AC}", 30.0, 0, false),
+    wg("视图切换", "\u{E7B3}", 56.0, 0, true),
 ];
+
+/// 真窗口里**根本不存在**、或不是"能挪位置的一块"的槽位。
+///
+/// 上一版照着 Win11 命令栏列了一串（新建/剪切/复制/粘贴/重命名/删除/视图/排序…），
+/// 但这个软件压根没有那条命令栏 —— 于是用户可以兴高采烈地把它们拖来拖去，
+/// 真窗口一个像素都不变。编排页里出现的东西必须真的能在窗口里找到，
+/// 否则就是"看着能调、调了没用"。
+pub const WIDGET_RETIRED: [u16; 14] =
+    [8, 9, 10, 11, 12, 13, 14, 15, 18, 20, 21, 22, 24, 25];
+
+// —— 真窗口排布用的组件 id（`paint::apply_chrome` 按这些 id 摆位）——
+pub const W_TABS: u16 = 0;
+pub const W_NEW_TAB: u16 = 1;
+pub const W_MIN: u16 = 2;
+pub const W_MAX: u16 = 3;
+pub const W_CLOSE: u16 = 4;
+pub const W_BACK: u16 = 5;
+pub const W_FORWARD: u16 = 6;
+pub const W_UP: u16 = 7;
+pub const W_MORE: u16 = 16;
+pub const W_ADDRESS: u16 = 17;
+pub const W_SEARCH: u16 = 19;
+pub const W_STATUS_TEXT: u16 = 23;
+pub const W_SIDEBAR_TOGGLE: u16 = 26;
+pub const W_BULK: u16 = 27;
+pub const W_VIEW_SWITCH: u16 = 28;
 
 /// 最下面那三条最长的带。
 pub const BAR_NAMES: [&str; 3] = ["标题栏", "工具栏", "状态栏"];
@@ -98,9 +127,12 @@ pub const BAR_NAMES: [&str; 3] = ["标题栏", "工具栏", "状态栏"];
 /// 三条带出厂时各装什么。
 pub fn default_bars() -> Vec<Vec<u16>> {
     vec![
-        vec![0, 1, 2, 3, 4],                             // 标题栏：标签 / + / 三键
-        vec![5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16], // 工具栏：导航 + 常用动作
-        vec![23, 24, 25],                                // 状态栏：项目数 / 已选 / 容量
+        // 标题栏：左起 侧栏开关 → 标签条（弹性）→ 新建标签，右端 更多/最小/最大/关闭
+        vec![W_SIDEBAR_TOGGLE, W_TABS, W_NEW_TAB, W_MORE, W_MIN, W_MAX, W_CLOSE],
+        // 工具栏：左端三个导航，中间地址面包屑（弹性），右端 批量重命名 / 搜索框
+        vec![W_BACK, W_FORWARD, W_UP, W_ADDRESS, W_BULK, W_SEARCH],
+        // 状态栏：左边一行状态文字，右边视图切换
+        vec![W_STATUS_TEXT, W_VIEW_SWITCH],
     ]
 }
 
@@ -379,6 +411,7 @@ impl Settings {
                 self.ui_order.push(i);
             }
         }
+        let _ = &WIDGET_RETIRED;
         self.ui_hidden.retain(|i| *i < n && !self.ui_order.contains(i));
         self.ui_hidden.sort_unstable();
         self.ui_hidden.dedup();
@@ -390,7 +423,7 @@ impl Settings {
         let wn = WIDGETS.len() as u16;
         let mut seen = std::collections::HashSet::new();
         for b in self.bars.iter_mut() {
-            b.retain(|v| *v < wn && seen.insert(*v));
+            b.retain(|v| *v < wn && !WIDGET_RETIRED.contains(v) && seen.insert(*v));
         }
 
         let m = MENU_ITEM_NAMES.len() as u16;
@@ -665,7 +698,7 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
             let mut ty = g.ui_top.top + px(16.0);
             let sh = px(28.0);
             for (i, wd) in WIDGETS.iter().enumerate() {
-                if wd.long {
+                if wd.long || WIDGET_RETIRED.contains(&(i as u16)) {
                     continue;
                 }
                 let ww = px(wd.w).max(px(28.0));
@@ -685,7 +718,7 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
             let mut ry = g.ui_right.top + px(16.0);
             let rh = px(30.0);
             for (i, wd) in WIDGETS.iter().enumerate() {
-                if !wd.long {
+                if !wd.long || WIDGET_RETIRED.contains(&(i as u16)) {
                     continue;
                 }
                 if ry + rh > g.ui_right.bottom {
