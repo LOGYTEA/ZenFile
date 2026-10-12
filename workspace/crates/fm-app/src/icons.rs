@@ -39,6 +39,8 @@ const DIR_CACHE_MAX: usize = 1024;
 const THUMB_CACHE_MAX: usize = 256;
 /// 放大位图上界（96²×4 ≈ 36KB/张，384 张 ≈ 14MB）。满了整表清空重来。
 const UPSCALED_CACHE_MAX: usize = 384;
+/// 缩略图重采样缓存上界（thumb 原图大、重采样结果 96²×4，256 张 ≈ 9MB）。
+const THUMB_SCALED_MAX: usize = 256;
 
 /// 这几类文件的图标**只属于它自己**，不能按扩展名归并：
 /// 每个 exe/dll/ico 都嵌着自己的图标，.lnk 显示的是目标图标，.url 显示网站图标。
@@ -64,6 +66,11 @@ pub struct IconCache {
     /// 指针失效（Drop）时整表一起清。`RefCell` 是为了 draw/&self 签名不动 ——
     /// 调用点遍布 paint 里十几处 `&App` 函数，改成 `&mut` 要传染整条链。
     upscaled: RefCell<HashMap<(usize, i32), HBITMAP>>,
+    /// **缩略图重采样缓存**：key = (HBITMAP 句柄值, dw, dh)。
+    /// 缩略图（IShellItemImageFactory，256px 起）放大/缩小到格子尺寸不再走
+    /// GDI StretchBlt —— 它**只插值 RGB、不插值 alpha 通道**，边缘 alpha
+    /// 最近邻采样就是文件夹图标那圈硬锯齿阶梯。手工重采样后按位图缓存。
+    scaled_thumbs: RefCell<HashMap<(usize, i32, i32), HBITMAP>>,
 }
 
 impl Default for IconCache {
@@ -105,6 +112,13 @@ impl Drop for IconCache {
                 }
             }
         }
+        for (_, b) in self.scaled_thumbs.get_mut().drain() {
+            if !b.is_invalid() {
+                unsafe {
+                    let _ = DeleteObject(b.into());
+                }
+            }
+        }
     }
 }
 
@@ -116,6 +130,7 @@ impl IconCache {
             thumbs: HashMap::new(),
             dir: HashMap::new(),
             upscaled: RefCell::new(HashMap::new()),
+            scaled_thumbs: RefCell::new(HashMap::new()),
         }
     }
 
@@ -299,6 +314,12 @@ impl IconCache {
 
     /// 画一张缩略图到 `size × size` 的格子里（等比缩放并居中）。
     /// 失败返回 false，调用方应退回 HICON 那条路。
+    ///
+    /// **不走 GDI StretchBlt**（老路 HALFTONE）：它只插值 RGB 三通道、
+    /// **不插值 alpha** —— 边缘 alpha 最近邻采样，出来的就是文件夹图标
+    /// 那圈硬锯齿阶梯（用户截图反馈的"粗糙"）。这里改成：
+    /// 读出 32bpp 像素 → 判定 alpha 空间 → 缩小用 box 面积平均 / 放大用
+    /// premultiplied 双线性 → 按 (bmp, dw, dh) 缓存 → AlphaBlend 贴出。
     pub fn draw_thumb(&self, hdc: HDC, bmp: HBITMAP, x: i32, y: i32, size: i32) -> bool {
         if bmp.is_invalid() || size <= 0 {
             return false;
@@ -317,29 +338,54 @@ impl IconCache {
             if w <= 0 || h <= 0 {
                 return false;
             }
-            let mem = CreateCompatibleDC(Some(hdc));
-            if mem.is_invalid() {
-                return false;
-            }
-            let old = SelectObject(mem, bmp.into());
-            // 大图标是 96px，原图常是 1920×1080：默认 BLACKONWHITE 拉伸倍数大
-            // 锯齿非常重。HALFTONE + SetBrushOrgEx 才能让缩出来像样。
-            let _ = SetStretchBltMode(hdc, HALFTONE);
-            let _ = SetBrushOrgEx(hdc, 0, 0, None);
-            let mut bf: BLENDFUNCTION = std::mem::zeroed();
-            bf.BlendOp = AC_SRC_OVER as u8;
-            bf.SourceConstantAlpha = 255;
-            bf.AlphaFormat = AC_SRC_ALPHA as u8;
             // 等比缩放居中：缩略图不一定是正方形（宽图/竖图都是），
             // 硬拉成正方会把人压扁。
-            let dw = if w >= h { size } else { (size * w) / h };
-            let dh = if w >= h { (size * h) / w } else { size };
+            let (dw, dh) = if w >= h {
+                (size, ((size as i64 * h as i64) / w as i64).max(1) as i32)
+            } else {
+                (((size as i64 * w as i64) / h as i64).max(1) as i32, size)
+            };
             let dx = (size - dw) / 2;
             let dy = (size - dh) / 2;
-            let ok = AlphaBlend(hdc, x + dx, y + dy, dw, dh, mem, 0, 0, w, h, bf);
-            SelectObject(mem, old);
-            let _ = DeleteDC(mem);
-            ok.as_bool()
+
+            // 尺寸正好 1:1 —— 原样贴（无重采样）
+            if dw == w && dh == h {
+                return blend_bmp(hdc, bmp, x + dx, y + dy, dw, dh, 255);
+            }
+
+            // 缓存命中
+            let key = (bmp.0 as usize, dw, dh);
+            if let Some(sb) = self.scaled_thumbs.borrow().get(&key) {
+                let sb = *sb;
+                return blend_bmp(hdc, sb, x + dx, y + dy, dw, dh, 255);
+            }
+
+            // 读像素（thumb 此刻没有被选进任何 DC，可直接 GetDIBits）
+            let Some(data) = read_bmp_rgba(bmp, w, h) else {
+                return false;
+            };
+            // alpha 空间判定：WIC 出来的一般是 premultiplied；个别路径是
+            // straight。转成 pmp 后再插值（对 pmp 再乘一次 alpha 会二次变暗）。
+            let pmp = if looks_straight(&data) { to_pmp(&data) } else { data };
+            let out = resample_pmp(&pmp, w, h, dw, dh);
+            if out.is_empty() {
+                return false;
+            }
+            let Some(sbmp) = pmp_to_bmp(&out, dw, dh) else {
+                return false;
+            };
+            {
+                let mut c = self.scaled_thumbs.borrow_mut();
+                if c.len() >= THUMB_SCALED_MAX {
+                    for (_, b) in c.drain() {
+                        if !b.is_invalid() {
+                            let _ = DeleteObject(b.into());
+                        }
+                    }
+                }
+                c.insert(key, sbmp);
+            }
+            blend_bmp(hdc, sbmp, x + dx, y + dy, dw, dh, 255)
         }
     }
 
@@ -402,7 +448,7 @@ impl IconCache {
             // 白/绿杂边、锯齿很重（用户截图反馈的就是它）。
             if size > 32 {
                 if let Some(bmp) = self.upscaled_bmp(icon, size) {
-                    if blend_bmp(hdc, bmp, x, y, size, 255) {
+                    if blend_bmp(hdc, bmp, x, y, size, size, 255) {
                         return;
                     }
                 }
@@ -451,7 +497,7 @@ impl IconCache {
         // SourceConstantAlpha 贴出 —— 老路径里 DrawIconEx 拉伸的锯齿照样在。
         if size > 32 {
             if let Some(bmp) = self.upscaled_bmp(icon, size) {
-                if unsafe { blend_bmp(hdc, bmp, x, y, size, alpha) } {
+                if unsafe { blend_bmp(hdc, bmp, x, y, size, size, alpha) } {
                     return;
                 }
             }
@@ -674,56 +720,150 @@ fn icon_native_rgba(icon: HICON, ow: i32, oh: i32) -> Option<Vec<u8>> {
     }
 }
 
-/// premultiplied 双线性放大（方形：sw=sh → dw×dw）。
-///
-/// **必须在 premultiplied 空间插值**：straight alpha 直接对 RGB 插值会把
-/// "透明区的底色"混进可见边缘 —— 那就是图标外圈白/绿杂边（halo）的来源。
-fn upscale_pmp(src: &[u8], sw: i32, sh: i32, dw: i32) -> Vec<u8> {
-    let mut out = vec![0u8; (dw * dw * 4) as usize];
-    if sw <= 0 || sh <= 0 || dw <= 0 {
-        return out;
+/// 从 32bpp HBITMAP 读出 top-down BGRA 像素（原样字节，不做颜色空间转换）。
+fn read_bmp_rgba(bmp: HBITMAP, w: i32, h: i32) -> Option<Vec<u8>> {
+    unsafe {
+        let src = windows::Win32::Graphics::Gdi::GetDC(None);
+        if src.0.is_null() {
+            return None;
+        }
+        let mut hdr: windows::Win32::Graphics::Gdi::BITMAPINFO = std::mem::zeroed();
+        hdr.bmiHeader.biSize =
+            std::mem::size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32;
+        hdr.bmiHeader.biWidth = w;
+        hdr.bmiHeader.biHeight = -h; // 自上而下
+        hdr.bmiHeader.biPlanes = 1;
+        hdr.bmiHeader.biBitCount = 32;
+        hdr.bmiHeader.biCompression = windows::Win32::Graphics::Gdi::BI_RGB.0;
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let n = windows::Win32::Graphics::Gdi::GetDIBits(
+            src,
+            bmp,
+            0,
+            h as u32,
+            Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+            &mut hdr,
+            windows::Win32::Graphics::Gdi::DIB_RGB_COLORS,
+        );
+        let _ = windows::Win32::Graphics::Gdi::ReleaseDC(None, src);
+        if n == 0 {
+            None
+        } else {
+            Some(buf)
+        }
     }
-    for dy in 0..dw {
-        let syf = ((dy as f32 + 0.5) * sh as f32 / dw as f32 - 0.5).clamp(0.0, (sh - 1) as f32);
-        let y0 = syf as i32;
-        let y1 = (y0 + 1).min(sh - 1);
-        let fy = syf - y0 as f32;
-        for dx in 0..dw {
-            let sxf = ((dx as f32 + 0.5) * sw as f32 / dw as f32 - 0.5).clamp(0.0, (sw - 1) as f32);
-            let x0 = sxf as i32;
-            let x1 = (x0 + 1).min(sw - 1);
-            let fx = sxf - x0 as f32;
-            let corners = [
-                (x0, y0, (1.0 - fx) * (1.0 - fy)),
-                (x1, y0, fx * (1.0 - fy)),
-                (x0, y1, (1.0 - fx) * fy),
-                (x1, y1, fx * fy),
-            ];
-            let mut ab = 0f32;
-            let mut ag = 0f32;
-            let mut ar = 0f32;
-            let mut aa = 0f32;
-            for (cx, cy, w) in corners {
-                let o = ((cy * sw + cx) * 4) as usize;
-                let a = src[o + 3] as f32;
-                let k = a / 255.0 * w;
-                ab += src[o] as f32 * k;
-                ag += src[o + 1] as f32 * k;
-                ar += src[o + 2] as f32 * k;
-                aa += a * w;
+}
+
+/// 启发式判断缓冲是 **straight alpha**（存在半透明且 rgb 分量超过 alpha）。
+/// WIC/IShellItemImageFactory 出来的一般已是 premultiplied；个别路径是 straight。
+fn looks_straight(d: &[u8]) -> bool {
+    let mut i = 0;
+    let mut checked = 0usize;
+    while i + 3 < d.len() && checked < 4096 {
+        let a = d[i + 3];
+        if a > 8 && a < 250 {
+            checked += 1;
+            if d[i] > a || d[i + 1] > a || d[i + 2] > a {
+                return true;
             }
-            let o = ((dy * dw + dx) * 4) as usize;
-            out[o] = ab.round().clamp(0.0, 255.0) as u8;
-            out[o + 1] = ag.round().clamp(0.0, 255.0) as u8;
-            out[o + 2] = ar.round().clamp(0.0, 255.0) as u8;
-            out[o + 3] = aa.round().clamp(0.0, 255.0) as u8;
+        }
+        i += 28; // 每 7 像素采一个，够统计判断
+    }
+    let _ = checked;
+    false
+}
+
+/// straight → premultiplied。
+fn to_pmp(d: &[u8]) -> Vec<u8> {
+    let mut o = d.to_vec();
+    for px in o.chunks_exact_mut(4) {
+        let a = px[3] as u32;
+        px[0] = ((px[0] as u32 * a + 127) / 255) as u8;
+        px[1] = ((px[1] as u32 * a + 127) / 255) as u8;
+        px[2] = ((px[2] as u32 * a + 127) / 255) as u8;
+    }
+    o
+}
+
+/// 重采样 **premultiplied** 像素（dw×dh 可非方形）。
+///
+/// - 放大：双线性（各通道直接加权 —— 源已是 pmp，不能再乘 alpha）
+/// - 缩小：box 面积平均。对 alpha 边缘锯齿最有效 —— GDI StretchBlt
+///   不插值 alpha 通道，边缘呈硬阶梯（用户截图文件夹图标的粗糙感）。
+fn resample_pmp(src: &[u8], sw: i32, sh: i32, dw: i32, dh: i32) -> Vec<u8> {
+    if sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0 || src.len() < (sw * sh * 4) as usize {
+        return Vec::new();
+    }
+    let mut out = vec![0u8; (dw * dh * 4) as usize];
+    if dw >= sw && dh >= sh {
+        for dy in 0..dh {
+            let syf = ((dy as f32 + 0.5) * sh as f32 / dh as f32 - 0.5).clamp(0.0, (sh - 1) as f32);
+            let y0 = syf as i32;
+            let y1 = (y0 + 1).min(sh - 1);
+            let fy = syf - y0 as f32;
+            for dx in 0..dw {
+                let sxf = ((dx as f32 + 0.5) * sw as f32 / dw as f32 - 0.5).clamp(0.0, (sw - 1) as f32);
+                let x0 = sxf as i32;
+                let x1 = (x0 + 1).min(sw - 1);
+                let fx = sxf - x0 as f32;
+                let corners = [
+                    (x0, y0, (1.0 - fx) * (1.0 - fy)),
+                    (x1, y0, fx * (1.0 - fy)),
+                    (x0, y1, (1.0 - fx) * fy),
+                    (x1, y1, fx * fy),
+                ];
+                let mut acc = [0f32; 4];
+                for (cx, cy, w) in corners {
+                    let o = ((cy * sw + cx) * 4) as usize;
+                    acc[0] += src[o] as f32 * w;
+                    acc[1] += src[o + 1] as f32 * w;
+                    acc[2] += src[o + 2] as f32 * w;
+                    acc[3] += src[o + 3] as f32 * w;
+                }
+                let o = ((dy * dw + dx) * 4) as usize;
+                out[o] = acc[0].round().clamp(0.0, 255.0) as u8;
+                out[o + 1] = acc[1].round().clamp(0.0, 255.0) as u8;
+                out[o + 2] = acc[2].round().clamp(0.0, 255.0) as u8;
+                out[o + 3] = acc[3].round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    } else {
+        for dy in 0..dh {
+            let y0 = (dy as i64 * sh as i64 / dh as i64) as i32;
+            let y1 = ((((dy + 1) as i64 * sh as i64 / dh as i64) as i32).max(y0 + 1)).min(sh);
+            for dx in 0..dw {
+                let x0 = (dx as i64 * sw as i64 / dw as i64) as i32;
+                let x1 = ((((dx + 1) as i64 * sw as i64 / dw as i64) as i32).max(x0 + 1)).min(sw);
+                let n = ((x1 - x0) * (y1 - y0)).max(1) as u32;
+                let mut sb = 0u32;
+                let mut sg = 0u32;
+                let mut sr = 0u32;
+                let mut sa = 0u32;
+                for yy in y0..y1 {
+                    for xx in x0..x1 {
+                        let o = ((yy * sw + xx) * 4) as usize;
+                        sb += src[o] as u32;
+                        sg += src[o + 1] as u32;
+                        sr += src[o + 2] as u32;
+                        sa += src[o + 3] as u32;
+                    }
+                }
+                let o = ((dy * dw + dx) * 4) as usize;
+                out[o] = (sb / n) as u8;
+                out[o + 1] = (sg / n) as u8;
+                out[o + 2] = (sr / n) as u8;
+                out[o + 3] = (sa / n) as u8;
+            }
         }
     }
     out
 }
 
 /// 把 premultiplied 像素包成 32bpp DIB（供 AlphaBlend 的 AC_SRC_ALPHA 用）。
-fn pmp_to_bmp(data: &[u8], size: i32) -> Option<HBITMAP> {
+fn pmp_to_bmp(data: &[u8], dw: i32, dh: i32) -> Option<HBITMAP> {
+    if dw <= 0 || dh <= 0 {
+        return None;
+    }
     unsafe {
         let src = windows::Win32::Graphics::Gdi::GetDC(None);
         let mem = CreateCompatibleDC(Some(src));
@@ -734,8 +874,8 @@ fn pmp_to_bmp(data: &[u8], size: i32) -> Option<HBITMAP> {
         let mut hdr: windows::Win32::Graphics::Gdi::BITMAPINFO = std::mem::zeroed();
         hdr.bmiHeader.biSize =
             std::mem::size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32;
-        hdr.bmiHeader.biWidth = size;
-        hdr.bmiHeader.biHeight = -size;
+        hdr.bmiHeader.biWidth = dw;
+        hdr.bmiHeader.biHeight = -dh;
         hdr.bmiHeader.biPlanes = 1;
         hdr.bmiHeader.biBitCount = 32;
         hdr.bmiHeader.biCompression = windows::Win32::Graphics::Gdi::BI_RGB.0;
@@ -756,7 +896,7 @@ fn pmp_to_bmp(data: &[u8], size: i32) -> Option<HBITMAP> {
             }
             return None;
         }
-        let n = (size * size * 4) as usize;
+        let n = (dw * dh * 4) as usize;
         if data.len() < n {
             let _ = DeleteObject(bmp.into());
             return None;
@@ -793,17 +933,24 @@ fn render_upscaled(icon: HICON, size: i32) -> Option<HBITMAP> {
             }
         }
     }
-    // 2) 无损取样 + 插值 + 打包
+    // 2) 无损取样 → straight 转 pmp → 重采样 → 打包
     let data = icon_native_rgba(icon, ow, oh)?;
-    let out = upscale_pmp(&data, ow, oh, size);
-    pmp_to_bmp(&out, size)
+    let pmp = to_pmp(&data); // DrawIconEx 到 DIB 出来的是 straight alpha
+    let out = resample_pmp(&pmp, ow, oh, size, size);
+    if out.is_empty() {
+        return None;
+    }
+    pmp_to_bmp(&out, size, size)
 }
 
 /// 把缓存位图贴到目标 DC。`alpha` = 整体不透明度（隐藏项淡出用）。
 ///
 /// 源是 **premultiplied** 32bpp（`upscaled_bmp` 保证），所以 AlphaFormat
 /// 必须是 AC_SRC_ALPHA —— 直接 AC_SRC_OVER 贴 straight alpha 会出暗边。
-unsafe fn blend_bmp(hdc: HDC, bmp: HBITMAP, x: i32, y: i32, size: i32, alpha: u8) -> bool {
+unsafe fn blend_bmp(hdc: HDC, bmp: HBITMAP, x: i32, y: i32, dw: i32, dh: i32, alpha: u8) -> bool {
+    if dw <= 0 || dh <= 0 {
+        return false;
+    }
     let mem = CreateCompatibleDC(Some(hdc));
     if mem.is_invalid() {
         return false;
@@ -814,7 +961,7 @@ unsafe fn blend_bmp(hdc: HDC, bmp: HBITMAP, x: i32, y: i32, size: i32, alpha: u8
     bf.BlendFlags = 0;
     bf.SourceConstantAlpha = alpha;
     bf.AlphaFormat = AC_SRC_ALPHA as u8;
-    let ok = AlphaBlend(hdc, x, y, size, size, mem, 0, 0, size, size, bf);
+    let ok = AlphaBlend(hdc, x, y, dw, dh, mem, 0, 0, dw, dh, bf);
     SelectObject(mem, old);
     let _ = DeleteDC(mem);
     ok.as_bool()
