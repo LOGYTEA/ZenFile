@@ -76,6 +76,8 @@ pub fn home_entries() -> Vec<FileEntry> {
         kind: FileKind::Directory,
         size: 0,
         modified: 0,
+        created: 0,
+        accessed: 0,
         attributes: 16, // FILE_ATTRIBUTE_DIRECTORY
         hidden: false,
     };
@@ -1154,6 +1156,77 @@ impl App {
         ]
     }
 
+    // —— 列布局（第33轮：列头右键自定义，每文件夹各一套）——
+
+    /// 当前目录的**显示列序列**（已按名称列在首位规范化）。
+    ///
+    /// 三级优先：Explorer bag（资源管理器真的去过这个目录）→ ZenFile 每目录
+    /// 配置 → 默认四列。bag 优先是为了满足"与资源管理器同步"，配置兜底是
+    /// 因为 bag 只在资源管理器去过某目录时才存在。
+    pub fn visible_cols(&self) -> Vec<String> {
+        // 搜索态强制多一个「位置」列，插在名称后面 —— 搜索结果需要知道在哪
+        // （资源管理器搜索结果视图同样如此，且此时"选择列"是禁用的）。
+        if self.tab().search_root.is_some() {
+            let mut v = self.saved_visible_cols();
+            if !v.iter().any(|x| x == fm_core::columns::C_PATH) {
+                v.insert(1, fm_core::columns::C_PATH.to_string());
+            }
+            return v;
+        }
+        self.saved_visible_cols()
+    }
+
+    /// 磁盘上的列序列（不含搜索态注入的「位置」列）。
+    fn saved_visible_cols(&self) -> Vec<String> {
+        if self.tab().home || self.tab().settings || self.tab().recycle {
+            return fm_core::columns::default_visible();
+        }
+        let key = norm_key(&self.tab().path);
+        if !key.is_empty() {
+            if let Some(v) = crate::sysview::system_columns(&self.tab().path) {
+                return fm_core::columns::normalize_visible(&v);
+            }
+            if let Some(l) = self.cfg.files.view.col_layouts.get(&key) {
+                if !l.visible.is_empty() {
+                    return fm_core::columns::normalize_visible(&l.visible);
+                }
+            }
+        }
+        fm_core::columns::default_visible()
+    }
+
+    /// 某列在当前目录的宽度（DIP）。
+    pub fn col_width(&self, id: &str) -> i32 {
+        // 先问磁盘上那份 bag —— 资源管理器拖过的列宽要能直接生效
+        if !self.tab().home && !self.tab().settings && !self.tab().recycle {
+            let key = norm_key(&self.tab().path);
+            if !key.is_empty() {
+                if let Some(w) = crate::sysview::system_col_width(&self.tab().path, id) {
+                    return w as i32;
+                }
+                if let Some(l) = self.cfg.files.view.col_layouts.get(&key) {
+                    if let Some(w) = l.widths.get(id) {
+                        return *w as i32;
+                    }
+                }
+            }
+        }
+        // 旧的三段固定宽度（用户在这轮之前拖过的）映射到同名列，
+        // 否则升级后列宽会全体跳回默认值 —— 那是"我的设置被重置了"。
+        let legacy = match id {
+            fm_core::columns::C_NAME => self.cfg.files.view.col_name_w,
+            fm_core::columns::C_DATE_MOD => self.cfg.files.view.col_date_w,
+            fm_core::columns::C_TYPE => self.cfg.files.view.col_kind_w,
+            fm_core::columns::C_SIZE => self.cfg.files.view.col_size_w,
+            _ => 0,
+        };
+        if legacy > 0 {
+            return legacy as i32;
+        }
+        fm_core::columns::default_width(id) as i32
+    }
+
+    /// 改一列的宽度：写 bag（让资源管理器也认）+ 写本目录配置（兜底）。
     pub fn set_col_width(&mut self, index: usize, w: i32) {
         let w = (w.max(COL_W_MIN).min(COL_W_MAX)) as u32;
         let v = &mut self.cfg.files.view;
@@ -1163,6 +1236,121 @@ impl App {
             2 => v.col_kind_w = w,
             _ => v.col_size_w = w,
         }
+    }
+
+    /// 新的一列宽度（第33轮按列 id 存）。同时写 bag 与本目录配置。
+    pub fn set_col_width_by_id(&mut self, id: &str, w: i32) {
+        let w = (w.max(fm_core::columns::W_MIN as i32) as u32).min(fm_core::columns::W_MAX);
+        if self.tab().home || self.tab().settings || self.tab().recycle {
+            return;
+        }
+        let path = self.tab().path.clone();
+        crate::sysview::write_system_col_width(&path, id, w);
+        let key = norm_key(&path);
+        let entry = self
+            .cfg
+            .files
+            .view
+            .col_layouts
+            .entry(key)
+            .or_default();
+        entry.widths.insert(id.to_string(), w);
+        // 落盘：深合并（不覆盖用户在别的位置的设置）
+        let patch = serde_json::json!({
+            "files": { "view": { "col_layouts": {
+                norm_key(&path): { "widths": { id: w } }
+            }}}
+        });
+        let _ = fm_core::config::Config::save_user_patch(&patch);
+        self.invalidate();
+    }
+
+    /// 设置某列在当前目录是否可见（名称列不可隐藏，与资源管理器一致）。
+    pub fn set_col_visible(&mut self, id: &str, visible: bool) {
+        if id == fm_core::columns::C_NAME || self.tab().home {
+            return;
+        }
+        let mut v = self.saved_visible_cols();
+        v.retain(|x| x != id);
+        if visible {
+            // 追加到末尾（保持"名称在首位、其余按添加顺序"）
+            if !v.iter().any(|x| x == id) {
+                v.push(id.to_string());
+            }
+        }
+        v = fm_core::columns::normalize_visible(&v);
+        self.apply_visible_cols(&v);
+    }
+
+    /// 应用一整套列序列：写 bag + 写本目录配置 + 重画。
+    pub fn apply_visible_cols(&mut self, visible: &[String]) {
+        let v = fm_core::columns::normalize_visible(visible);
+        let path = self.tab().path.clone();
+        if !self.tab().home && !self.tab().settings && !self.tab().recycle {
+            crate::sysview::write_system_columns(&path, &v);
+            let key = norm_key(&path);
+            self.cfg
+                .files
+                .view
+                .col_layouts
+                .entry(key.clone())
+                .or_default()
+                .visible = v.clone();
+            let patch = serde_json::json!({
+                "files": { "view": { "col_layouts": { key.clone(): { "visible": v } } } }
+            });
+            let _ = fm_core::config::Config::save_user_patch(&patch);
+        }
+        self.invalidate();
+    }
+
+    /// 某一列当前是否可见（"选择列"菜单打勾用）。
+    pub fn is_col_visible(&self, id: &str) -> bool {
+        self.saved_visible_cols().iter().any(|x| x == id)
+    }
+
+    /// 「将列调整为合适的大小」：按当前**实际最长内容**算宽度。
+    ///
+    /// 只看可见行（最多采样 200 行）—— 全量扫 9 万个条目来量文字宽度，
+    /// 打开目录要多等好几秒，这个代价不值当。资源管理器也是按可见范围算的。
+    pub fn autofit_cols(&mut self) {
+        let cols = self.visible_cols();
+        let show_ext = self.cfg.files.view.show_extensions;
+        let take = self.tab().visible.len().min(200);
+        for (i, id) in cols.iter().enumerate() {
+            if id == fm_core::columns::C_SIZE {
+                // 大小列固定 80：内容全是 "12.3 MB"，按它算也还是那个宽度
+                self.set_col_width_by_id(id, 80);
+                continue;
+            }
+            // 表头文字本身是下限
+            let mut maxw = text_width_units(fm_core::columns::label_of(id));
+            for k in 0..take {
+                let Some(ei) = self.tab().visible.get(k).and_then(|x| self.tab().entries.get(*x))
+                else {
+                    continue;
+                };
+                let s = match fm_core::columns::cell(id, ei, show_ext) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let wpx = text_width_units(&s) + 12; // 左右各留 6px
+                if wpx > maxw {
+                    maxw = wpx;
+                }
+            }
+            // 名称列额外给图标与缩进留位
+            if id == fm_core::columns::C_NAME {
+                maxw += 40;
+            }
+            let w = maxw
+                .max(fm_core::columns::W_MIN as i32)
+                .min(fm_core::columns::W_MAX as i32);
+            self.set_col_width_by_id(id, w);
+            let _ = i;
+            let _ = i;
+        }
+        self.invalidate();
     }
 
     pub fn tab(&self) -> &Tab {
@@ -2134,6 +2322,8 @@ impl App {
                 kind: if h.dir { FileKind::Directory } else { FileKind::File },
                 size: h.size,
                 modified: h.modified,
+                created: 0,
+                accessed: 0,
                 attributes: if h.dir { 0x10 } else { 0 } | if h.hidden { 0x2 } else { 0 },
                 hidden: h.hidden,
             })
@@ -3278,6 +3468,16 @@ impl App {
                 }
             }),
             Command::HeaderSort(sem, desc) => self.header_sort(sem, desc),
+            // 「选择列…」：勾掉/勾上某一列。**只改当前目录**（资源管理器
+            // 的列设置就是每个文件夹各一套），同时写回 bag 让资源管理器
+            // 也认（第33轮）。
+            Command::ToggleColumn(id) => {
+                if !id.is_empty() {
+                    let on = !self.is_col_visible(&id);
+                    self.set_col_visible(&id, on);
+                }
+            }
+            Command::AutofitColumns | Command::AutofitAllColumns => self.autofit_cols(),
             Command::ColFilterKind(k) => {
                 self.set_col_filter(if k.is_empty() { None } else { Some(ColFilter::Kind(k)) })
             }
@@ -4132,6 +4332,7 @@ pub fn shell_row(text: &str, glyph: Option<&'static str>, cmd: Command) -> menu:
         separator: false,
         disabled: false,
         selected: false,
+        checked: false,
         has_submenu: false,
         submenu: Vec::new(),
         action: MenuAction::Own(cmd),
@@ -4211,6 +4412,7 @@ fn new_rows() -> Vec<menu::MenuEntry> {
         separator: false,
         disabled: false,
         selected: false,
+        checked: false,
         has_submenu: false,
         submenu: Vec::new(),
         action: MenuAction::Own(menu::Command::NewFolder),
@@ -4223,6 +4425,7 @@ fn new_rows() -> Vec<menu::MenuEntry> {
             separator: false,
             disabled: false,
             selected: false,
+            checked: false,
             has_submenu: false,
             submenu: Vec::new(),
             action: MenuAction::Own(menu::Command::NewTemplate(tpl.ext)),
@@ -4241,6 +4444,7 @@ pub fn submenu_row(text: &str, glyph: Option<&'static str>, children: Vec<menu::
         separator: false,
         disabled: false,
         selected: false,
+        checked: false,
         has_submenu: !children.is_empty(),
         submenu: children,
         action: MenuAction::None,
@@ -4393,6 +4597,39 @@ pub fn same_volume(a: &Path, b: &Path) -> bool {
         }
     };
     vol(a) == vol(b)
+}
+
+/// 估算一段文字在当前字体下有多宽（像素）。
+///
+/// 「将列调整为合适的大小」要在**改宽度之前**就知道内容有多宽，而那一刻
+/// 往往还没有 DC 可用（不能为了量宽度去建一个内存 DC 再销毁，每次点击都
+/// 来一遍太浪费）。所以用一张保守的估算表：ASCII 约 7px、CJK 全角 13px，
+/// 再按当前 scale 放大。真要精确时由绘制侧 `DT_END_ELLIPSIS` 兜底 ——
+/// 估宽偏大只会让列略宽一点，不会截字。
+pub fn text_width_units(s: &str) -> i32 {
+    let mut w = 0i32;
+    for c in s.chars() {
+        w += if (c as u32) < 0x80 {
+            7
+        } else if is_wide(c) {
+            13
+        } else {
+            8
+        };
+    }
+    w
+}
+
+/// 是不是需要双倍宽度的字符（CJK / 全角标点 / 假名 / 谚文）。
+fn is_wide(c: char) -> bool {
+    let c = c as u32;
+    (0x1100..=0x115F).contains(&c)      // 谚文字母
+        || (0x2E80..=0xA4CF).contains(&c) // CJK 部首 ~ 彝文
+        || (0xAC00..=0xD7A3).contains(&c) // 谚文音节
+        || (0xF900..=0xFAFF).contains(&c) // CJK 兼容表意
+        || (0xFE30..=0xFE4F).contains(&c) // CJK 兼容形式
+        || (0xFF00..=0xFF60).contains(&c) // 全角 ASCII
+        || (0xFFE0..=0xFFE6).contains(&c) // 全角符号
 }
 
 pub fn human(bytes: u64) -> String {

@@ -1994,8 +1994,20 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             // 地址框/搜索框正在编辑时，按键属于那个 EDIT（回车、ESC 由它自己的
             // 子类过程处理）。主窗口再插一脚会把字母当快捷键、还会顺手把地址栏
             // 文本刷回当前路径 —— 输入到一半的内容就这么没了。
+            //
+            // 但**判据必须是"焦点在不在 EDIT 上"，不能只看 addr_editing 标志**
+            // （第33轮用户报"单击目录栏变成输入的样子，无法退出"）：焦点一旦
+            // 从 EDIT 上漏掉（隐藏 EDIT 却没交出焦点那种情况），标志还是 true，
+            // 按键就全被这里吞掉 —— 表现为"Esc 没反应、打字没反应、界面死了"。
+            // 焦点不在 EDIT 却还打着编辑旗标的，一律**先把编辑态收掉**再继续处理。
             if app.addr_editing {
-                return LRESULT(0);
+                let focus = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() };
+                if focus != app.hwnd_address {
+                    paint::end_address_edit(app, true);
+                    paint::sync_address(app);
+                } else {
+                    return LRESULT(0);
+                }
             }
             // 「快捷键」页正在录一个新组合键：这一下按键归它，不往下走
             if let Some(act) = app.hotkey_capture.clone() {
@@ -2108,8 +2120,9 @@ fn view_row_at(app: &App, l: &paint::Layout, x: i32, y: i32, view_top: i32) -> O
         // 用户"说过几遍"的那条）。改用**列区右沿**：最后一列（大小）结束处。
         if mode == fm_core::ViewMode::Details {
             let icon_size = (16.0 * app.metrics.scale) as i32;
-            let cols = paint::detail_cols(app, l, icon_size);
-            if x >= cols.size + cols.size_w {
+            // 列区右沿 = 最后一列右沿（与行高亮/表头分隔线同源，第32轮 #1）
+            let boxes = paint::col_boxes(app, l, icon_size);
+            if x >= paint::cols_right(&boxes) {
                 return None;
             }
         }
@@ -2690,37 +2703,71 @@ fn show_header_filter_menu(hwnd: HWND, app: &mut App, l: &paint::Layout, col: us
 }
 
 /// 表头右键：排序方向 + 按这一列筛选（资源管理器同款）。
+/// 表头右键菜单的**「选择列…」子菜单**（第33轮）。
+///
+/// 结构照资源管理器（用户截图）：
+///   将列调整为合适的大小(S)
+///   ─────────
+///   所有列均调整为合适的大小(A)
+///   ─────────
+///   ✓名称          ← 名称恒勾且不可点（同 Explorer）
+///   ✓修改日期
+///    类型
+///    大小
+///   ─────────
+///   其他(M)...
+fn header_choose_columns_rows(app: &App) -> Vec<menu::MenuEntry> {
+    let mut v: Vec<menu::MenuEntry> = Vec::new();
+    v.push(menu::MenuEntry::item(
+        "将列调整为合适的大小(S)",
+        menu::Command::AutofitColumns,
+    ));
+    v.push(menu::MenuEntry::sep());
+    v.push(menu::MenuEntry::item(
+        "所有列均调整为合适的大小(A)",
+        menu::Command::AutofitAllColumns,
+    ));
+    v.push(menu::MenuEntry::sep());
+    // 名称恒在、恒勾、不可点 —— 与 Explorer 一致（没有任何列表能没有"名称"）
+    for id in fm_core::columns::COL_ALL {
+        let on = app.is_col_visible(id);
+        let e = menu::MenuEntry::checked_item(
+            fm_core::columns::label_of(id),
+            menu::Command::ToggleColumn((*id).to_string()),
+            on,
+        );
+        if *id == fm_core::columns::C_NAME {
+            v.push(e.with_disabled(true).with_checked(true));
+        } else {
+            v.push(e);
+        }
+    }
+    v.push(menu::MenuEntry::sep());
+    v.push(menu::MenuEntry::item("其他(M)...", menu::Command::ToggleColumn(String::new()))
+        .with_disabled(true));
+    v
+}
+
+/// 表头右键：排序方向 + 按这一列筛选 + 「选择列…」（资源管理器同款）。
 fn show_header_context_menu(hwnd: HWND, app: &mut App, l: &paint::Layout, col: usize, x: i32, y: i32) {
-    let sem = paint::header_col_semantic(app, col);
-    let label = match sem {
-        0 => "名称",
-        1 => "修改日期",
-        2 => "类型",
-        3 => "大小",
-        _ => "位置",
-    };
+    let icon_size = (16.0 * app.metrics.scale) as i32;
+    let boxes = paint::col_boxes(app, l, icon_size);
+    let id = boxes.get(col).map(|b| b.id).unwrap_or(fm_core::columns::C_NAME);
+    let label = fm_core::columns::label_of(id);
     let desc = app.tab().sort.descending;
-    let cur_col = match app.tab().sort.key {
-        fm_core::SortKey::Name => 0u8,
-        fm_core::SortKey::Modified => 1,
-        fm_core::SortKey::Type => 2,
-        _ => 3,
-    };
-    let on_this = cur_col == sem;
+    let on_this = sort_key_of_col(id) == Some(app.tab().sort.key);
     let mut entries: Vec<menu::MenuEntry> = Vec::new();
-    // 列与方向一次到位：只给"方向"的话，右键 大小 选递增却仍在按名称排，
-    // 看着就像这一项没生效。
     entries.push(app::pick_row(
         &format!("按{}递增排序", label),
-        menu::Command::HeaderSort(sem, false),
+        menu::Command::HeaderSort(header_sem_of(id), false),
         on_this && !desc,
     ));
     entries.push(app::pick_row(
         &format!("按{}递减排序", label),
-        menu::Command::HeaderSort(sem, true),
+        menu::Command::HeaderSort(header_sem_of(id), true),
         on_this && desc,
     ));
-    let filters = header_filter_rows(app, sem);
+    let filters = header_filter_rows(app, header_sem_of(id));
     if !filters.is_empty() {
         entries.push(menu::MenuEntry::sep());
         entries.push(crate::app::submenu_row("筛选", None, filters));
@@ -2732,6 +2779,14 @@ fn show_header_context_menu(hwnd: HWND, app: &mut App, l: &paint::Layout, col: u
             menu::Command::ColFilterKind(String::new()),
             false,
         ));
+    }
+    // 「选择列…」放最后（与 Explorer 的位置一致：它是"配置"不是"操作"）
+    if app.tab().view_mode == fm_core::ViewMode::Details {
+        entries.push(menu::MenuEntry::sep());
+        let sub = header_choose_columns_rows(app);
+        let mut row = crate::app::submenu_row("选择列(O)...", None, sub);
+        row.disabled = app.tab().search_root.is_some();
+        entries.push(row);
     }
     let mut pt = POINT { x, y };
     let _ = unsafe { ClientToScreen(hwnd, &mut pt) };
@@ -2748,6 +2803,33 @@ fn show_header_context_menu(hwnd: HWND, app: &mut App, l: &paint::Layout, col: u
         false,
     ) {
         app.menu_hwnd = Some(h);
+    }
+}
+
+/// 列 id → 旧的"语义列号"（0=名称 1=修改日期 2=类型 3=大小）。
+/// 筛选/排序这两套老逻辑还是按语义号组织的，先转过去。
+fn header_sem_of(id: &str) -> u8 {
+    match id {
+        fm_core::columns::C_NAME => 0,
+        fm_core::columns::C_DATE_MOD
+        | fm_core::columns::C_DATE_CREATED
+        | fm_core::columns::C_DATE_ACCESSED => 1,
+        fm_core::columns::C_TYPE => 2,
+        fm_core::columns::C_SIZE => 3,
+        _ => 4,
+    }
+}
+
+/// 列 id → SortKey（不可排序的列返回 None）。
+fn sort_key_of_col(id: &str) -> Option<fm_core::SortKey> {
+    match id {
+        fm_core::columns::C_NAME => Some(fm_core::SortKey::Name),
+        fm_core::columns::C_DATE_MOD
+        | fm_core::columns::C_DATE_CREATED
+        | fm_core::columns::C_DATE_ACCESSED => Some(fm_core::SortKey::Modified),
+        fm_core::columns::C_TYPE => Some(fm_core::SortKey::Type),
+        fm_core::columns::C_SIZE => Some(fm_core::SortKey::Size),
+        _ => None,
     }
 }
 
@@ -2916,29 +2998,25 @@ fn hit_tab(app: &App, l: &paint::Layout, x: i32, y: i32) -> Option<usize> {
 }
 
 fn header_click(app: &mut App, l: &paint::Layout, x: i32) {
-    let columns = [
-        (("名称"), fm_core::SortKey::Name),
-        (("修改日期"), fm_core::SortKey::Modified),
-        (("类型"), fm_core::SortKey::Type),
-        (("大小"), fm_core::SortKey::Size),
-    ];
-    // 列宽与 paint_view 同源（用户拖过的宽度也在这里生效），
-    // 否则点击命中的列和看到的列错位
-    let w = app.col_widths();
-    let widths = [
-        (w[0] as f32 * app.metrics.scale) as i32,
-        (w[1] as f32 * app.metrics.scale) as i32,
-        (w[2] as f32 * app.metrics.scale) as i32,
-        (w[3] as f32 * app.metrics.scale) as i32,
-    ];
-    let mut cursor = l.view.left;
-    for (i, (_, key)) in columns.iter().enumerate() {
-        let width = widths[i];
-        if x >= cursor && x < cursor + width {
-            app.sort_column(*key);
-            return;
-        }
-        cursor += width;
+    // 点表头 = 按那一列排序。列几何**必须**取绘制端那一份（col_boxes），
+    // 否则隐藏过列 / 拖过列宽之后，点击命中的列和看到的列会错位
+    //（第33轮之前这里是自己数一遍 widths，与绘制各写一份）。
+    let icon_size = (16.0 * app.metrics.scale) as i32;
+    let boxes = paint::col_boxes(app, l, icon_size);
+    let Some(id) = paint::col_id_at(app, &boxes, x) else {
+        return;
+    };
+    let key = match id {
+        fm_core::columns::C_NAME => Some(fm_core::SortKey::Name),
+        fm_core::columns::C_DATE_MOD
+        | fm_core::columns::C_DATE_CREATED
+        | fm_core::columns::C_DATE_ACCESSED => Some(fm_core::SortKey::Modified),
+        fm_core::columns::C_TYPE => Some(fm_core::SortKey::Type),
+        fm_core::columns::C_SIZE => Some(fm_core::SortKey::Size),
+        _ => None,
+    };
+    if let Some(k) = key {
+        app.sort_column(k);
     }
 }
 

@@ -171,6 +171,25 @@ pub struct ViewConfig {
     /// `default_mode == "system"` 时才被读回，靠不住。
     #[serde(default)]
     pub overrides: std::collections::BTreeMap<String, String>,
+    /// **每个文件夹各自的列布局**（第33轮：列头右键自定义，Windows 逻辑）。
+    ///
+    /// 键 = `norm_key` 归一化后的路径，值 = 该目录的列配置。
+    /// 为什么按目录存：资源管理器的"选择列…"本来就是**每个文件夹各存一套**
+    /// （存在注册表 bag 里）。我们照抄这个语义。
+    #[serde(default)]
+    pub col_layouts: std::collections::BTreeMap<String, ColLayout>,
+}
+
+/// 一个目录下的列布局：哪些列可见、多宽、什么顺序。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ColLayout {
+    /// 可见的列（按显示顺序）。空 = 用默认四列（名称/修改日期/类型/大小）。
+    /// 元素是稳定的列 id 字符串，见 `crate::columns::COL_ALL`。
+    #[serde(default)]
+    pub visible: Vec<String>,
+    /// 各列宽度（DIP），键 = 列 id。缺项用该列的默认宽度。
+    #[serde(default)]
+    pub widths: std::collections::BTreeMap<String, u32>,
 }
 
 impl ViewConfig {

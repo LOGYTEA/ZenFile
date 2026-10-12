@@ -66,6 +66,8 @@ fn to_entry(dir: &Path, data: &WIN32_FIND_DATAW) -> Option<FileEntry> {
         kind,
         size,
         modified: filetime_to_i64(data.ftLastWriteTime.dwHighDateTime, data.ftLastWriteTime.dwLowDateTime),
+        created: filetime_to_i64(data.ftCreationTime.dwHighDateTime, data.ftCreationTime.dwLowDateTime),
+        accessed: filetime_to_i64(data.ftLastAccessTime.dwHighDateTime, data.ftLastAccessTime.dwLowDateTime),
         attributes: attrs,
         hidden: attrs & FILE_ATTRIBUTE_HIDDEN.0 != 0,
     })

@@ -31,6 +31,12 @@ pub struct FileEntry {
     pub size: u64,
     /// FILETIME 折算出的 i64（100ns 步进，自 1601-01-01）
     pub modified: i64,
+    /// 创建时间（第33轮："创建日期"列）。同 modified 的编码，0 = 未知。
+    #[allow(dead_code)]
+    pub created: i64,
+    /// 上次访问时间（第33轮："访问日期"列）。0 = 未知（很多文件系统不填）。
+    #[allow(dead_code)]
+    pub accessed: i64,
     pub attributes: u32,
     pub hidden: bool,
 }

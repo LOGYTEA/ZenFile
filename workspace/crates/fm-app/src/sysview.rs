@@ -586,6 +586,186 @@ unsafe fn write_all(h: HKEY, mode: fm_core::ViewMode) {
     let _ = set_dword(h, "IconSize", icon_size(mode));
 }
 
+// ============================================================ 列（第33轮）
+//
+// Explorer 的列配置就在同一个 bag 里，值名固定：
+//   `Columns`   REG_SZ，逗号分隔的**显示顺序**，每项是列的内部名
+//               （name,datemodified,type,size,datecreated,dateaccessed,
+//                 author,tags,title,path,attributes）
+//   `ColWidths` REG_SZ，**分号分隔**，每项是 "列名:宽度"（像素）
+//   `ColFlags`  REG_DWORD 集合，置位表示隐藏（1=不显示），语义是
+//               `flag & 1 << 位号`。我们只读不用它 —— 直接读 Columns 更准
+//               （Columns 缺项 = 用默认可见，省掉位序对齐的活）。
+//
+// 找不到 bag（资源管理器没去过这个目录）时读写都返回 false/No，
+// 上层退到自己的每目录配置。
+
+/// 我们支持的列 ↔ Explorer 内部名。**必须一字不差**，
+/// 差一个字母 Explorer 就认不出这一列（列会消失而不是显示错名字）。
+/// 我们的 id 本来就是照 Explorer 的内部名取的（见 fm_core::columns）。
+
+fn bag_keys(path: &Path) -> Option<(String, Vec<String>)> {
+    let (_, slot) = slot_for(path)?;
+    for root in ROOTS {
+        let base = format!("{root}\\Bags\\{slot}\\Shell");
+        let Some(h) = (unsafe { open(&base, false) }) else {
+            continue;
+        };
+        let subs = unsafe { subkey_names(h) };
+        unsafe {
+            let _ = RegCloseKey(h);
+        }
+        return Some((base, subs));
+    }
+    None
+}
+
+/// 读资源管理器里这个文件夹的显示列序列。`None` = 没 bag / bag 里没 Columns。
+pub fn system_columns(path: &Path) -> Option<Vec<String>> {
+    let (base, subs) = bag_keys(path)?;
+    let mut collect = |key: &str| -> Option<Vec<String>> {
+        unsafe {
+            let h = open(key, false)?;
+            let raw = value_raw(h, "Columns");
+            let _ = RegCloseKey(h);
+            let raw = raw?;
+            // REG_SZ：UTF-16LE。Explorer 写的是每项之间带一个 NUL 的双 NUL 结尾
+            let s = decode_utf16z(&raw);
+            let mut out: Vec<String> = Vec::new();
+            for part in s.split(',') {
+                let p = part.trim();
+                if !p.is_empty() {
+                    out.push(p.to_string());
+                }
+            }
+            if out.is_empty() {
+                None
+            } else {
+                Some(out)
+            }
+        }
+    };
+    // Shell 键本身先试，再试 FolderType 子键 —— 老 bag 只有前者
+    let base_owned = base.clone();
+    if let Some(v) = collect(&base_owned) {
+        return Some(v);
+    }
+    for sub in subs {
+        if let Some(v) = collect(&format!("{base}\\{sub}")) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// 读资源管理器里某一列的宽度（像素）。`None` = 没记录。
+pub fn system_col_width(path: &Path, id: &str) -> Option<u32> {
+    let (base, subs) = bag_keys(path)?;
+    let mut scan = |key: &str| -> Option<u32> {
+        unsafe {
+            let h = open(key, false)?;
+            let raw = value_raw(h, "ColWidths");
+            let _ = RegCloseKey(h);
+            let s = decode_utf16z(&raw?);
+            // 格式 "name:200;datemodified:120"
+            for item in s.split(';') {
+                let mut it = item.splitn(2, ':');
+                let (k, v) = (it.next()?.trim(), it.next()?.trim());
+                if k.eq_ignore_ascii_case(id) {
+                    return v.parse::<u32>().ok();
+                }
+            }
+            None
+        }
+    };
+    if let Some(v) = scan(&base) {
+        return Some(v);
+    }
+    for sub in subs {
+        if let Some(v) = scan(&format!("{base}\\{sub}")) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// 写列序列回资源管理器。
+pub fn write_system_columns(path: &Path, cols: &[String]) -> bool {
+    let Some((base, subs)) = bag_keys(path) else {
+        return false;
+    };
+    let joined = cols.join(",");
+    // 只有已存在的 FolderType 子键 + Shell 键本身都写；一个都没有的老 bag
+    // 不擅自建（跟 write_system_view 同一条纪律：Shell 读不懂会把树判坏）
+    let mut wrote = false;
+    unsafe {
+        if let Some(h) = open(&base, true) {
+            wrote |= set_str(h, "Columns", &joined);
+            let _ = RegCloseKey(h);
+        }
+    }
+    for sub in subs {
+        unsafe {
+            if let Some(h) = open(&format!("{base}\\{sub}"), true) {
+                wrote |= set_str(h, "Columns", &joined);
+                let _ = RegCloseKey(h);
+            }
+        }
+    }
+    wrote
+}
+
+/// 写某一列宽度回资源管理器。
+///
+/// 宽度的合并规则要照 Explorer：**只替换自己那一项，其余原样保留**。
+/// 直接整条重写会把资源管理器记着的其他列宽全清掉 —— 那正是用户最恨的
+/// "我的设置被莫名重置"。
+pub fn write_system_col_width(path: &Path, id: &str, w: u32) -> bool {
+    let Some((base, subs)) = bag_keys(path) else {
+        return false;
+    };
+    let apply = |key: &str| -> bool {
+        unsafe {
+            let Some(h) = open(key, true) else {
+                return false;
+            };
+            let cur = value_raw(h, "ColWidths").map(|r| decode_utf16z(&r)).unwrap_or_default();
+            let mut items: Vec<String> = cur
+                .split(';')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let tag = format!("{id}:{w}");
+            match items.iter().position(|s| {
+                s.split(':').next().map(|k| k.trim().eq_ignore_ascii_case(id)).unwrap_or(false)
+            }) {
+                Some(i) => items[i] = tag,
+                None => items.push(tag),
+            }
+            let ok = set_str(h, "ColWidths", &items.join(";"));
+            let _ = RegCloseKey(h);
+            ok
+        }
+    };
+    let mut wrote = apply(&base);
+    for sub in subs {
+        wrote |= apply(&format!("{base}\\{sub}"));
+    }
+    wrote
+}
+
+/// REG_SZ 原始字节 → String（去掉结尾 NUL）。
+unsafe fn decode_utf16z(raw: &[u8]) -> String {
+    let mut units: Vec<u16> = Vec::with_capacity(raw.len() / 2);
+    let mut i = 0;
+    while i + 1 < raw.len() {
+        units.push(u16::from_le_bytes([raw[i], raw[i + 1]]));
+        i += 2;
+    }
+    let end = units.iter().position(|&c| c == 0).unwrap_or(units.len());
+    String::from_utf16_lossy(&units[..end])
+}
+
 /// 供自检/排查用：本机扫到了多少个可用 bag。
 pub fn debug_slot_count() -> usize {
     slot_map().len()

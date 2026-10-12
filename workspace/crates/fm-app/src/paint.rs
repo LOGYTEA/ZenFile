@@ -1389,12 +1389,21 @@ fn draw_chrome_glyph(app: &App, hdc: HDC, r: &RECT, which: ChromeGlyph) {
                 let _ = DeleteObject(b.into());
             }
             ChromeGlyph::MoreDots => {
-                let d = ((3.0 * s).round() as i32).max(2);
-                let gap = (4.0 * s).round() as i32;
+                // **三条杠**（第33轮：用户要求把"更多"菜单从三个点改成
+                // hamburger —— 三个点看着像"还有更多内容"，而这个键的实际
+                // 语义是"主菜单"，三条杠才是那个意思）。
+                //
+                // 尺寸与三个窗口键（最小化/最大化/关闭）**同一套口径**：
+                // 宽 11px、高 11px、线宽 1px，所以它跟旁边那排键看上去
+                // 是同一族，不会一个胖一个瘦。
+                let w = (11.0 * s).round() as i32;
+                let th = (1.0 * s).round().max(1.0) as i32;
+                // 三条线的 y 间距：4px（11px 的框里放 3 条，视觉重心居中）
+                let step = (4.0 * s).round().max(3.0) as i32;
                 let b = CreateSolidBrush(app.theme.text);
                 for k in -1..=1 {
-                    let x = cx + k * (d + gap) - d / 2;
-                    let _ = Ellipse(hdc, x, cy - d / 2, x + d, cy - d / 2 + d);
+                    let y = cy + k * step - th / 2;
+                    let _ = FillRect(hdc, &RECT { left: cx - w / 2, top: y, right: cx - w / 2 + w, bottom: y + th }, b);
                 }
                 let _ = DeleteObject(b.into());
             }
@@ -1438,8 +1447,13 @@ fn draw_caption_glyph(app: &App, hdc: HDC, r: &RECT, which: u8) {
         };
         match which {
             1 => {
-                // 最小化：底部一条横线
-                bar(cx - half, cy + half - th, cx - half + box_w, cy + half);
+                // 最小化：一条横线。**y 位置刻意压在几何中心之下 2px** ——
+                // 贴到符号框底边（原来的 `cy + half`）看着就是"掉在地上"，
+                // 用户原话"最小化不要贴地上"。资源管理器的减号也是这个位置：
+                // 符号框高 11px，横线在第 8~9 行，上下留白 3/2。
+                let th = (1.0 * s).round().max(1.0) as i32;
+                let y = cy + (half - 2 * s.round() as i32).max(1);
+                bar(cx - half, y, cx - half + box_w, y + th);
             }
             2 => {
                 let top = cy - half;
@@ -1506,10 +1520,23 @@ fn draw_caption_button(app: &App, hdc: HDC, r: &RECT, which: u8) {
 }
 
 /// 标题栏自有按钮（侧栏开关 / 更多菜单）：带悬停底色，观感对齐资源管理器。
+///
+/// **「更多」这个键是常驻带底色的**（第33轮用户要求"永远自己就带一层白色
+/// 背景"）：它是主菜单入口，不是那种"鼠标划过去才显出来"的次要控件 ——
+/// 之前只在 hover 时给底色，看上去跟旁边的窗口键不属于同一排，也让人
+/// 怀疑"那里到底有没有东西"。所以只有**侧栏折叠开关**保持"平时透明、
+/// hover 才亮"，两个键的语义本来就不同（一个折叠面板，一个开菜单）。
 fn draw_chrome_button(app: &App, hdc: HDC, r: &RECT, glyph: ChromeGlyph, hover: bool) {
     let t = &app.theme;
     unsafe {
-        let bg = if hover { t.hover_bg } else { t.chrome_bg };
+        let always_on = matches!(glyph, ChromeGlyph::MoreDots);
+        let bg = if hover {
+            t.hover_bg
+        } else if always_on {
+            t.surface
+        } else {
+            t.chrome_bg
+        };
         fill_radius(app, hdc, "title.button", r, bg, None);
         draw_chrome_glyph(app, hdc, r, glyph);
     }
@@ -2222,20 +2249,23 @@ pub fn sidebar_split_rect(l: &Layout) -> RECT {
 /// 规则是"第 n 列的右边线 = 下一列的起点"，最后一列也一样（资源管理器允许
 /// 拖 大小 的右边线）。列序号固定为 0=名称 1=修改日期 2=类型 3=大小 ——
 /// 搜索态多出来的"位置"列不改序号，否则拖一次就拖错列。
+/// 表头分隔线的位置：每一列的右沿 + 最后补一条"内容区右沿"。
+///
+/// 返回 `(列下标, x)`。下标是**当前可见列的顺序**（第33轮列可增删改序），
+/// 拖列宽/命中都按这个下标走，不再有"0=名称 1=日期 2=类型 3=大小"的硬编码。
 pub fn header_splits(app: &App, l: &Layout) -> Vec<(usize, i32)> {
     if app.tab().view_mode != fm_core::ViewMode::Details {
         return Vec::new();
     }
     // 详细信息视图的图标恒为 16（与 paint_view 里同一套取值）
     let icon_size = (16.0 * app.metrics.scale) as i32;
-    let cols = detail_cols(app, l, icon_size);
-    let next_name = cols.path.unwrap_or(cols.date);
-    vec![
-        (0, next_name),
-        (1, cols.kind),
-        (2, cols.size),
-        (3, cols.size + cols.size_w),
-    ]
+    let boxes = col_boxes(app, l, icon_size);
+    let mut out: Vec<(usize, i32)> = boxes.iter().enumerate().map(|(i, b)| (i, b.x + b.w)).collect();
+    // 最后一条：整块列区右沿（拖它 = 拉伸最后一列）
+    if let Some(last) = boxes.last() {
+        out.push((boxes.len(), last.x + last.w));
+    }
+    out
 }
 
 /// 光标落在表头的哪一列上（0=名称，搜索态 1=位置，其后 修改日期/类型/大小）。
@@ -2251,17 +2281,10 @@ pub fn header_col_hit(app: &App, l: &Layout, x: i32, y: i32) -> Option<usize> {
         return None;
     }
     let icon_size = (16.0 * app.metrics.scale) as i32;
-    let cols = detail_cols(app, l, icon_size);
-    let mut list: Vec<(i32, i32)> = vec![(cols.name, cols.name_w)];
-    if let Some(p) = cols.path {
-        list.push((p, cols.path_w));
-    }
-    list.push((cols.date, cols.date_w));
-    list.push((cols.kind, cols.kind_w));
-    list.push((cols.size, cols.size_w));
-    for (i, (x0, w)) in list.iter().enumerate() {
-        let right = (*x0 + w).min(l.view.right);
-        if x >= *x0 && x < right.max(*x0) {
+    let boxes = col_boxes(app, l, icon_size);
+    for (i, b) in boxes.iter().enumerate() {
+        let right = (b.x + b.w).min(l.view.right);
+        if x >= b.x && x < right.max(b.x) {
             return Some(i);
         }
     }
@@ -2272,15 +2295,11 @@ pub fn header_col_hit(app: &App, l: &Layout, x: i32, y: i32) -> Option<usize> {
 pub fn header_filter_rect(app: &App, l: &Layout, col: usize) -> RECT {
     let s = app.metrics.scale;
     let icon_size = (16.0 * s) as i32;
-    let cols = detail_cols(app, l, icon_size);
-    let mut list: Vec<(i32, i32)> = vec![(cols.name, cols.name_w)];
-    if let Some(p) = cols.path {
-        list.push((p, cols.path_w));
-    }
-    list.push((cols.date, cols.date_w));
-    list.push((cols.kind, cols.kind_w));
-    list.push((cols.size, cols.size_w));
-    let (x0, w) = list.get(col).copied().unwrap_or((l.view.left, 0));
+    let boxes = col_boxes(app, l, icon_size);
+    let (x0, w) = boxes
+        .get(col)
+        .map(|b| (b.x, b.w))
+        .unwrap_or((l.view.left, 0));
     let right = (x0 + w).min(l.view.right);
     let aw = (16.0 * s) as i32;
     RECT {
@@ -2747,29 +2766,88 @@ pub struct DetailCols {
     pub size_w: i32,
 }
 
-pub fn detail_cols(app: &App, l: &Layout, icon_size: i32) -> DetailCols {
+// —— 通用列布局（第33轮：列可显示/隐藏/排序）——
+
+/// 一列的落位：左沿 x + 宽度（像素）。
+pub struct ColBox {
+    pub id: &'static str,
+    pub x: i32,
+    pub w: i32,
+}
+
+/// 详细列表**当前实际画的那几列**的几何。绘制 / 命中 / 拖列宽 /
+/// 表头右键**全部读这一份**（老纪律：几何只有一处来源）。
+///
+/// 名称列左移让出图标位（21px 缩进 + 图标宽 + 3px 间隙），其余列紧挨排列。
+/// 搜索态的「位置」列由 `App::visible_cols` 注入，所以这里不用特殊处理。
+pub fn col_boxes(app: &App, l: &Layout, icon_size: i32) -> Vec<ColBox> {
     let s = app.metrics.scale;
     let text_pad = (21.0 * s) as i32;
     let icon_gap = (3.0 * s) as i32;
-    let name = l.view.left + text_pad + icon_size + icon_gap;
     let searching = app.tab().search_root.is_some();
-    // 列宽是用户能拖的（存在配置里），这里只是把它按 DPI 放大。
-    // 搜索态多一列"位置"，名称列让出空间（照资源管理器搜索结果的做法）。
-    let w = app.col_widths();
-    let (name_w, path_w) = if searching {
-        ((w[0].min(190) as f32 * s) as i32, (270.0 * s) as i32)
-    } else {
-        ((w[0] as f32 * s) as i32, 0)
+    let mut out: Vec<ColBox> = Vec::new();
+    let mut x = l.view.left;
+    for id in app.visible_cols() {
+        let idc: &'static str = fm_core::columns::COL_ALL
+            .iter()
+            .copied()
+            .find(|c| *c == id)
+            .unwrap_or("name");
+        let w = if searching && idc == fm_core::columns::C_NAME {
+            // 搜索态名称列收窄给「位置」列腾地方（照资源管理器）
+            ((app.col_width(idc).min(190) as f32 * s) as i32)
+        } else {
+            ((app.col_width(idc) as f32 * s) as i32)
+        };
+        if idc == fm_core::columns::C_NAME {
+            x = l.view.left + text_pad + icon_size + icon_gap;
+        }
+        out.push(ColBox { id: idc, x, w });
+        x += w;
+    }
+    out
+}
+
+/// 找某一列的几何（按 id）。
+pub fn col_box_of<'a>(boxes: &'a [ColBox], id: &str) -> Option<&'a ColBox> {
+    boxes.iter().find(|b| b.id == id)
+}
+
+/// 列区**总右沿** = 最后一列的 x + w。
+///
+/// 行高亮/悬停底色的右沿、点击判空白的边界都用它 —— 与表头分隔线同一来源，
+/// 天然对齐（第32轮 #1 的教训：这两个必须同口径）。
+pub fn cols_right(boxes: &[ColBox]) -> i32 {
+    boxes.last().map(|b| b.x + b.w).unwrap_or(0)
+}
+
+/// 光标落在哪一列上（按可见列顺序，返回下标）。
+pub fn col_index_at(boxes: &[ColBox], x: i32) -> Option<usize> {
+    boxes.iter().position(|b| x >= b.x && x < b.x + b.w)
+}
+
+/// 列下标 → 列 id（命中测试与排序都靠它翻译）。
+pub fn col_id_at(app: &App, boxes: &[ColBox], x: i32) -> Option<&'static str> {
+    col_index_at(boxes, x).and_then(|i| boxes.get(i)).map(|b| b.id)
+}
+
+/// 旧结构的兼容壳：把通用列几何翻译成"名称/日期/类型/大小"四个字段。
+///
+/// 存量代码（筛选菜单、排序命中、拖列宽）暂时还用这套；等它们各自迁到
+/// `col_boxes` 之后再删。不另起一套几何 —— 这里只做字段翻译。
+pub fn detail_cols(app: &App, l: &Layout, icon_size: i32) -> DetailCols {
+    let boxes = col_boxes(app, l, icon_size);
+    let get = |id: &str| -> (i32, i32) {
+        col_box_of(&boxes, id).map(|b| (b.x, b.w)).unwrap_or((0, 0))
     };
-    let date = name + name_w + path_w;
-    let date_w = (w[1] as f32 * s) as i32;
-    let kind = date + date_w;
-    let kind_w = (w[2] as f32 * s) as i32;
-    let size = kind + kind_w;
-    let size_w = (w[3] as f32 * s) as i32;
+    let (name, name_w) = get(fm_core::columns::C_NAME);
+    let (path, path_w) = get(fm_core::columns::C_PATH);
+    let (date, date_w) = get(fm_core::columns::C_DATE_MOD);
+    let (kind, kind_w) = get(fm_core::columns::C_TYPE);
+    let (size, size_w) = get(fm_core::columns::C_SIZE);
     DetailCols {
         name,
-        path: if searching { Some(name + name_w) } else { None },
+        path: if path_w > 0 { Some(path) } else { None },
         date,
         kind,
         size,
@@ -2846,11 +2924,12 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
         } else {
             (16.0 * app.metrics.scale) as i32
         };
-        let cols = detail_cols(app, l, icon_size);
-        let col_name = cols.name;
-        let col_date = cols.date;
-        let col_type = cols.kind;
-        let col_size = cols.size;
+        // 列几何：算**一次**，行循环与表头循环共用（第33轮：列可显示/隐藏/排序）
+        let boxes = col_boxes(app, l, icon_size);
+        let col_name = col_box_of(&boxes, fm_core::columns::C_NAME).map(|b| b.x).unwrap_or(l.view.left);
+        let col_date = 0;
+        let col_type = 0;
+        let col_size = 0;
 
         let visible: Vec<usize> = app.tab().visible.clone();
         // 当前正在被拖走的那些条目的 key（小写路径）—— 画的时候要调淡
@@ -2891,6 +2970,9 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
         // 资源管理器就是这么区分的（不换图标，只把图标压暗），照抄能让人一眼认出。
         let mut icon_alpha: Vec<u8> = Vec::with_capacity(n);
         let mut names: Vec<String> = Vec::with_capacity(n);
+        // 文字要不要用暗色（缓存文件夹）。图标淡了字还是全亮的话，
+        // 看上去只是"图标旧了"而不是"这个目录是临时的"。
+        let mut dim_text: Vec<bool> = Vec::with_capacity(n);
         let mut size_texts: Vec<String> = Vec::with_capacity(n);
         let show_ext = app.cfg.files.view.show_extensions;
         let unit = app.cfg.files.view.size_unit_of();
@@ -2906,6 +2988,7 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
                     e.is_dir(),
                     e.is_hidden(),
                     e.is_system(),
+                    fm_core::columns::is_cache_dir(&e.name) && e.is_dir(),
                 )
             }) else {
                 icon_handles.push(HICON(std::ptr::null_mut()));
@@ -2913,10 +2996,19 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
                 icon_alpha.push(255);
                 names.push(String::new());
                 size_texts.push(String::new());
+                dim_text.push(false);
                 continue;
             };
-            let (path, name, size, is_dir, is_hidden, is_system) = snap;
+            let (path, name, size, is_dir, is_hidden, is_system, is_cache) = snap;
             let mut alpha = if is_system { 110 } else if is_hidden { 150 } else { 255 };
+            // 缓存/临时文件夹：图标与文字一起压淡（第33轮）。
+            //
+            // 为什么不复用 hidden 的 150：那档是"你看不见它"，而缓存目录是
+            // "它就在那儿、但内容是丢掉也没关系的" —— 用另一档（120）才能
+            // 跟隐藏项区分开，扫一眼就知道这个目录别去备份。
+            if is_cache {
+                alpha = alpha.min(120);
+            }
             // 正在被拖走的那些条目要淡下去。资源管理器就是这么表示的：东西已经
             // "拎在手上"，原地剩下的是一个占位影子，不然根本看不出拖的是哪几个。
             if dragged.contains(&path.to_string_lossy().to_lowercase()) {
@@ -2929,6 +3021,7 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
                 alpha = alpha.min(130);
             }
             icon_alpha.push(alpha);
+            dim_text.push(is_cache);
             let ext = path
                 .extension()
                 .map(|x| format!(".{}", x.to_string_lossy()))
@@ -3000,9 +3093,10 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
                 // 列表视图没有列分隔，整行就该整行可点可画（行式列表的语义）。
                 None => {
                     let w = if mode == fm_core::ViewMode::Details {
+                        // 列区右沿 = 最后一列的 x+w（表头分隔线同源，第32轮 #1）
                         let icon_size = (16.0 * app.metrics.scale) as i32;
-                        let cols = detail_cols(app, l, icon_size);
-                        ((cols.size + cols.size_w).min(l.view.right) - l.view.left).max(10)
+                        let boxes = col_boxes(app, l, icon_size);
+                        (cols_right(&boxes).min(l.view.right) - l.view.left).max(10)
                     } else {
                         l.view.right - l.view.left
                     };
@@ -3046,44 +3140,70 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
             let alpha = icon_alpha.get(k).copied().unwrap_or(255);
             let name = names.get(k).cloned().unwrap_or_default();
             if mode == fm_core::ViewMode::Details {
+                // 名称列特殊：左边要让出图标位，所以 x 由 col_boxes 给
                 draw_item_icon(app, hdc, icon, thumb, col_name - icon_size - icon_gap, y + (row_h - icon_size) / 2, icon_size, alpha);
-                let name_r = RECT {
-                    left: col_name,
-                    top: y,
-                    right: cols.path.unwrap_or(col_date),
-                    bottom: y + row_h,
-                };
-                // 必须带 DT_END_ELLIPSIS：名字长了不省略就会一路画到下一列上
-                // （"条目长度"不对的真因 —— 长文件名的字压在"修改日期"上面）。
-                draw_text(
-                    hdc,
-                    &name,
-                    name_r,
-                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
-                );
-                SetTextColor(hdc, if selected { t.selection_text } else { t.text_dim });
-                if let Some(px0) = cols.path {
-                    // 搜索结果里的"位置"：显示所在文件夹，超长省略中间
-                    let folder = entry
-                        .path
-                        .parent()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_default();
+                // 名称列文字：右沿 = 名称列自己的右沿（隐藏了「位置」列时
+                // 就是下一列的左沿）。必须带 DT_END_ELLIPSIS：名字长了不省略
+                // 就会一路画到下一列上（长文件名压在"修改日期"上面）。
+                if let Some(nb) = col_box_of(&boxes, fm_core::columns::C_NAME) {
+                    let dim = dim_text.get(k).copied().unwrap_or(false);
+                    if dim && !selected {
+                        SetTextColor(hdc, t.text_dim);
+                    }
                     draw_text(
                         hdc,
-                        &folder,
-                        RECT { left: px0, top: y, right: col_date, bottom: y + row_h },
-                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+                        &name,
+                        RECT { left: nb.x, top: y, right: nb.x + nb.w - 4, bottom: y + row_h },
+                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+                    );
+                    if dim && !selected {
+                        SetTextColor(hdc, t.text);
+                    }
+                }
+                // 其余列**按当前可见列逐个画**（第33轮：列可显示/隐藏/排序，
+                // 不能再写死"日期/类型/大小"三个字段）。每列都夹在自己的
+                // [x, x+w) 里，DT_END_ELLIPSIS 兜底 —— 少一个就会串列。
+                SetTextColor(hdc, if selected { t.selection_text } else { t.text_dim });
+                let cell = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS;
+                let show_ext = app.cfg.files.view.show_extensions;
+                for b in &boxes {
+                    if b.id == fm_core::columns::C_NAME {
+                        continue;
+                    }
+                    let txt = match b.id {
+                        // 大小列：目录恒空（画 `—`），文件用格式化后的值
+                        fm_core::columns::C_SIZE => {
+                            if entry.is_dir() {
+                                "—".to_string()
+                            } else {
+                                size_texts.get(k).cloned().unwrap_or_default()
+                            }
+                        }
+                        fm_core::columns::C_TYPE => entry.type_label(),
+                        fm_core::columns::C_PATH => entry
+                            .path
+                            .parent()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_default(),
+                        _ => match fm_core::columns::cell(b.id, entry, show_ext) {
+                            Some(s) => s,
+                            None => "—".to_string(),
+                        },
+                    };
+                    let mut cx = b.x;
+                    // 搜索态「位置」列靠右对齐更像资源管理器，其余左对齐
+                    let mut fl = cell;
+                    if b.id == fm_core::columns::C_SIZE {
+                        fl = DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS;
+                    }
+                    let _ = &mut cx;
+                    draw_text(
+                        hdc,
+                        &txt,
+                        RECT { left: b.x, top: y, right: b.x + b.w - 4, bottom: y + row_h },
+                        fl,
                     );
                 }
-                // 后三列同样要夹在各自列宽里：少了 NOPREFIX 会把文件名里的 `&`
-                // 画出来，少了 END_ELLIPSIS 就会串列。
-                let cell = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS;
-                draw_text(hdc, &format_date(entry.modified), RECT { left: col_date, top: y, right: col_type, bottom: y + row_h }, cell);
-                draw_text(hdc, &entry.type_label(), RECT { left: col_type, top: y, right: col_size, bottom: y + row_h }, cell);
-                // 最后一列也要夹在自己的列宽里，不能一路画到窗口右边缘 ——
-                // 那样"大小"那列看着比表头长一截，和表头对不上。
-                draw_text(hdc, size_texts.get(k).unwrap_or(&String::new()), RECT { left: col_size, top: y, right: col_size + cols.size_w, bottom: y + row_h }, cell);
             } else if mode == fm_core::ViewMode::List {
                 let ix = l.view.left + text_pad;
                 draw_item_icon(app, hdc, icon, thumb, ix, y + (row_h - icon_size) / 2, icon_size, alpha);
@@ -3113,36 +3233,32 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
             let sort = app.tab().sort;
             let hf = header_font(app.metrics.scale);
             let old = SelectObject(hdc, hf.into());
-            let mut cols_hdr = [
-                ("名称", fm_core::SortKey::Name, col_name, cols.name_w),
-                ("修改日期", fm_core::SortKey::Modified, col_date, cols.date_w),
-                ("类型", fm_core::SortKey::Type, col_type, cols.kind_w),
-                ("大小", fm_core::SortKey::Size, col_size, cols.size_w),
-            ];
-            let mut path_hdr = ("位置", fm_core::SortKey::Name, 0, 0);
-            let mut all: Vec<(&str, fm_core::SortKey, i32, i32)> = Vec::new();
-            all.push(cols_hdr[0]);
-            if let Some(px0) = cols.path {
-                path_hdr.2 = px0;
-                path_hdr.3 = cols.path_w;
-                all.push(path_hdr);
-            }
-            all.extend_from_slice(&cols_hdr[1..]);
-            for (ci, (label, key, x0, w)) in all.iter().enumerate() {
-                let label: &str = *label;
-                let _ = &mut cols_hdr;
+            // 表头也走**当前可见列**（第33轮）：列名与列几何同一来源，
+            // 隐藏掉的列这里不会露出一个空标题。
+            for (ci, b) in boxes.iter().enumerate() {
+                let label: &str = fm_core::columns::label_of(b.id);
                 // 列名一律**夹在自己那一列的宽度里**：不夹的话列宽拖窄之后，
                 // 列名会一路画到右边那一列的头上（"列拖不动/看着乱"的观感来源）。
-                let right = (x0 + w).min(l.view.right);
-                let rr = RECT { left: *x0, top: l.view.top, right: right.max(*x0), bottom: l.view.top + header_h };
-                let active = sort.key == *key;
+                let right = (b.x + b.w).min(l.view.right);
+                let rr = RECT { left: b.x, top: l.view.top, right: right.max(b.x), bottom: l.view.top + header_h };
+                // 只有可排序的列才有排序箭头；作者/标记这类列点了没反应
+                let key: Option<fm_core::SortKey> = match b.id {
+                    fm_core::columns::C_NAME => Some(fm_core::SortKey::Name),
+                    fm_core::columns::C_DATE_MOD
+                    | fm_core::columns::C_DATE_CREATED
+                    | fm_core::columns::C_DATE_ACCESSED => Some(fm_core::SortKey::Modified),
+                    fm_core::columns::C_TYPE => Some(fm_core::SortKey::Type),
+                    fm_core::columns::C_SIZE => Some(fm_core::SortKey::Size),
+                    _ => None,
+                };
+                let active = key.map(|k| sort.key == k).unwrap_or(false);
                 SetTextColor(hdc, if active { t.text } else { t.text_dim });
                 // 列名在**自己这一列里居中**（资源管理器 Win11 表头就是这样）：
                 // 贴着左沿画的时候，它紧贴上一列的分隔线，看着像那一列的尾巴。
                 let tw = unsafe { text_width(hdc, hf, label) };
                 let arrow_w = if active { (14.0 * app.metrics.scale) as i32 } else { 0 };
                 let block_w = tw + arrow_w;
-                let bx = *x0 + ((rr.right - rr.left) - block_w) / 2;
+                let bx = b.x + ((rr.right - rr.left) - block_w) / 2;
                 let tr = RECT { left: bx, top: rr.top, right: bx + tw, bottom: rr.bottom };
                 draw_text(
                     hdc,
@@ -3165,7 +3281,7 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
                 }
                 // 悬停在这一列上时，右端露出一个"筛选"小箭头（资源管理器同款）：
                 // 点它下拉出这一列的筛选项。没有它用户不知道表头还能筛。
-                if app.hover_header == Some(ci) {
+                if app.hover_header == Some(ci) && key.is_some() {
                     let aw = (16.0 * app.metrics.scale) as i32;
                     let fr = RECT {
                         left: (rr.right - aw).max(rr.left),
@@ -4036,8 +4152,19 @@ const EC_RIGHTMARGIN: u32 = 0x0002;
 
 /// 搜索框内边距：左 26（放大镜 + 间隙）、右 8。`EM_SETMARGINS` 的 lparam
 /// 是 **低 16 位左、高 16 位右**，写反了图标和文字就叠在一起。
+/// 搜索框的左边距（放大镜占位）。
+///
+/// 与 `paint_search_decor` 里画的放大镜**同一个公式** —— 这两个值必须
+/// 一起改。以前这里写死 26 而放大镜按 scale 缩放，缩放不为 1 时文字就会
+/// 压在放大镜上。
+fn search_left_margin(scale: f32) -> i32 {
+    let m = ((28.0 * scale).round() as f32 * 0.28).round().max(4.0) as i32;
+    let pad = (6.0 * scale).round() as i32;
+    pad + m * 2 + (4.0 * scale).round() as i32
+}
+
 fn margins_for(scale: f32) -> isize {
-    let l = (26.0 * scale).round() as i32;
+    let l = search_left_margin(scale);
     let r = (8.0 * scale).round() as i32;
     ((l & 0xFFFF) | ((r & 0xFFFF) << 16)) as isize
 }
@@ -4048,6 +4175,31 @@ pub fn edit_margins(scale: f32, left: i32, right: i32) -> isize {
     let l = ((left as f32) * scale).round() as i32;
     let r = ((right as f32) * scale).round() as i32;
     ((l & 0xFFFF) | ((r & 0xFFFF) << 16)) as isize
+}
+
+/// 输入框统一内边距（DIP）。全应用一个口径。
+///
+/// 第33轮之前是五处各写各的（地址栏 8/8、搜索框 26/8、重命名 4/4、
+/// 批量重命名 6/6），同一个界面里输入框的文字起点差十几像素，看着就是
+/// "没对齐"。搜索框的左边距要额外让出放大镜，由 `search_left_margin` 单独算。
+pub(crate) const EDIT_PAD: i32 = 8;
+
+/// 给任意 EDIT 套上"本应用的输入框"标准外观：UI 字体 + 统一内边距 +
+/// 去掉系统那圈立体边框（暗色主题下 WS_EX_CLIENTEDGE 的白边非常突兀，
+/// 跟自绘控件完全不是一路）。
+pub(crate) fn style_edit(hwnd: HWND, scale: f32, left: i32, right: i32) {
+    unsafe {
+        // 去掉 WS_EX_CLIENTEDGE（0x200）：暗色主题下系统那圈立体白边非常突兀。
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & !(WS_EX_CLIENTEDGE.0 as isize));
+    }
+    set_edit_font(hwnd, scale);
+    set_edit_margins(hwnd, scale, left, right);
+    // 改了 EXSTYLE/边距之后要重排一次，否则控件还按旧的边框留白
+    unsafe {
+        let _ = SendMessageW(hwnd, WM_SIZE, Some(WPARAM(0)), Some(LPARAM(0)));
+        let _ = InvalidateRect(Some(hwnd), None, true);
+    }
 }
 
 /// 给任意 EDIT 设左右内边距。低 16 位是左、高 16 位是右，写反了文字就贴错边。
@@ -4085,26 +4237,35 @@ fn paint_search_decor(hwnd: HWND, hdc_in: Option<HDC>) {
         let mut r = RECT::default();
         let _ = GetClientRect(hwnd, &mut r);
         SetBkMode(hdc, TRANSPARENT);
-        // 放大镜：垂直居中，左边距 6
-        let g = glyph_font(scale);
-        let old = SelectObject(hdc, g.into());
-        SetTextColor(hdc, t.text_dim);
-        let side = ((r.bottom - r.top) as f32 * 1.1).round() as i32;
-        let ir = RECT {
-            left: (6.0 * scale).round() as i32,
-            top: (r.top + r.bottom - side) / 2,
-            right: (6.0 * scale).round() as i32 + side,
-            bottom: (r.top + r.bottom + side) / 2,
-        };
-        draw_text(hdc, "\u{E721}", ir, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        SelectObject(hdc, old);
+        // 放大镜：**自己用椭圆 + 斜线画**，不用字体字形。
+        //
+        // 第33轮用户截图报"搜索栏扭曲成竖条"：原来是把 Segoe MDL2 的 U+E721
+        // 当**文字**用 DrawTextW 画的，而字形字体的行高受 DT_SINGLELINE 限制，
+        // 那个图标字符被压扁成了一条竖着的条纹。矢量画在物理上不可能畸变。
+        let m = ((r.bottom - r.top) as f32 * 0.28).round().max(4.0) as i32; // 半径
+        let lw = (1.0 * scale).round().max(1.0) as i32;
+        let cx = (6.0 * scale).round() as i32 + m;
+        let cy = (r.top + r.bottom) / 2 - m / 4;   // 偏上一点点：给下方手柄留位，整体仍与文字齐平
+        let pen = CreatePen(PS_SOLID, lw, t.text_dim);
+        let op = SelectObject(hdc, pen.into());
+        let ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        let _ = Ellipse(hdc, cx - m, cy - m, cx + m, cy + m);
+        // 手柄：从圆右下 45° 伸出去的那一小段
+        let h = ((m as f32 * 0.9) as i32).max(3);
+        let _ = MoveToEx(hdc, cx + m / 2, cy + m / 2, None);
+        let _ = LineTo(hdc, cx + m / 2 + h, cy + m / 2 + h);
+        let _ = SelectObject(hdc, ob);
+        let _ = SelectObject(hdc, op);
+        let _ = DeleteObject(pen.into());
         if empty {
-            // 提示文字：跟着输入的起点（左边距之后），垂直居中
+            // 提示文字：起点跟着**放大镜实际占位**（左内边距 + 直径 + 间隙），
+            // 不能写死 26 —— 半径随 scale 变，写死就会出现字压在放大镜上。
+            let text_left = cx + m + (4.0 * scale).round() as i32;
             let f = ui_font(scale);
             let old2 = SelectObject(hdc, f.into());
             SetTextColor(hdc, t.text_dim);
             let tr = RECT {
-                left: (26.0 * scale).round() as i32,
+                left: text_left,
                 top: r.top,
                 right: r.right - (8.0 * scale).round() as i32,
                 bottom: r.bottom,
@@ -4147,8 +4308,7 @@ pub fn create_children(app: &mut App, instance: Option<HINSTANCE>) {
         .unwrap_or_default();
         app.hwnd_address = addr;
         ADDR_OLD = SetWindowLongPtrW(addr, GWLP_WNDPROC, (addr_proc as *const ()) as isize);
-        set_edit_font(addr, app.metrics.scale);
-        set_edit_margins(addr, app.metrics.scale, 8, 8);
+        style_edit(addr, app.metrics.scale, EDIT_PAD, EDIT_PAD);
         // 平时是面包屑，EDIT 只在编辑态才露出来（Win11 的资源管理器也是这样）。
         let _ = ShowWindow(addr, SW_HIDE);
 
@@ -4169,13 +4329,13 @@ pub fn create_children(app: &mut App, instance: Option<HINSTANCE>) {
         .unwrap_or_default();
         app.hwnd_search = search;
         SEARCH_OLD = SetWindowLongPtrW(search, GWLP_WNDPROC, (search_proc as *const ()) as isize);
-        set_edit_font(search, app.metrics.scale);
-        // 左边留出放大镜的位置（EC_LEFTMARGIN），否则输入的文字会压在图标下面
-        let _ = SendMessageW(
+        // 左边留出放大镜的位置（EC_LEFTMARGIN），否则输入的文字会压在图标下面。
+        // 数值与 paint_search_decor 里画的放大镜同源（search_left_margin）。
+        style_edit(
             search,
-            EM_SETMARGINS,
-            Some(WPARAM((EC_LEFTMARGIN | EC_RIGHTMARGIN) as usize)),
-            Some(LPARAM(margins_for(app.metrics.scale))),
+            app.metrics.scale,
+            search_left_margin(app.metrics.scale),
+            EDIT_PAD,
         );
     }
 }
@@ -4257,7 +4417,7 @@ pub fn create_rename_editor(app: &mut App, select_stem: bool) {
         .min((max_right - x).max((70.0 * app.metrics.scale) as i32));
     unsafe {
         let hwnd = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
+            WINDOW_EX_STYLE(0), // 边框由 style_edit 统一去掉（第33轮：输入框视觉对齐）
             windows::core::PCWSTR(edit_class.as_ptr()),
             windows::core::PCWSTR::null(),
             WS_CHILD | WS_VISIBLE | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
@@ -4273,8 +4433,7 @@ pub fn create_rename_editor(app: &mut App, select_stem: bool) {
         .unwrap_or_default();
         app.rename_hwnd = Some(hwnd);
         RENAME_OLD = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (rename_proc as *const ()) as isize);
-        set_edit_font(hwnd, app.metrics.scale);
-        set_edit_margins(hwnd, app.metrics.scale, 4, 4);
+        style_edit(hwnd, app.metrics.scale, EDIT_PAD, EDIT_PAD);
         let text = wide(&initial);
         let _ = SetWindowTextW(hwnd, windows::core::PCWSTR(text.as_ptr()));
         // 选区终点：默认整串；只选主部时停在最后一个点之前。
@@ -4416,10 +4575,18 @@ pub fn end_address_edit(app: &mut App, refocus: bool) {
     }
     app.addr_editing = false;
     unsafe {
-        let _ = ShowWindow(app.hwnd_address, SW_HIDE);
+        // **焦点必须显式交出去**（第33轮用户报"单击目录栏变成输入的样子，
+        // 无法退出"）。EDIT 是 WS_CHILD：它隐藏之后焦点仍然停在它身上，
+        // 键盘消息全进了一个不可见的窗口 —— 表现为"打不了字、Esc 也无效、
+        // 点内容区也没反应"，界面永远卡在编辑态。
+        //
+        // `refocus=false`（WM_KILLFOCUS 来的）时不能抢焦点，但**父窗口必须
+        // 拿到键盘**：`WM_NEXTFOCUS` 让系统自己把焦点顺着 Z 序给下一个窗口，
+        // 父窗口就是下一个。
         if refocus {
             let _ = SetFocus(Some(app.hwnd));
         }
+        let _ = ShowWindow(app.hwnd_address, SW_HIDE);
         let _ = InvalidateRect(Some(app.hwnd), None, true);
     }
 }

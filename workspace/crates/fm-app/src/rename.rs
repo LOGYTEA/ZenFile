@@ -343,7 +343,8 @@ fn make_edit(parent: HWND, id: u16, r: &RECT, text: &str, scale: f32) -> HWND {
     unsafe {
         let cls = HSTRING::from("EDIT");
         let h = CreateWindowExW(
-            windows::Win32::UI::WindowsAndMessaging::WS_EX_CLIENTEDGE,
+            // 边框交给 style_edit 统一处理（第33轮：输入框视觉对齐）
+            windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
             PCWSTR(cls.as_ptr()),
             PCWSTR(HSTRING::from(text).as_ptr()),
             WS_CHILD | WS_VISIBLE | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
@@ -359,8 +360,7 @@ fn make_edit(parent: HWND, id: u16, r: &RECT, text: &str, scale: f32) -> HWND {
         .unwrap_or_default();
         let _ = SetWindowLongPtrW(h, GWLP_USERDATA, parent.0 as isize);
         EDIT_OLD = SetWindowLongPtrW(h, GWLP_WNDPROC, (edit_proc as *const ()) as isize);
-        crate::paint::set_edit_font(h, scale);
-        crate::paint::set_edit_margins(h, scale, 6, 6);
+        crate::paint::style_edit(h, scale, crate::paint::EDIT_PAD, crate::paint::EDIT_PAD);
         h
     }
 }

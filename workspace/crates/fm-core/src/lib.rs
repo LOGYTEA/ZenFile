@@ -16,6 +16,7 @@
 pub mod acl;
 pub mod bulk;
 pub mod clipboard;
+pub mod columns;
 pub mod config;
 pub mod folder_ini;
 pub mod drives;
