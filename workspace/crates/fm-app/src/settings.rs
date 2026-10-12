@@ -512,6 +512,9 @@ pub struct Geom {
     pub ui_bars: [RECT; 3],
     /// 界面页：三条带里各自的条目矩形
     pub ui_bar_items: [Vec<RECT>; 3],
+    /// 界面页：**中间预览里**那三条带（标题栏/工具栏/状态栏）的屏幕矩形。
+    /// 预览不是装饰 —— 它和下面三条整条一样是投放目标。
+    pub ui_pv_bars: [RECT; 3],
     /// 打开方式里每一条候选程序
     pub ow_rows: Vec<RECT>,
     /// 「右键菜单」：右下系统集成开关
@@ -618,6 +621,7 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
         ui_preview: RECT::default(),
         ui_bars: [RECT::default(); 3],
         ui_bar_items: [Vec::new(), Vec::new(), Vec::new()],
+        ui_pv_bars: [RECT::default(); 3],
     };
 
     match app.settings_tab {
@@ -692,6 +696,9 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
                 right: content.right,
                 bottom: mid_bot,
             };
+            // 预览里三条带的位置：和 draw_window_preview 共用同一份映射，
+            // 于是"看起来在这条带上"和"判定为这条带"必然一致。
+            g.ui_pv_bars = preview_bands(app, &g.ui_preview);
 
             // —— 上面：小组件，横向流式排布，排满换行 ——
             let mut tx = g.ui_top.left;
@@ -1080,9 +1087,21 @@ fn paint_ui_tab(app: &App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
     draw_window_preview(app, hdc, &g.ui_preview, th, s);
 
     // —— 上面：小组件 ——
-    band_title(hdc, &g.ui_top, "小组件 —— 拖到下面任意一条整条里", th, s);
+    band_title(
+        hdc,
+        &g.ui_top,
+        "小组件 —— 暗的=没装，点一下装上；拖到预览或下面的整条里可放到指定位置",
+        th,
+        s,
+    );
     // —— 右边：长组件 ——
-    band_title(hdc, &g.ui_right, "长组件 —— 侧栏、地址栏那些", th, s);
+    band_title(
+        hdc,
+        &g.ui_right,
+        "长组件 —— 侧栏、地址栏那些；同样点一下装/不装",
+        th,
+        s,
+    );
 
     // —— 最下面：三条最长的整条 ——
     for bi in 0..3 {
@@ -1111,7 +1130,7 @@ fn paint_ui_tab(app: &App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
         }
     }
 
-    // —— 两条调色板里的组件 ——
+    // —— 两条调色板里的组件：没装在任何带子里的画成暗的 ——
     for (i, r) in g.cards.iter().enumerate() {
         let id = g.card_ids[i];
         if id & 0x8000_0000 != 0 {
@@ -1120,8 +1139,97 @@ fn paint_ui_tab(app: &App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
         let wid = (id & 0xFF) as usize;
         let dragging = matches!(&app.settings_drag, Some(d) if d.id == id);
         let hover = app.settings_hover_card == Some(id) && !dragging;
-        draw_widget(app, hdc, r, wid, th, s, hover, dragging);
+        let ghost = widget_bar_of(app, wid as u16).is_none();
+        draw_widget_ex(app, hdc, r, wid, th, s, hover, dragging, ghost);
     }
+
+    // 拖着东西的时候，把**会接收它的那条带**在预览里框出来 —— 不然用户
+    // 不知道往哪儿松手（"拖过去没反应"有一半是这个原因）。
+    if let Some(d) = &app.settings_drag {
+        if let Some((bi, _)) = drop_target(app, g, d.cur.0, d.cur.1) {
+            for br in [g.ui_pv_bars[bi], g.ui_bars[bi]] {
+                if br.right > br.left && br.bottom > br.top {
+                    unsafe {
+                        let p = windows::Win32::Graphics::Gdi::CreatePen(
+                            windows::Win32::Graphics::Gdi::PS_SOLID,
+                            2,
+                            th.accent,
+                        );
+                        let op = SelectObject(hdc, p.into());
+                        let ob = SelectObject(
+                            hdc,
+                            windows::Win32::Graphics::Gdi::GetStockObject(
+                                windows::Win32::Graphics::Gdi::NULL_BRUSH,
+                            ),
+                        );
+                        let _ = windows::Win32::Graphics::Gdi::Rectangle(
+                            hdc, br.left, br.top, br.right, br.bottom,
+                        );
+                        let _ = SelectObject(hdc, ob);
+                        let _ = SelectObject(hdc, op);
+                        let _ = DeleteObject(p.into());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 组件当前装在哪条带（没装返回 None）。
+pub fn widget_bar_of(app: &App, wid: u16) -> Option<usize> {
+    app.ui_settings.bars.iter().position(|b| b.contains(&wid))
+}
+
+/// 组件的"老家"：出厂排布里它在哪条带。点一下装上时用这个。
+fn home_bar_of(wid: u16) -> usize {
+    for (bi, b) in default_bars().iter().enumerate() {
+        if b.contains(&wid) {
+            return bi;
+        }
+    }
+    1
+}
+
+/// 没装 → 装到它本来该待的那条带；装了 → 摘掉（回到调色板等着再装）。
+///
+/// 出厂时 15 个组件全装在带子里，于是"添加"这件事根本无从下手 —— 拖到预览里
+/// 反而变成"拿掉"。给调色板加这条"点一下就装/不装"的通路，添加才真的可行。
+fn toggle_widget(app: &mut App, wid: u16) {
+    if let Some(bi) = widget_bar_of(app, wid) {
+        app.ui_settings.bars[bi].retain(|v| *v != wid);
+    } else {
+        let bi = home_bar_of(wid);
+        let v = &mut app.ui_settings.bars[bi];
+        if !v.contains(&wid) {
+            v.push(wid);
+        }
+    }
+    after_change(app);
+}
+
+/// 落点判定：底部三条整条 **和** 中间预览里那三条带，都算。
+///
+/// `finish_drag()`（真的改配置）和 `paint_ui_tab()`（画投放高亮）共用这一份。
+fn drop_target(app: &App, g: &Geom, x: i32, y: i32) -> Option<(usize, Vec<RECT>)> {
+    let tol = (6.0 * app.metrics.scale).round() as i32;
+    for bi in 0..3 {
+        let br = &g.ui_bars[bi];
+        if br.right > br.left && x >= br.left && x < br.right && y >= br.top - tol && y < br.bottom + tol
+        {
+            return Some((bi, g.ui_bar_items[bi].clone()));
+        }
+    }
+    // 预览里的带子很薄（缩放后可能只有十几像素），给足容差才点得中
+    let k = preview_map(app, &g.ui_preview).k;
+    for bi in 0..3 {
+        let br = &g.ui_pv_bars[bi];
+        if br.right > br.left && x >= br.left && x < br.right && y >= br.top - tol && y < br.bottom + tol
+        {
+            let items = layout_bar(app, bi, br, k).into_iter().map(|(r, _)| r).collect();
+            return Some((bi, items));
+        }
+    }
+    None
 }
 
 fn band_title(hdc: HDC, r: &RECT, name: &str, th: Theme, s: f32) {
@@ -1147,6 +1255,22 @@ fn draw_widget(
     hover: bool,
     dragged: bool,
 ) {
+    draw_widget_ex(app, hdc, r, wid, th, s, hover, dragged, false);
+}
+
+/// `ghost` = 这个组件**当前没装在任何一条带里**（真窗口里不会出现）。
+/// 调色板里这种画成暗的 + 描边，于是"哪些能添加"一眼看得出来。
+fn draw_widget_ex(
+    app: &App,
+    hdc: HDC,
+    r: &RECT,
+    wid: usize,
+    th: Theme,
+    s: f32,
+    hover: bool,
+    dragged: bool,
+    ghost: bool,
+) {
     let Some(wd) = WIDGETS.get(wid) else { return };
     let rid = if wd.long {
         "sidebar.item"
@@ -1159,6 +1283,8 @@ fn draw_widget(
         th.accent
     } else if hover {
         th.hover_bg
+    } else if ghost {
+        th.window_bg
     } else if wd.long {
         th.surface_alt
     } else {
@@ -1169,7 +1295,13 @@ fn draw_widget(
         r,
         app.radius_of(rid),
         fill,
-        if hover && !dragged { Some(th.accent) } else { None },
+        if hover && !dragged {
+            Some(th.accent)
+        } else if ghost {
+            Some(th.border)
+        } else {
+            None
+        },
     );
     let gw = (22.0 * s).round() as i32;
     let mut gr = *r;
@@ -1188,7 +1320,13 @@ fn draw_widget(
         let mut tr = *r;
         tr.left += gw;
         tr.right -= (4.0 * s).round() as i32;
-        set_color(hdc, if dragged { th.selection_text } else { th.text });
+        set_color(hdc, if dragged {
+            th.selection_text
+        } else if ghost {
+            th.text_dim
+        } else {
+            th.text
+        });
         paint::draw_text(
             hdc,
             wd.name,
@@ -1240,113 +1378,173 @@ fn layout_bar(app: &App, bar: usize, host: &RECT, s: f32) -> Vec<(RECT, usize)> 
     out
 }
 
+/// 预览的等比缩放映射：真窗口 (0,0,rw,rh) 缩到预览矩形里居中。
+///
+/// 上一版预览里的标题栏/工具栏/状态栏高度是拍脑袋写的 26/22/18、侧栏宽度是
+/// "占 26%"，而真窗口实际是 34/40/23 和**固定 157px**（`theme::Metrics`），
+/// 于是预览看着像那么回事、和真窗口一个都对不上。这里改成直接按真窗口尺寸
+/// 等比缩放，比例必然一致。
+struct PvMap {
+    ox: f32,
+    oy: f32,
+    k: f32,
+}
+
+fn preview_size(app: &App) -> (f32, f32) {
+    let w = if app.last_size.0 > 200 { app.last_size.0 as f32 } else { 1280.0 };
+    let h = if app.last_size.1 > 160 { app.last_size.1 as f32 } else { 800.0 };
+    (w, h)
+}
+
+fn preview_map(app: &App, host: &RECT) -> PvMap {
+    let (rw, rh) = preview_size(app);
+    let iw = (host.right - host.left) as f32;
+    let ih = (host.bottom - host.top) as f32;
+    let k = if rw > 0.0 && rh > 0.0 { (iw / rw).min(ih / rh) } else { 1.0 };
+    PvMap {
+        ox: host.left as f32 + (iw - rw * k) / 2.0,
+        oy: host.top as f32 + (ih - rh * k) / 2.0,
+        k,
+    }
+}
+
+fn pv_rect(m: &PvMap, l: f32, t: f32, r: f32, b: f32) -> RECT {
+    RECT {
+        left: (m.ox + l * m.k).round() as i32,
+        top: (m.oy + t * m.k).round() as i32,
+        right: (m.ox + r * m.k).round() as i32,
+        bottom: (m.oy + b * m.k).round() as i32,
+    }
+}
+
+/// 预览里三条带的屏幕矩形。
+///
+/// `geom()`（落点判定）和 `draw_window_preview()`（画）共用这一份 ——
+/// 画在哪就判定在哪，不会出现"看着能放、放了没反应"。
+pub fn preview_bands(app: &App, host: &RECT) -> [RECT; 3] {
+    let m = preview_map(app, host);
+    let (rw, rh) = preview_size(app);
+    let tb = app.metrics.title_h as f32;
+    let tbb = tb + app.metrics.toolbar_h as f32;
+    [
+        pv_rect(&m, 0.0, 0.0, rw, tb),
+        pv_rect(&m, 0.0, tb, rw, tbb),
+        pv_rect(&m, 0.0, rh - app.metrics.status_h as f32, rw, rh),
+    ]
+}
+
 /// 中间那块：整个窗口按比例实时渲染。标题栏 / 工具栏 / 状态栏画的是**带子里
 /// 真的装了什么**，所以上面拖一下这里就跟着变。
+///
+/// 结构和真窗口一致：标题栏 → 工具栏（地址栏/搜索框就在这条里）→ 侧栏+内容
+/// → 状态栏。真窗口**没有**独立的一条"地址栏"行，上一版多画了它，于是预览
+/// 和真实窗口平白差出一整条。
 fn draw_window_preview(app: &App, hdc: HDC, r: &RECT, th: Theme, s: f32) {
+    let _ = s;
     if r.right <= r.left || r.bottom <= r.top {
         return;
     }
     fill_rect(hdc, r, th.window_bg);
-    let pad = (6.0 * s).round() as i32;
-    let l = r.left + pad;
-    let t = r.top + pad;
-    let rt = r.right - pad;
-    let bt = r.bottom - pad;
+    let m = preview_map(app, r);
+    let (rw, rh) = preview_size(app);
+    let met = app.metrics;
+    let tb = met.title_h as f32;
+    let tbb = tb + met.toolbar_h as f32;
+    let sb_w = if app.cfg.ui.sidebar_visible { met.sidebar_w as f32 } else { 0.0 };
+    let st_h = if app.cfg.ui.statusbar_visible { met.status_h as f32 } else { 0.0 };
+    let vbot = rh - st_h;
+    let pad = met.pad as f32;
 
-    let title_h = (26.0 * s).round() as i32;
-    let bar_h = (22.0 * s).round() as i32;
-    let st_h = (18.0 * s).round() as i32;
+    fill_rect(hdc, &pv_rect(&m, 0.0, 0.0, rw, rh), th.window_bg);
 
     // 标题栏
-    let title = RECT { left: l, top: t, right: rt, bottom: t + title_h };
+    let title = pv_rect(&m, 0.0, 0.0, rw, tb);
     fill_rect(hdc, &title, th.title_bg);
-    for (wr, wid) in layout_bar(app, 0, &title, s) {
-        draw_widget(app, hdc, &wr, wid, th, s, false, false);
+    for (wr, wid) in layout_bar(app, 0, &title, m.k) {
+        draw_widget(app, hdc, &wr, wid, th, m.k, false, false);
     }
 
-    // 地址栏：面包屑 + 输入框（固定结构，不进带子）
-    let mut y = title.bottom + pad;
-    let ad = RECT { left: l, top: y, right: rt, bottom: y + bar_h };
-    fill_rect(hdc, &ad, th.chrome_bg);
-    let cw = (30.0 * s).round() as i32;
-    for k in 0..3 {
-        let c = RECT {
-            left: l + pad + k * (cw + pad),
-            top: y + pad,
-            right: l + pad + k * (cw + pad) + cw,
-            bottom: y + bar_h - pad,
-        };
-        rr(hdc, &c, app.radius_of("address.crumb"), th.surface, None);
-    }
-    let ed = RECT {
-        left: l + pad + 3 * (cw + pad),
-        top: y + pad,
-        right: rt - pad,
-        bottom: y + bar_h - pad,
-    };
-    rr(hdc, &ed, app.radius_of("address.edit"), th.window_bg, None);
-
-    // 工具栏
-    y = ad.bottom + pad;
-    let tb = RECT { left: l, top: y, right: rt, bottom: y + bar_h };
-    fill_rect(hdc, &tb, th.chrome_bg);
-    for (wr, wid) in layout_bar(app, 1, &tb, s) {
-        draw_widget(app, hdc, &wr, wid, th, s, false, false);
+    // 工具栏：地址栏 / 批量重命名 / 搜索框都在这一条里
+    let tbar = pv_rect(&m, 0.0, tb, rw, tbb);
+    fill_rect(hdc, &tbar, th.chrome_bg);
+    for (wr, wid) in layout_bar(app, 1, &tbar, m.k) {
+        draw_widget(app, hdc, &wr, wid, th, m.k, false, false);
     }
 
-    // 主体：侧栏 + 内容区
-    y = tb.bottom + pad;
-    let body_b = bt - st_h - pad;
-    let sb_w = ((rt - l) * 26 / 100).max((56.0 * s).round() as i32);
-    let sb = RECT { left: l, top: y, right: l + sb_w, bottom: body_b };
-    fill_rect(hdc, &sb, th.chrome_bg);
-    let n = 4;
-    let rh = ((body_b - y - (n + 1) * pad) / n).max(4);
-    for k in 0..n {
-        let it = RECT {
-            left: sb.left + pad,
-            top: y + pad + k * (rh + pad),
-            right: sb.right - pad,
-            bottom: y + pad + k * (rh + pad) + rh,
-        };
-        let (id, fill) = match k {
-            0 => ("sidebar.group", th.surface),
-            1 => ("sidebar.item", th.surface_alt),
-            2 => ("sidebar.hover", th.hover_bg),
-            _ => ("sidebar.selected", th.selection_bg),
-        };
-        rr(hdc, &it, app.radius_of(id), fill, None);
+    // 侧栏
+    if sb_w > 0.0 {
+        let sb = pv_rect(&m, 0.0, tbb, sb_w, vbot);
+        fill_rect(hdc, &sb, th.chrome_bg);
+        let ih = met.row_h as f32;
+        for k in 0..8usize {
+            let top = tbb + pad + k as f32 * (ih + 2.0);
+            if top + ih > vbot - pad {
+                break;
+            }
+            let it = pv_rect(&m, pad, top, sb_w - pad, top + ih);
+            let (id, fill) = match k {
+                0 => ("sidebar.group", th.surface),
+                2 => ("sidebar.hover", th.hover_bg),
+                3 => ("sidebar.selected", th.selection_bg),
+                _ => ("sidebar.item", th.surface_alt),
+            };
+            rr(hdc, &it, app.radius_of(id), fill, None);
+        }
     }
-    let ct = RECT { left: l + sb_w + pad, top: y, right: rt, bottom: body_b };
+
+    // 内容区：跟着当前视图模式画（详细信息/列表画行，图标类画磁贴）
+    let ct = pv_rect(&m, sb_w, tbb, rw, vbot);
     fill_rect(hdc, &ct, th.window_bg);
-    let hh = (14.0 * s).round() as i32;
-    let hd = RECT { left: ct.left + pad, top: ct.top + pad, right: ct.right - pad, bottom: ct.top + pad + hh };
-    rr(hdc, &hd, app.radius_of("content"), th.surface, None);
-    let gw = (ct.right - ct.left - 3 * pad) / 2;
-    let gh = (body_b - hd.bottom - 3 * pad) / 2;
-    for k in 0..4 {
-        let col = k % 2;
-        let row = k / 2;
-        let tl = RECT {
-            left: ct.left + pad + col * (gw + pad),
-            top: hd.bottom + pad + row * (gh + pad),
-            right: ct.left + pad + col * (gw + pad) + gw,
-            bottom: hd.bottom + pad + row * (gh + pad) + gh,
-        };
-        let (id, fill) = match k {
-            0 => ("content.tile", th.surface),
-            1 => ("content.hover", th.hover_bg),
-            2 => ("content.tile", th.surface),
-            _ => ("content.selected", th.selection_bg),
-        };
-        rr(hdc, &tl, app.radius_of(id), fill, None);
+    let list = matches!(
+        app.tab().view_mode,
+        fm_core::ViewMode::Details | fm_core::ViewMode::List
+    );
+    if list {
+        let hh = met.row_h as f32;
+        let hd = pv_rect(&m, sb_w + pad, tbb + pad, rw - pad, tbb + pad + hh);
+        rr(hdc, &hd, app.radius_of("content"), th.surface, None);
+        for k in 0..24usize {
+            let top = tbb + pad + (k + 1) as f32 * (hh + 2.0);
+            if top + hh > vbot - pad {
+                break;
+            }
+            let row = pv_rect(&m, sb_w + pad, top, rw - pad, top + hh);
+            let (id, fill) = match k {
+                1 => ("content.hover", th.hover_bg),
+                2 => ("content.selected", th.selection_bg),
+                _ => ("content.tile", th.surface_alt),
+            };
+            rr(hdc, &row, app.radius_of(id), fill, None);
+        }
+    } else {
+        let cols = 4usize;
+        let cw = (rw - sb_w - pad * (cols as f32 + 1.0)) / cols as f32;
+        let ch = cw * 0.8;
+        for k in 0..(cols * 3) {
+            let cx = (k % cols) as f32;
+            let cy = (k / cols) as f32;
+            let l = sb_w + pad + cx * (cw + pad);
+            let top = tbb + pad + cy * (ch + pad);
+            if top + ch > vbot - pad {
+                break;
+            }
+            let tile = pv_rect(&m, l, top, l + cw, top + ch);
+            let (id, fill) = match k {
+                1 => ("content.hover", th.hover_bg),
+                3 => ("content.selected", th.selection_bg),
+                _ => ("content.tile", th.surface),
+            };
+            rr(hdc, &tile, app.radius_of(id), fill, None);
+        }
     }
 
     // 状态栏
-    let st = RECT { left: l, top: body_b + pad, right: rt, bottom: bt };
-    fill_rect(hdc, &st, th.status_bg);
-    for (wr, wid) in layout_bar(app, 2, &st, s) {
-        draw_widget(app, hdc, &wr, wid, th, s, false, false);
+    if st_h > 0.0 {
+        let st = pv_rect(&m, 0.0, vbot, rw, rh);
+        fill_rect(hdc, &st, th.status_bg);
+        for (wr, wid) in layout_bar(app, 2, &st, m.k) {
+            draw_widget(app, hdc, &wr, wid, th, m.k, false, false);
+        }
     }
 }
 
@@ -2187,27 +2385,26 @@ pub fn finish_drag(app: &mut App, l: &Layout, x: i32, y: i32) {
     // 拿掉，在同一条里挪就是换位置。整条里装的正是"组件里的子组件"。
     if d.tab == crate::app::SETTINGS_TAB_UI {
         let wid = (d.id & 0xFF) as u16;
-        let src_bar = if d.id & 0x8000_0000 != 0 {
+        let from_bar = d.id & 0x8000_0000 != 0;
+        let src_bar = if from_bar {
             Some(((d.id >> 16) & 0xFF) as usize)
         } else {
             None
         };
         let src_slot = ((d.id >> 8) & 0xFF) as usize;
-        let tol = (6.0 * app.metrics.scale).round() as i32;
-        let mut target: Option<usize> = None;
-        for (bi, br) in g.ui_bars.iter().enumerate() {
-            if x >= br.left && x < br.right && y >= br.top - tol && y < br.bottom + tol {
-                target = Some(bi);
-                break;
-            }
+        // 原地单击（鼠标没动）= 装/不装切换。出厂时 15 个组件全装满了，
+        // 光靠拖是"搬"不是"加"，这条通路才让"添加组件"真的做得成。
+        if !from_bar && (d.cur.0 - d.grab.0).abs() + (d.cur.1 - d.grab.1).abs() <= 3 {
+            toggle_widget(app, wid);
+            return;
         }
         // 一个组件只能待在一处：先从所有带子里摘掉
         for b in app.ui_settings.bars.iter_mut() {
             b.retain(|v| *v != wid);
         }
-        if let Some(bi) = target {
-            let mut slot = g.ui_bar_items[bi].len();
-            for (k, br) in g.ui_bar_items[bi].iter().enumerate() {
+        if let Some((bi, items)) = drop_target(app, &g, x, y) {
+            let mut slot = items.len();
+            for (k, br) in items.iter().enumerate() {
                 if x < (br.left + br.right) / 2 {
                     slot = k;
                     break;
