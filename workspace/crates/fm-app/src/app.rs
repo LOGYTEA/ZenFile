@@ -1012,6 +1012,18 @@ impl App {
         let (engine_tx, engine_rx) = channel::<EngineMsg>();
         let (io_tx, io_rx) = channel::<String>();
         let theme = if cfg.core.theme == "light" { theme::light() } else { theme::dark() };
+        // 上次会话里手动切过的视图：启动时从配置加载进覆盖表（第29轮）。
+        // 之前这张表是纯内存的，重启即丢 —— 用户反馈"文件夹的布局样式
+        // 压根不会保存"。只认已知的视图名，脏值直接丢（parse_view 兜底
+        // 会把未知串都读成"详细信息"，反而把默认值顶掉）。
+        let view_overrides: HashMap<String, ViewMode> = cfg
+            .files
+            .view
+            .overrides
+            .iter()
+            .filter(|(_, v)| matches!(v.as_str(), "details" | "list" | "medium" | "large"))
+            .map(|(k, v)| (k.clone(), parse_view(v)))
+            .collect();
         Self {
             hwnd,
             hwnd_address: HWND(std::ptr::null_mut()),
@@ -1107,7 +1119,7 @@ impl App {
             hover_split: None,
             drag: None,
             drop_target: None,
-            view_overrides: HashMap::new(),
+            view_overrides,
         }
     }
 
@@ -1578,15 +1590,20 @@ impl App {
             }
         }
         let mut tab = Tab::new(path.clone());
-        tab.view_mode = parse_view(&self.cfg.files.view.default_mode);
-        // 同上：新标签也要按"这个文件夹自己的视图"来
-        if self.cfg.files.view.default_mode == "system" {
-            if let Some(m) = self.view_overrides.get(&norm_key(&path)).copied() {
-                tab.view_mode = m;
-            } else if let Some(m) = crate::sysview::system_view(&path) {
-                tab.view_mode = m;
+        // 新标签按"这个文件夹自己的视图"来，优先级与 apply_view_for 一致：
+        // 本进程改过的（含跨重启持久化的 overrides）→ 资源管理器记的
+        // （仅 default_mode=system 时）→ 配置默认。
+        // 之前整段包在 `if default_mode == "system"` 里 —— 默认模式不是
+        // system 时 override 表压根不查，重启后切好的视图全被默认值顶掉
+        // （第29轮 D2 实锤：cfg 里明明有 c:\windows=large，重启仍落 details）。
+        let dv = || parse_view(&self.cfg.files.view.default_mode);
+        tab.view_mode = match self.view_overrides.get(&norm_key(&path)).copied() {
+            Some(m) => m,
+            None if self.cfg.files.view.default_mode == "system" => {
+                crate::sysview::system_view(&path).unwrap_or_else(dv)
             }
-        }
+            None => dv(),
+        };
         tab.sort = SortSpec { key: parse_sort(&self.cfg.files.view.sort_key), descending: self.cfg.files.view.sort_descending };
         self.pane_mut().tabs.push(tab);
         self.pane_mut().active = self.pane().tabs.len() - 1;
@@ -2474,6 +2491,19 @@ impl App {
         // 那样至少在本进程里来回切换不该被默认值吃掉。
         self.view_overrides.insert(norm_key(&path), mode);
         crate::sysview::write_system_view(&path, mode);
+        // 再落盘：内存表只保本进程，重启就没了（第29轮"窗口位置和布局
+        // 样式都不保存"的布局一侧）。每次全量写整张表 —— 启动时表是从
+        // 同一个文件读的，全量写 = 内存即文件，深合并不会残留旧键。
+        let map: serde_json::Map<String, serde_json::Value> = self
+            .view_overrides
+            .iter()
+            .map(|(k, v)| (k.clone(), serde_json::Value::String(view_name(*v).to_string())))
+            .collect();
+        if let Err(e) = fm_core::config::Config::save_user_patch(&serde_json::json!({
+            "files": { "view": { "overrides": map } }
+        })) {
+            eprintln!("保存视图覆盖失败: {e}");
+        }
         self.invalidate();
     }
 

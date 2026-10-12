@@ -73,6 +73,34 @@ pub struct UiConfig {
     /// 行背景外面）、stroke = 空心时的描边线宽、hollow = 只描边不填色。
     #[serde(default)]
     pub sel_bar: SelBarConfig,
+    /// 上次退出时主窗口的位置与状态（第29轮：窗口位置持久化）。
+    ///
+    /// `w/h = 0` 表示"从没存过"，保持系统默认的创建位置。
+    /// 坐标取自 `WINDOWPLACEMENT.rcNormalPosition`（还原态矩形），
+    /// 恢复时也整套走 `SetWindowPlacement`，两边同一套坐标系不打架。
+    #[serde(default)]
+    pub window: WindowConfig,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct WindowConfig {
+    #[serde(default)]
+    pub x: i32,
+    #[serde(default)]
+    pub y: i32,
+    #[serde(default)]
+    pub w: i32,
+    #[serde(default)]
+    pub h: i32,
+    /// 关窗口时是否处于最大化（恢复时一起还原）。
+    #[serde(default)]
+    pub maximized: bool,
+}
+
+impl Default for WindowConfig {
+    fn default() -> Self {
+        Self { x: 0, y: 0, w: 0, h: 0, maximized: false }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -134,6 +162,15 @@ pub struct ViewConfig {
     pub col_date_w: u32,
     pub col_kind_w: u32,
     pub col_size_w: u32,
+    /// 每个文件夹手动切过的视图（第29轮：跨重启保持）。
+    ///
+    /// 键 = `norm_key` 归一化后的路径（小写、反斜杠、无尾斜杠），
+    /// 值 = `view_name`（`details`/`list`/`medium`/`large`）。
+    /// 之前只存在内存 HashMap 里，重启即丢 —— 用户反馈"文件夹的
+    /// 布局样式压根不会保存"。资源管理器 bag 只在
+    /// `default_mode == "system"` 时才被读回，靠不住。
+    #[serde(default)]
+    pub overrides: std::collections::BTreeMap<String, String>,
 }
 
 impl ViewConfig {

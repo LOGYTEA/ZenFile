@@ -351,12 +351,102 @@ fn spawn_window(
     unsafe {
         let _ = SetTimer(Some(hwnd), TIMER_DRAIN, 100, None);
         let _ = SetTimer(Some(hwnd), TIMER_BUSY, 50, None);
+        // 第29轮：恢复上次退出时的窗口位置/大小/最大化 —— 只对本进程第一个
+        // 窗口做（后面的窗口保持上面的级联错开）。之前完全没这段逻辑，
+        // 每次启动都落在 CW_USEDEFAULT 上，用户反馈"窗口位置压根不会保存"。
+        let mut restore_max = false;
+        if primary {
+            let wc = app.cfg.ui.window;
+            if wc.w >= 480 && wc.h >= 320 && rect_on_screen(wc.x, wc.y, wc.w, wc.h) {
+                let mut wp: WINDOWPLACEMENT = std::mem::zeroed();
+                wp.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+                if GetWindowPlacement(hwnd, &mut wp).is_ok() {
+                    wp.rcNormalPosition = RECT {
+                        left: wc.x,
+                        top: wc.y,
+                        right: wc.x + wc.w,
+                        bottom: wc.y + wc.h,
+                    };
+                    // showCmd 不动：此刻窗口还没显示，Get 拿回来的就是
+                    // SW_HIDE，原样 Set 回去只改几何，不会把它提前闪出来。
+                    if SetWindowPlacement(hwnd, &wp).is_ok() {
+                        restore_max = wc.maximized;
+                    }
+                }
+            }
+        }
         if show {
-            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = ShowWindow(hwnd, if restore_max { SW_SHOWMAXIMIZED } else { SW_SHOW });
             let _ = windows::Win32::Graphics::Gdi::UpdateWindow(hwnd);
         }
     }
     Some(hwnd)
+}
+
+// —— 第29轮：窗口位置持久化 ————————————————————————————————
+
+/// 上次写盘时的"最大化"状态（-1 = 还没记过）。
+///
+/// 交互调整大小时 WM_SIZE 会连发几十条，逐条写盘既浪费，还会把**测试
+/// 脚本 SetWindowPos 的临时坐标**灌进用户配置。所以判据是"状态变了
+/// 或强制"：程序化改位置（状态没变）一律不写；交互结束
+/// （WM_EXITSIZEMOVE）与关闭（WM_CLOSE）强制写终值。
+static RECT_SAVED_MAX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// 把窗口的位置/大小/最大化状态写进配置 `ui.window`。
+/// 坐标取 `WINDOWPLACEMENT.rcNormalPosition`（还原态矩形）——
+/// 最大化时 GetWindowRect 拿到的是撑满屏幕的那个框，存它下次就回不去了。
+fn persist_window_rect(hwnd: HWND, force: bool) {
+    use std::sync::atomic::Ordering;
+    unsafe {
+        if IsIconic(hwnd).0 != 0 {
+            // 最小化时 IsZoomed 恒为假："最大化 → 最小化 → 关闭"会被
+            // 记成非最大化。跳过这次，等状态真正变化时再写。
+            return;
+        }
+        let max = IsZoomed(hwnd).0 != 0;
+        let max_i = max as i32;
+        let prev = RECT_SAVED_MAX.swap(max_i, Ordering::Relaxed);
+        if !force && (prev == -1 || prev == max_i) {
+            return;
+        }
+        let mut wp: WINDOWPLACEMENT = std::mem::zeroed();
+        wp.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+        if GetWindowPlacement(hwnd, &mut wp).is_err() {
+            return;
+        }
+        let r = wp.rcNormalPosition;
+        let wc = fm_core::config::WindowConfig {
+            x: r.left,
+            y: r.top,
+            w: r.right - r.left,
+            h: r.bottom - r.top,
+            maximized: max,
+        };
+        let _ = fm_core::config::Config::save_user_patch(&serde_json::json!({
+            "ui": { "window": wc }
+        }));
+    }
+}
+
+/// 存下来的矩形是否仍落在某个显示器的可见范围内。
+///
+/// 换分辨率 / 拔掉副屏之后，旧坐标可能整块跑到屏幕外 —— 那时候原样
+/// 恢复等于"窗口不见了"，比恢复默认位置更糟，宁可放弃这次恢复。
+fn rect_on_screen(x: i32, y: i32, w: i32, h: i32) -> bool {
+    let (vx, vy, vw, vh) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    };
+    if vw <= 0 || vh <= 0 {
+        return false;
+    }
+    // 与虚拟屏相交，且顶部 60px（标题栏）与左右各 80px 露在屏内 —— 抓得住、点得到
+    x < vx + vw - 80 && x + w > vx + 80 && y < vy + vh - 60 && y + h > vy + 60
 }
 
 /// 关掉本进程所有窗口（托盘菜单「退出」）。
@@ -818,6 +908,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             app.last_size = ((lparam.0 & 0xFFFF) as i32, (lparam.0 >> 16) as i32);
             paint::reposition(app);
             let _ = InvalidateRect(Some(hwnd), None, true);
+            // 位置持久化（第29轮）：状态没变时内部直接跳过，不会逐条写盘
+            persist_window_rect(hwnd, false);
+            LRESULT(0)
+        }
+        WM_EXITSIZEMOVE => {
+            // 交互式拖动/调整结束 —— 一次性强制写盘。拖动过程中的 WM_SIZE
+            // 都被"最大化状态没变"挡掉了，终值在这里落。
+            persist_window_rect(hwnd, true);
             LRESULT(0)
         }
         WM_DPICHANGED => {
@@ -1933,6 +2031,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         }
         WM_CLOSE => {
             let app = &mut *app_ptr;
+            // 关闭前把位置定格写盘（第29轮）：托盘隐藏走的也是这条路，
+            // 之后用户从托盘再开窗口时位置才是对的。
+            persist_window_rect(hwnd, true);
             if app.cfg.core.exit_to_tray {
                 let _ = ShowWindow(hwnd, SW_HIDE);
                 return LRESULT(0);
