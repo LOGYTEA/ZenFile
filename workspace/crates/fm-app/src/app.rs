@@ -1381,13 +1381,30 @@ impl App {
 
     /// 某个圆角项当前的值（DIP）。没在配置里出现过就用树上的默认值 ——
     /// 于是"加了新圆角项"不需要迁移旧配置。
+    /// 某个圆角项当前的值（DIP）。
+    ///
+    /// 取值顺序是**从细到粗**：三级本项 → 它所属的二级页面 → 全局 → 出厂默认。
+    /// 于是「全局圆角」真的是全局、"侧栏圆角"真的是整个侧栏的基准，某个具体
+    /// 控件单独调过才用它自己的值。
     pub fn radius_of(&self, id: &str) -> u32 {
-        self.cfg
-            .ui
-            .radius
-            .get(id)
-            .copied()
-            .unwrap_or_else(|| crate::settings::radius_default(id))
+        let r = &self.cfg.ui.radius;
+        if let Some(v) = r.get(id).copied() {
+            return v;
+        }
+        let max = crate::settings::radius_max(id);
+        if let Some(page) = id.split('.').next() {
+            if page != id {
+                if let Some(v) = r.get(page).copied() {
+                    return v.min(max);
+                }
+            }
+        }
+        if id != "global" {
+            if let Some(g) = r.get("global").copied() {
+                return g.min(max);
+            }
+        }
+        crate::settings::radius_default(id)
     }
 
     /// 改一个圆角项并写回用户层。

@@ -109,6 +109,14 @@ pub const MENU_ITEM_NAMES: [&str; 14] = [
     "打开", "打开方式", "剪切", "复制", "粘贴", "重命名", "批量重命名", "删除", "新建", "全选",
     "刷新", "查看", "排序方式", "属性",
 ];
+/// 已经**不在右键菜单里**的槽位。
+///
+/// 「批量重命名」搬到了目录栏最右侧那个按钮上，`own_menu_rows` 不再生成它。
+/// 但设置页的排布表是按 `MENU_ITEM_NAMES` 的下标建的，于是它仍占一行还能拖
+/// —— 拖完真菜单纹丝不动（实测：拖到第一位，真菜单一个字都没变）。
+/// 排布表必须和"菜单里真的会出现哪些项"严格一致，否则用户调了半天没反应。
+pub const MENU_ITEM_RETIRED: [u16; 1] = [6];
+
 pub const MENU_ITEM_GLYPHS: [&str; 14] = [
     "\u{E8A7}", "\u{E7AC}", "\u{E8C6}", "\u{E8C8}", "\u{E77F}", "\u{E8AC}", "\u{E8AC}", "\u{E74D}",
     "\u{E8F4}", "\u{E762}", "\u{E72C}", "\u{E7B3}", "\u{E8CB}", "\u{E946}",
@@ -167,26 +175,25 @@ pub fn radius_tree() -> Vec<RadiusNode> {
             ]),
             page("address", "地址栏圆角", 4, 12, vec![
                 leaf("address.crumb", "面包屑圆角", "M", 4, 12),
-                leaf("address.edit", "输入框圆角", "S", 10, 24),
+                leaf("address.edit", "输入框圆角", "S", 6, 16),
             ]),
             page("toolbar", "工具栏圆角", 4, 12, vec![
                 leaf("toolbar.button", "按钮圆角", "A", 4, 12),
             ]),
+            // 只列**真实界面里真的有这块底色**的项：给没有的地方留开关，
+            // 用户调了半天界面纹丝不动，等于又一个"看着做完了"的假功能。
+            // 常态没有底色的（侧栏条目、磁贴、表头、状态栏整条）一概不列，
+            // 它们要调就用上面一级的「侧栏圆角 / 内容区圆角 / 状态栏圆角」。
             page("sidebar", "侧栏圆角", 4, 12, vec![
-                leaf("sidebar.group", "分组标题圆角", "F", 4, 12),
                 leaf("sidebar.hover", "鼠标悬停圆角", "S", 4, 12),
-                leaf("sidebar.item", "条目圆角", "T", 4, 12),
                 leaf("sidebar.selected", "选中圆角", "X", 4, 12),
             ]),
             page("content", "内容区圆角", 6, 16, vec![
-                leaf("content.header", "表头圆角", "B", 3, 10),
-                leaf("content.tile", "磁贴圆角", "C", 6, 18),
                 leaf("content.hover", "鼠标悬停圆角", "S", 6, 16),
                 leaf("content.selected", "选中圆角", "X", 6, 16),
             ]),
             page("status", "状态栏圆角", 3, 10, vec![
                 leaf("status.button", "按钮圆角", "A", 3, 10),
-                leaf("status.panel", "面板圆角", "M", 3, 10),
             ]),
             page("menu", "菜单圆角", 6, 16, vec![
                 leaf("menu.hover", "鼠标悬停圆角", "S", 4, 12),
@@ -387,13 +394,18 @@ impl Settings {
         }
 
         let m = MENU_ITEM_NAMES.len() as u16;
-        self.menu_order.retain(|i| *i < m && !self.menu_hidden.contains(i));
+        self.menu_order
+            .retain(|i| *i < m && !self.menu_hidden.contains(i) && !MENU_ITEM_RETIRED.contains(&i));
         for i in 0..m {
-            if !self.menu_order.contains(&i) && !self.menu_hidden.contains(&i) {
+            if !self.menu_order.contains(&i)
+                && !self.menu_hidden.contains(&i)
+                && !MENU_ITEM_RETIRED.contains(&i)
+            {
                 self.menu_order.push(i);
             }
         }
-        self.menu_hidden.retain(|i| *i < m && !self.menu_order.contains(i));
+        self.menu_hidden
+            .retain(|i| *i < m && !self.menu_order.contains(i) && !MENU_ITEM_RETIRED.contains(&i));
         self.menu_hidden.sort_unstable();
         self.menu_hidden.dedup();
     }
@@ -1276,7 +1288,7 @@ fn draw_window_preview(app: &App, hdc: HDC, r: &RECT, th: Theme, s: f32) {
     fill_rect(hdc, &ct, th.window_bg);
     let hh = (14.0 * s).round() as i32;
     let hd = RECT { left: ct.left + pad, top: ct.top + pad, right: ct.right - pad, bottom: ct.top + pad + hh };
-    rr(hdc, &hd, app.radius_of("content.header"), th.surface, None);
+    rr(hdc, &hd, app.radius_of("content"), th.surface, None);
     let gw = (ct.right - ct.left - 3 * pad) / 2;
     let gh = (body_b - hd.bottom - 3 * pad) / 2;
     for k in 0..4 {
@@ -1687,7 +1699,7 @@ fn draw_preview(app: &App, hdc: HDC, r: &RECT, sel: &str, th: Theme, s: f32) {
     // 内容区：表头 + 2x2 磁贴（一块悬停、一块选中）
     let hh = (14.0 * s).round() as i32;
     let hd = RECT { left: ct.left + gap, top: ct.top + gap, right: ct.right - gap, bottom: ct.top + gap + hh };
-    rr(hdc, &hd, app.radius_of("content.header"), th.surface, hot("content.header", sel, th));
+    rr(hdc, &hd, app.radius_of("content"), th.surface, hot("content.header", sel, th));
     let gw = (ct.right - ct.left - 5 * gap) / 2;
     let gh = (body_b - hd.bottom - 3 * gap) / 2;
     for k in 0..4 {
@@ -1714,7 +1726,7 @@ fn draw_preview(app: &App, hdc: HDC, r: &RECT, sel: &str, th: Theme, s: f32) {
     rr(
         hdc,
         &RECT { left: st.left + gap, top: st.top + gap, right: st.right - gap, bottom: st.bottom - gap },
-        app.radius_of("status.panel"),
+        app.radius_of("status"),
         th.surface,
         hot("status.panel", sel, th),
     );
@@ -1781,6 +1793,7 @@ pub fn visible_menu_ids(app: &App) -> Vec<u16> {
         .iter()
         .copied()
         .filter(|i| !app.ui_settings.menu_hidden.contains(i))
+        .filter(|i| !MENU_ITEM_RETIRED.contains(&i))
         .collect()
 }
 
@@ -1842,13 +1855,27 @@ fn paint_menu_tab(app: &App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
                 g.menu_panel.left,
                 g.menu_panel.top,
             );
-            // 面板边框：和真菜单一样有一圈边，不然看不出"这是一块弹出的菜单"
+            // 先把 DC 还原回 SaveDC 那一刻的状态，**再**画边框。
+            //
+            // 顺序反了会踩两个坑（都是实测出来的）：
+            //   1. `paint_menu_into` 内部改过窗口原点，还原前画出来的矩形会
+            //      整体平移一个面板的宽高，落到菜单旁边的空白处；
+            //   2. `Rectangle` 会**用当前画刷填内部**，而记忆 DC 的默认画刷
+            //      是 WHITE_BRUSH —— 于是多出一大块纯白实心头。必须显式选
+            //      NULL_BRUSH，让它只描边不填充。
+            let _ = windows::Win32::Graphics::Gdi::RestoreDC(hdc, -1);
             let p = windows::Win32::Graphics::Gdi::CreatePen(
                 windows::Win32::Graphics::Gdi::PS_SOLID,
                 1,
                 th.border,
             );
             let op = SelectObject(hdc, p.into());
+            let ob = SelectObject(
+                hdc,
+                windows::Win32::Graphics::Gdi::GetStockObject(
+                    windows::Win32::Graphics::Gdi::NULL_BRUSH,
+                ),
+            );
             let _ = windows::Win32::Graphics::Gdi::Rectangle(
                 hdc,
                 g.menu_panel.left,
@@ -1856,9 +1883,9 @@ fn paint_menu_tab(app: &App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
                 g.menu_panel.right,
                 g.menu_panel.bottom,
             );
+            SelectObject(hdc, ob);
             SelectObject(hdc, op);
             let _ = DeleteObject(p.into());
-            let _ = windows::Win32::Graphics::Gdi::RestoreDC(hdc, -1);
         }
     }
 

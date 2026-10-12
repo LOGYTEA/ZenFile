@@ -1197,16 +1197,35 @@ pub unsafe fn paint_menu_into(
     paint_menu(hdc, &st);
 }
 
+/// 按「外观」页的圆角画一块实心矩形。
+///
+/// 菜单绘制拿不到 `App`（`MenuWindow` 里只存了主题快照），去全局那份 App 取
+/// —— 取不到就退回方角，不能因为拿不到就把菜单画崩。
+unsafe fn menu_fill_radius(hdc: HDC, id: &str, r: &RECT, fill: windows::Win32::Foundation::COLORREF) {
+    let Some(app) = crate::app_ref_opt() else {
+        let br = CreateSolidBrush(fill);
+        let _ = FillRect(hdc, r, br);
+        let _ = DeleteObject(br.into());
+        return;
+    };
+    crate::paint::fill_radius(&*app, hdc, id, r, fill, None);
+}
+
 unsafe fn paint_menu(hdc: HDC, state: &MenuWindow) {
     let t = &state.theme;
-    let bg = CreateSolidBrush(t.surface);
     let mut r = RECT::default();
     unsafe {
-        // 客户区高度就是可见高度；内容更长时由滚动偏移决定画哪一段
-        r.right = state.width;
-        r.bottom = state.view_h;
-        let _ = FillRect(hdc, &r, bg);
-        DeleteObject(bg.into());
+        // 客户区高度就是可见高度；内容更长时由滚动偏移决定画哪一段。
+        //
+        // 这块底板**必须自己带上 ox/oy**：此时窗口原点还没设（下一行才
+        // SetWindowOrgEx），画的是设备坐标。真菜单窗口 ox=oy=0 看不出差别，
+        // 设置页「右键菜单」里 ox/oy 是面板左上角，少了这个偏移整块底板会
+        // 糊到窗口 (0,0) 上，把侧栏和标题栏一起盖掉。
+        r.left = state.ox;
+        r.top = state.oy;
+        r.right = state.ox + state.width;
+        r.bottom = state.oy + state.view_h;
+        menu_fill_radius(hdc, "menu.panel", &r, t.surface);
 
         // 裁剪到可见区，避免超长内容画到窗口外（也会溢出到屏幕上）
         let clip = RECT {
@@ -1235,9 +1254,7 @@ unsafe fn paint_menu(hdc: HDC, state: &MenuWindow) {
             let rect = RECT { left: 0, top, right: state.width, bottom: top + state.row_h };
             let hovered = state.hover == Some(i) && !e.disabled;
             if hovered {
-                let hb = CreateSolidBrush(t.hover_bg);
-                let _ = FillRect(hdc, &rect, hb);
-                DeleteObject(hb.into());
+                menu_fill_radius(hdc, "menu.hover", &rect, t.hover_bg);
                 // 左侧再压一条强调竖线：光靠底色在暗色主题下对比仍然偏弱，
                 // 加一条 3px 的重色边，鼠标在哪一行一眼就能看出来。
                 let ab = CreateSolidBrush(t.accent);

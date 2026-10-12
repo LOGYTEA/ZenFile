@@ -1063,9 +1063,7 @@ fn paint_tab_strip(app: &mut App, hdc: HDC, l: &Layout, pi: usize) {
             } else {
                 (t.chrome_bg, t.text_dim)
             };
-            let b = CreateSolidBrush(bg);
-            FillRect(hdc, &r, b);
-            let _ = DeleteObject(b.into());
+            fill_radius(app, hdc, "title.tab", &r, bg, None);
             SetTextColor(hdc, fg);
             // 图标 16px 压在左边，文字从它右边开始（资源管理器也是这个排布）
             let icon_s = (16.0 * app.metrics.scale).round() as i32;
@@ -1103,9 +1101,7 @@ fn paint_tab_strip(app: &mut App, hdc: HDC, l: &Layout, pi: usize) {
             {
                 let cr = l.tab_close_rect(i, n, &app.metrics);
                 if hovered {
-                    let hb = CreateSolidBrush(t.hover_bg);
-                    FillRect(hdc, &cr, hb);
-                    let _ = DeleteObject(hb.into());
+                    fill_radius(app, hdc, "title.tab", &cr, t.hover_bg, None);
                 }
                 SetTextColor(hdc, if i == app.panes[pi].active || hovered { t.text } else { t.text_dim });
                 let g = glyph_font(app.metrics.scale);
@@ -1325,11 +1321,53 @@ fn draw_caption_button(app: &App, hdc: HDC, r: &RECT, which: u8) {
 fn draw_chrome_button(app: &App, hdc: HDC, r: &RECT, glyph: ChromeGlyph, hover: bool) {
     let t = &app.theme;
     unsafe {
-        let bg = CreateSolidBrush(if hover { t.hover_bg } else { t.chrome_bg });
-        FillRect(hdc, r, bg);
-        let _ = DeleteObject(bg.into());
+        let bg = if hover { t.hover_bg } else { t.chrome_bg };
+        fill_radius(app, hdc, "title.button", r, bg, None);
         draw_chrome_glyph(app, hdc, r, glyph);
     }
+}
+
+/// 画一个**圆角**的实心矩形 —— 半径取自「外观」页那棵树。
+///
+/// 之前这个文件里到处是 `FillRect`，用户在外观点拖的滑杆一点都作用不到真实
+/// 界面上，设置页成了摆设。凡是"用户能在外观页调圆角"的色块，一律走这里。
+///
+/// 两个坑（都踩过）：
+/// - `RoundRect` 的第 5/6 个参数是**椭圆的直径**不是半径，直接传半径会画出
+///   只有一半大的圆角；
+/// - 它用**当前画笔描边、当前刷子填充**：不换笔的话每块圆角色块外面都套一圈
+///   默认黑边。所以这里总是显式造一支笔 —— 不描边时就用和填充同色的笔。
+pub(crate) unsafe fn fill_radius(
+    app: &App,
+    hdc: HDC,
+    id: &str,
+    r: &RECT,
+    fill: COLORREF,
+    outline: Option<COLORREF>,
+) {
+    let w = r.right - r.left;
+    let h = r.bottom - r.top;
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let rad = app.radius_of(id) as i32;
+
+    if rad <= 0 {
+        let br = CreateSolidBrush(fill);
+        let _ = FillRect(hdc, r, br);
+        let _ = DeleteObject(br.into());
+        return;
+    }
+    let d = (rad * 2).min(w).min(h);
+    let pen = CreatePen(PS_SOLID, 1, outline.unwrap_or(fill));
+    let old_pen = SelectObject(hdc, pen.into());
+    let br = CreateSolidBrush(fill);
+    let old_br = SelectObject(hdc, br.into());
+    let _ = RoundRect(hdc, r.left, r.top, r.right, r.bottom, d, d);
+    SelectObject(hdc, old_br);
+    SelectObject(hdc, old_pen);
+    let _ = DeleteObject(br.into());
+    let _ = DeleteObject(pen.into());
 }
 
 /// 文本绘制统一入口：内部完成 UTF-16 转换。
@@ -1463,19 +1501,7 @@ fn paint_address(app: &mut App, hdc: HDC, l: &Layout) {
     let t = app.theme;
     unsafe {
         // 底 + 1px 边框（EDIT 与工具栏同色，没有框就等于看不见）
-        let bg = CreateSolidBrush(t.surface);
-        FillRect(hdc, &l.address, bg);
-        let _ = DeleteObject(bg.into());
-        let pf = CreateSolidBrush(t.border);
-        for e in [
-            RECT { left: l.address.left, top: l.address.top, right: l.address.right, bottom: l.address.top + 1 },
-            RECT { left: l.address.left, top: l.address.bottom - 1, right: l.address.right, bottom: l.address.bottom },
-            RECT { left: l.address.left, top: l.address.top, right: l.address.left + 1, bottom: l.address.bottom },
-            RECT { left: l.address.right - 1, top: l.address.top, right: l.address.right, bottom: l.address.bottom },
-        ] {
-            FillRect(hdc, &e, pf);
-        }
-        let _ = DeleteObject(pf.into());
+        fill_radius(app, hdc, "address.edit", &l.address, t.surface, Some(t.border));
         if app.addr_editing {
             return;
         }
@@ -1501,9 +1527,7 @@ fn paint_address(app: &mut App, hdc: HDC, l: &Layout) {
             };
             let last = i + 1 == bar.crumbs.len();
             if app.addr_hover == Some(i) {
-                let hb = CreateSolidBrush(t.hover_bg);
-                FillRect(hdc, &r, hb);
-                let _ = DeleteObject(hb.into());
+                fill_radius(app, hdc, "address.crumb", &r, t.hover_bg, None);
             }
             SetTextColor(hdc, if last { t.text } else { t.text_dim });
             let mut w: Vec<u16> = c.label.encode_utf16().collect();
@@ -1544,9 +1568,7 @@ fn paint_toolbar(app: &mut App, hdc: HDC, l: &Layout) {
             if app.hover_nav != i {
                 continue;
             }
-            let hb = CreateSolidBrush(t.row_hover);
-            FillRect(hdc, &r, hb);
-            let _ = DeleteObject(hb.into());
+            fill_radius(app, hdc, "toolbar.button", &r, t.row_hover, None);
         }
         SetTextColor(hdc, if app.can_back() { t.text } else { t.text_dim });
         draw_text(hdc, "\u{E72B}", l.back, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_CENTER);
@@ -1561,20 +1583,7 @@ fn paint_toolbar(app: &mut App, hdc: HDC, l: &Layout) {
         paint_address(app, hdc, l);
         {
             let r = &l.search;
-            let bg = CreateSolidBrush(t.surface);
-            FillRect(hdc, r, bg);
-            let _ = DeleteObject(bg.into());
-            let pf = CreateSolidBrush(t.border);
-            let edges = [
-                RECT { left: r.left, top: r.top, right: r.right, bottom: r.top + 1 },
-                RECT { left: r.left, top: r.bottom - 1, right: r.right, bottom: r.bottom },
-                RECT { left: r.left, top: r.top, right: r.left + 1, bottom: r.bottom },
-                RECT { left: r.right - 1, top: r.top, right: r.right, bottom: r.bottom },
-            ];
-            for e in &edges {
-                FillRect(hdc, e, pf);
-            }
-            let _ = DeleteObject(pf.into());
+            fill_radius(app, hdc, "address.edit", r, t.surface, Some(t.border));
         }
 
         // 「批量重命名」图标按钮：**无条件画**（置顶显示）。
@@ -1611,20 +1620,14 @@ fn paint_bulk_button(app: &App, hdc: HDC, l: &Layout) {
     let hovered = app.hover_bulk && enabled;
     unsafe {
         let r = &l.bulk_btn;
-        let bg = CreateSolidBrush(if hovered { t.hover_bg } else { t.surface });
-        FillRect(hdc, r, bg);
-        let _ = DeleteObject(bg.into());
-        let pf = CreateSolidBrush(if hovered { t.accent } else { t.border });
-        let edges = [
-            RECT { left: r.left, top: r.top, right: r.right, bottom: r.top + 1 },
-            RECT { left: r.left, top: r.bottom - 1, right: r.right, bottom: r.bottom },
-            RECT { left: r.left, top: r.top, right: r.left + 1, bottom: r.bottom },
-            RECT { left: r.right - 1, top: r.top, right: r.right, bottom: r.bottom },
-        ];
-        for e in &edges {
-            FillRect(hdc, e, pf);
-        }
-        let _ = DeleteObject(pf.into());
+        fill_radius(
+            app,
+            hdc,
+            "toolbar.button",
+            r,
+            if hovered { t.hover_bg } else { t.surface },
+            Some(if hovered { t.accent } else { t.border }),
+        );
 
         SetBkMode(hdc, TRANSPARENT);
         // 主字形：占据整块（略偏左上，给右下角的小三角腾位置）
@@ -1885,15 +1888,28 @@ fn paint_sidebar(app: &mut App, hdc: HDC, l: &Layout) {
             let active = sidebar_row_active(app, row, &cur);
             let hovered = app.sidebar_hover == Some(i);
             if active || hovered {
-                let hb = CreateSolidBrush(if hovered && !active { t.surface } else { t.hover_bg });
-                FillRect(hdc, &row_r, hb);
-                let _ = DeleteObject(hb.into());
+                let only_hover = hovered && !active;
+                fill_radius(
+                    app,
+                    hdc,
+                    if only_hover { "sidebar.hover" } else { "sidebar.selected" },
+                    &row_r,
+                    if only_hover { t.surface } else { t.hover_bg },
+                    None,
+                );
             }
             if active {
-                // 左侧 3px 强调条：和菜单悬停保持一致的语言，指示"当前位置"
-                let ab = CreateSolidBrush(t.accent);
-                FillRect(hdc, &RECT { left: row_r.left, top: row_r.top, right: row_r.left + (3.0 * scale) as i32, bottom: row_r.bottom }, ab);
-                let _ = DeleteObject(ab.into());
+                // 左侧 3px 强调条：和菜单悬停保持一致的语言，指示"当前位置"。
+                // 跟着条目的圆角一起倒角 —— 底色是圆的、竖线是方的，竖线就会
+                // 从圆角外面戳出来一小截。
+                fill_radius(
+                    app,
+                    hdc,
+                    "sidebar.selected",
+                    &RECT { left: row_r.left, top: row_r.top, right: row_r.left + (3.0 * scale) as i32, bottom: row_r.bottom },
+                    t.accent,
+                    None,
+                );
             }
             SetTextColor(hdc, if active { t.text } else { t.text_dim });
 
@@ -2359,23 +2375,27 @@ fn paint_home(app: &mut App, hdc: HDC, l: &Layout) {
             // 首页磁贴同样给悬停反馈，强度比选中弱一档（见列表行的注释）
             let focused = app.focus_visible && n == focus_row;
             if !sel && !focused && app.hover_row == Some(tile.index) {
-                let b = CreateSolidBrush(t.row_hover);
-                FillRect(hdc, &tile.rect, b);
-                let _ = DeleteObject(b.into());
+                fill_radius(app, hdc, "content.hover", &tile.rect, t.row_hover, None);
             }
             if sel || focused {
-                let b = CreateSolidBrush(if sel { t.selection_bg } else { t.hover_bg });
-                FillRect(hdc, &tile.rect, b);
-                let _ = DeleteObject(b.into());
+                fill_radius(
+                    app,
+                    hdc,
+                    "content.selected",
+                    &tile.rect,
+                    if sel { t.selection_bg } else { t.hover_bg },
+                    None,
+                );
                 // 与列表行 / 菜单悬停项同一套语言：选中态在左沿压一条强调竖线
                 let bw = (3.0 * scale).round().max(2.0) as i32;
-                let bar = CreateSolidBrush(t.accent);
-                FillRect(
+                fill_radius(
+                    app,
                     hdc,
+                    "content.selected",
                     &RECT { left: tile.rect.left, top: tile.rect.top, right: tile.rect.left + bw, bottom: tile.rect.bottom },
-                    bar,
+                    t.accent,
+                    None,
                 );
-                let _ = DeleteObject(bar.into());
             }
             SetTextColor(hdc, if sel { t.selection_text } else { t.text });
             app.icons.draw(hdc, icons[n], tile.icon_x, tile.icon_y, tile.icon_size);
@@ -2737,22 +2757,30 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
             // 两者一样重就分不清"我已经选了它"和"我只是指在这儿"。
             let hovered = !selected && !focused && app.hover_row == Some(index);
             if hovered {
-                let fill = CreateSolidBrush(t.row_hover);
-                FillRect(hdc, &r, fill);
-                let _ = DeleteObject(fill.into());
+                fill_radius(app, hdc, "content.hover", &r, t.row_hover, None);
             }
             if selected || focused {
-                let fill = CreateSolidBrush(if selected { t.selection_bg } else { t.hover_bg });
-                FillRect(hdc, &r, fill);
-                let _ = DeleteObject(fill.into());
+                fill_radius(
+                    app,
+                    hdc,
+                    "content.selected",
+                    &r,
+                    if selected { t.selection_bg } else { t.hover_bg },
+                    None,
+                );
                 // 行首一条竖线：和自绘右键菜单的悬停项**同一套语言**
                 // （那里是"底色 + 3px 竖线"）。只有一层底色时，暗色主题下
                 // "选中了哪几行"要逐个比对亮度才看得出来；加了竖线，扫一眼
                 // 左边缘就知道。
                 let bw = (3.0 * app.metrics.scale).round().max(2.0) as i32;
-                let bar = CreateSolidBrush(t.accent);
-                FillRect(hdc, &RECT { left: r.left, top: r.top, right: r.left + bw, bottom: r.bottom }, bar);
-                let _ = DeleteObject(bar.into());
+                fill_radius(
+                    app,
+                    hdc,
+                    "content.selected",
+                    &RECT { left: r.left, top: r.top, right: r.left + bw, bottom: r.bottom },
+                    t.accent,
+                    None,
+                );
             }
             SetTextColor(hdc, if selected { t.selection_text } else { t.text });
 
@@ -3398,9 +3426,14 @@ fn paint_recycle(app: &mut App, hdc: HDC, l: &Layout) {
         {
             let r = btns[i];
             let hovered = app.hover_recycle_btn == (i + 1) as u8 && *enabled;
-            let b = CreateSolidBrush(if hovered { t.row_hover } else { t.surface_alt });
-            FillRect(hdc, &r, b);
-            let _ = DeleteObject(b.into());
+            fill_radius(
+                app,
+                hdc,
+                "toolbar.button",
+                &r,
+                if hovered { t.row_hover } else { t.surface_alt },
+                None,
+            );
             SetTextColor(hdc, if *enabled { t.text } else { t.text_dim });
             draw_text(hdc, label, r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         }
@@ -3463,13 +3496,9 @@ fn paint_recycle(app: &mut App, hdc: HDC, l: &Layout) {
             // 悬停反馈用比选中弱一档的 row_hover，和文件列表一个手感
             let hovered = app.hover_recycle == Some(i);
             if sel {
-                let fb = CreateSolidBrush(t.selection_bg);
-                FillRect(hdc, &r, fb);
-                let _ = DeleteObject(fb.into());
+                fill_radius(app, hdc, "content.selected", &r, t.selection_bg, None);
             } else if hovered {
-                let fb = CreateSolidBrush(t.row_hover);
-                FillRect(hdc, &r, fb);
-                let _ = DeleteObject(fb.into());
+                fill_radius(app, hdc, "content.hover", &r, t.row_hover, None);
             }
             let icon = icons.get(i).copied().unwrap_or(HICON(std::ptr::null_mut()));
             let ix = l.view.left + (12.0 * s) as i32;
@@ -3688,9 +3717,14 @@ fn paint_view_switch(app: &App, hdc: HDC, l: &Layout) {
         for (i, (r, active, grid)) in [(icons, !is_details, true), (details, is_details, false)].iter().enumerate() {
             let hovered = app.hover_view_btn == (i as u8) + 1;
             if hovered || *active {
-                let b = CreateSolidBrush(if hovered { t.hover_bg } else { t.selection_bg });
-                let _ = FillRect(hdc, r, b);
-                let _ = DeleteObject(b.into());
+                fill_radius(
+                    app,
+                    hdc,
+                    "status.button",
+                    r,
+                    if hovered { t.hover_bg } else { t.selection_bg },
+                    None,
+                );
             }
             let color = if *active || hovered { t.text } else { t.text_dim };
             draw_view_glyph(hdc, r, *grid, color);
