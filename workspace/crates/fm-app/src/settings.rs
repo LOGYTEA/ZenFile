@@ -16,9 +16,9 @@ use std::path::PathBuf;
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::HDC;
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DeleteObject, DrawTextW, FillRect, RoundRect, SelectObject, SetBkMode,
-    SetTextColor, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HBRUSH,
-    TRANSPARENT,
+    CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, GetStockObject, Rectangle,
+    RoundRect, SelectObject, SetBkMode, SetTextColor, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX,
+    DT_SINGLELINE, DT_VCENTER, HBRUSH, NULL_BRUSH, PS_SOLID, TRANSPARENT,
 };
 
 use crate::app::{App, SETTINGS_TABS};
@@ -387,6 +387,20 @@ pub struct Settings {
     pub menu_order: Vec<u16>,
     /// 被拖进「更多」的菜单条目
     pub menu_hidden: Vec<u16>,
+    /// 预览画布里**已经放下的**组件（id, x, y）。
+    ///
+    /// round 25 起，预览画布改成"画布"形态：组件拖进预览里就落下到
+    /// (x, y) 位置；拖出预览就删；最多装一次。每个 wid 在这里只出现一次。
+    #[serde(default)]
+    pub canvas_items: Vec<CanvasItem>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CanvasItem {
+    pub wid: u16,
+    /// 相对预览画布左上角（0..1 归一化坐标）
+    pub nx: f32,
+    pub ny: f32,
 }
 
 impl Default for Settings {
@@ -397,6 +411,7 @@ impl Default for Settings {
             bars: default_bars(),
             menu_order: (0..MENU_ITEM_NAMES.len() as u16).collect(),
             menu_hidden: Vec::new(),
+            canvas_items: Vec::new(),
         }
     }
 }
@@ -506,10 +521,13 @@ pub struct Geom {
     pub ui_top: RECT,
     /// 界面页：右边那条（长组件）
     pub ui_right: RECT,
-    /// 界面页：中间的窗口实时预览
+    /// 界面页：预览画布（左侧垂直居中）。**死数据** C:\Windows 详细列表。
     pub ui_preview: RECT,
-    /// 界面页：**预览里**那三条带（标题栏/工具栏/状态栏）的屏幕矩形。
-    /// 预览不是装饰 —— 它就是唯一的投放目标（1:1，比三条 30px 的整条好点多了）。
+    /// 界面页：5 个整条矩形（标题栏 / 工具栏 / 状态栏 / 目录栏 / 用户自定义空行）。
+    pub ui_strips: [RECT; 5],
+    /// 界面页：5 个整条顶部 y
+    pub ui_strips_top: i32,
+    /// 兼容旧字段（drag 旧版可能引用到）
     pub ui_pv_bars: [RECT; 3],
     /// 打开方式里每一条候选程序
     pub ow_rows: Vec<RECT>,
@@ -535,6 +553,8 @@ pub enum Hit {
     MenuRow(usize),
     /// 「右键菜单」打开方式列表里第 n 个程序
     OpenWith(usize),
+    /// 预览画布里第 n 个已放置组件（可拖动改位置 / 拖出预览删除）
+    Canvas(usize),
 }
 
 /// 排布编辑器里正在被拖的那一张。
@@ -551,6 +571,9 @@ pub struct SettingsDrag {
     pub rect: RECT,
     /// 是否是从「更多」区里拖出来的（拖回去 = 恢复显示）
     pub from_dock: bool,
+    /// 是不是从预览画布里某个**已放置组件**上起的拖（下标见 `canvas_item_rects`）。
+    /// 松手时：还在预览内 = 改位置，拖出预览 = 删除。
+    pub from_canvas: Option<usize>,
 }
 
 pub fn geom(app: &App, l: &Layout) -> Geom {
@@ -615,6 +638,8 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
         ui_top: RECT::default(),
         ui_right: RECT::default(),
         ui_preview: RECT::default(),
+        ui_strips: [RECT::default(); 5],
+        ui_strips_top: 0,
         ui_pv_bars: [RECT::default(); 3],
     };
 
@@ -665,51 +690,87 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
             g.rows = system_rows(app, &g.sys_panel);
         }
         crate::app::SETTINGS_TAB_UI => {
-            // 上面两条调色板（小组件 / 长组件），下面一整块 **1:1 的真窗口预览**。
+            // round 25 全新布局（按用户原话"最后再明确一遍"）：
             //
-            // 上一版是"预览缩到 0.49 倍 + 底部三条 30px 整条"：预览小到看不清，
-            // 而且是手绘示意图（侧栏没字、内容区没列头），和真窗口长得不一样。
-            // 现在预览占满整页宽、用真绘制函数原尺寸画 —— 它就是软件窗口本身，
-            // 也是唯一的投放目标。三条整条删了：同一个信息画两遍，还把预览挤瘪。
+            //   ┌──────── 8 个小标签（界面/外观/交互/...）────────┐
+            //   ├──── 顶：小组件横排（按钮） ────┐   ┌── 右侧：长组件 ──┐
+            //   │  [标签][新建][-][□][X][←][→]  │   │ [地址栏][搜索框]  │
+            //   │  [↑][…][侧栏][批量]            │   │ [属性行][...]     │
+            //   ├──────────────────────────────┤   └──────────────────┘
+            //   │ 预览画布（C:\Windows 详细列表） │
+            //   │ —— 死数据，仅渲染圆角 + 内部组件
+            //   ├─────────────────────────────────┤
+            //   │ 标题栏 | 工具栏 | 状态栏 | 目录栏 | 自定义空行 │
+            //   └─────────────────────────────────┘
+            //
+            // 圆角（外观页那一套）只作用于预览画布 + 调色板卡片；
+            // 其它都是死数据（顶/底整条占位条），不调真绘制函数。
             let gap = px(10.0);
+            // 上排 = 小组件（横排整行）
             let h_top = px(48.0);
-            let h_long = px(50.0);
             g.ui_top = RECT {
                 left: content.left,
                 top: content.top,
                 right: content.right,
                 bottom: content.top + h_top,
             };
+            // 下排 = 5 个整条矩形（标题栏/工具栏/状态栏/目录栏/用户空行）
+            let strip_h = px(38.0);
+            let strips_top = content.bottom - strip_h;
+            g.ui_strips_top = strips_top;
+            // 中间行区：小组件带下方 .. 整条上方
+            let row_top = g.ui_top.bottom + gap;
+            let row_bot = strips_top - gap;
+            // 长组件区 = 行区**右侧整列**（用户原话："预览窗口的右边"）
+            let w_long = (content.right - content.left) * 26 / 100;
             g.ui_right = RECT {
-                left: content.left,
-                top: g.ui_top.bottom + gap,
+                left: content.right - w_long,
+                top: row_top,
                 right: content.right,
-                bottom: g.ui_top.bottom + gap + h_long,
+                bottom: row_bot,
             };
+            // 预览画布 = 行区左侧，16:9 按比例缩，**垂直居中**（不占满，
+            // 上下右三边都留白 —— 用户原话）
+            let pv_left = content.left;
+            let pv_right = g.ui_right.left - gap;
+            let pv_w = pv_right - pv_left;
+            let pv_h = (pv_w * 9 / 16)
+                .min(px(430.0))
+                .max(px(200.0))
+                .min((row_bot - row_top - 2).max(px(200.0)));
+            let pv_top = row_top + ((row_bot - row_top - pv_h) / 2).max(0);
             g.ui_preview = RECT {
-                left: content.left,
-                top: g.ui_right.bottom + gap,
-                right: content.right,
-                bottom: content.bottom,
+                left: pv_left,
+                top: pv_top,
+                right: pv_right,
+                bottom: pv_top + pv_h,
             };
-            // 预览里三条带的位置：和 draw_window_preview 共用同一份真布局，
-            // 于是"看起来在这条带上"和"判定为这条带"必然一致。
-            g.ui_pv_bars = preview_bands(app, &g.ui_preview);
+            // 5 个整条矩形横向均匀分
+            let strips_left = content.left;
+            let strips_right = content.right;
+            let strip_w = (strips_right - strips_left - gap * 4) / 5;
+            g.ui_strips = [RECT::default(); 5];
+            for (i, slot) in g.ui_strips.iter_mut().enumerate() {
+                *slot = RECT {
+                    left: strips_left + (i as i32) * (strip_w + gap),
+                    top: strips_top,
+                    right: strips_left + (i as i32) * (strip_w + gap) + strip_w,
+                    bottom: strips_top + strip_h,
+                };
+            }
+            // 兼容旧字段（旧 1:1 预览代码保留但不再用）
+            g.ui_pv_bars = [RECT::default(); 3];
 
-            // —— 第一行：小组件，横向流式排布，排满换行 ——
-            let mut tx = g.ui_top.left;
-            let mut ty = g.ui_top.top + px(16.0);
-            let sh = px(28.0);
+            // —— 上排：小组件横排（+20 避让 band_title 的 16px 标题行）——
+            let mut tx = g.ui_top.left + px(8.0);
+            let ty = g.ui_top.top + px(20.0);
+            let sh = px(26.0);
             for (i, wd) in WIDGETS.iter().enumerate() {
                 if wd.long || WIDGET_RETIRED.contains(&(i as u16)) {
                     continue;
                 }
                 let ww = px(wd.w).max(px(28.0));
-                if tx + ww > g.ui_top.right {
-                    tx = g.ui_top.left;
-                    ty += sh + px(4.0);
-                }
-                if ty + sh > g.ui_top.bottom {
+                if tx + ww > g.ui_top.right - px(4.0) {
                     break;
                 }
                 g.cards.push(RECT { left: tx, top: ty, right: tx + ww, bottom: ty + sh });
@@ -717,24 +778,24 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
                 tx += ww + px(4.0);
             }
 
-            // —— 第二行：长组件 ——
-            let mut lx = g.ui_right.left;
-            let ly = g.ui_right.top + px(16.0);
+            // —— 右侧：长组件**竖排**一列（预览右边） ——
+            let lx0 = g.ui_right.left + px(8.0);
+            let lx1 = g.ui_right.right - px(8.0);
+            let mut ly = g.ui_right.top + px(20.0);
             let lh = px(30.0);
             for (i, wd) in WIDGETS.iter().enumerate() {
                 if !wd.long || WIDGET_RETIRED.contains(&(i as u16)) {
                     continue;
                 }
-                let ww = px(wd.w).max(px(56.0));
-                if lx + ww > g.ui_right.right {
+                if ly + lh > g.ui_right.bottom - px(4.0) {
                     break;
                 }
-                g.cards.push(RECT { left: lx, top: ly, right: lx + ww, bottom: ly + lh });
+                g.cards.push(RECT { left: lx0, top: ly, right: lx1, bottom: ly + lh });
                 g.card_ids.push(i as u32);
-                lx += ww + px(4.0);
+                ly += lh + px(4.0);
             }
 
-            // 这一页没有「更多」区了：拖出预览带就是拿掉，不需要第二个框
+            // 这一页没有「更多」区
             g.dock = RECT::default();
         }
         crate::app::SETTINGS_TAB_LOOK => {
@@ -795,6 +856,12 @@ pub fn hit(app: &App, l: &Layout, x: i32, y: i32) -> Option<Hit> {
     for (i, r) in g.cards.iter().enumerate() {
         if inside(r, x, y) {
             return Some(Hit::Card(i));
+        }
+    }
+    // 画布里已放置的组件（后放的画在上层，所以倒序测）
+    for (i, r) in canvas_item_rects(app, &g).into_iter().rev() {
+        if inside(&r, x, y) {
+            return Some(Hit::Canvas(i));
         }
     }
     for (i, r) in g.chips.iter().enumerate() {
@@ -1058,125 +1125,379 @@ pub fn paint(app: &mut App, hdc: HDC, l: &Layout) {
 
 // ---------------------------------------------------------------- 界面页
 
-/// 界面页：中间是这个软件窗口的实时预览，四周三条组件带。
+/// round 25：界面页 = 画布拖拽形态。
+/// 上 = 小组件横排；右上 = 长组件横排；左侧垂直居中 = 预览画布
+/// （**死数据** C:\Windows 详细列表，圆角渲染）；
+/// 下 = 5 个整条矩形（标题栏/工具栏/状态栏/目录栏/用户自定义空行）。
 fn paint_ui_tab(app: &mut App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
-    // —— 两条调色板 ——
+    let px = |v: f32| (v * s).round() as i32;
+
+    // —— 上排（小组件）——
     band_title(
         hdc,
         &g.ui_top,
-        "小组件 —— 暗的=没装，点一下装上；拖进预览可放到指定位置",
+        "小组件 —— 暗的=已装/不可用；点一下/拖到画布里就能添加",
         th,
         s,
     );
-    band_title(
-        hdc,
-        &g.ui_right,
-        "长组件 —— 地址栏、搜索框那些；同样点一下装/不装",
-        th,
-        s,
-    );
-
-    // —— 中间：整个软件窗口的 1:1 实时预览（真绘制函数画的） ——
-    let pv = g.ui_preview;
-    draw_window_preview(app, hdc, &pv, th, s);
-
-    // —— 调色板里的组件：没装在任何带子里的画成暗的 ——
     for (i, r) in g.cards.iter().enumerate() {
         let id = g.card_ids[i];
-        if id & 0x8000_0000 != 0 {
-            continue;
-        }
+        if id & 0x8000_0000 != 0 { continue; }
+        // 只画"短"组件（长组件在 ui_right 调色板）
         let wid = (id & 0xFF) as usize;
         let dragging = matches!(&app.settings_drag, Some(d) if d.id == id);
         let hover = app.settings_hover_card == Some(id) && !dragging;
-        let ghost = widget_bar_of(app, wid as u16).is_none();
-        draw_widget_ex(app, hdc, r, wid, th, s, hover, dragging, ghost);
+        let placed = widget_is_placed(app, wid as u16);
+        draw_widget_ex(app, hdc, r, wid, th, s, hover, dragging, placed);
     }
 
-    // 拖着东西的时候，把**会接收它的那条带**在预览里框出来 —— 不然用户
-    // 不知道往哪儿松手（"拖过去没反应"有一半是这个原因）。
+    // —— 右侧（长组件）：标题 + 卡片（卡片已在 g.cards 里统一画）——
+    band_title(
+        hdc,
+        &g.ui_right,
+        "长组件（地址栏/搜索框等）",
+        th,
+        s,
+    );
+
+    // —— 预览画布：边框 + 死数据 C:\Windows 详细列表 + 圆角渲染 ——
+    paint_preview_canvas(app, hdc, &g.ui_preview, th, s);
+
+    // —— 画布里已经放下的组件：按画布坐标渲染（可拖动改位置）——
+    let rects = canvas_item_rects(app, g);
+    let drag_ci = app.settings_drag.as_ref().and_then(|d| d.from_canvas);
+    for (i, r0) in rects.iter() {
+        if Some(*i) == drag_ci {
+            continue; // 拖动中的那个最后画（跟着鼠标走）
+        }
+        let Some(it) = app.ui_settings.canvas_items.get(*i) else { continue };
+        draw_widget_ex(app, hdc, r0, it.wid as usize, th, s, false, false, false);
+    }
+    if let (Some(d), Some(ci)) = (&app.settings_drag, drag_ci) {
+        if let Some((_, r0)) = rects.get(ci) {
+            let dx = d.cur.0 - d.grab.0;
+            let dy = d.cur.1 - d.grab.1;
+            let r = RECT {
+                left: r0.left + dx,
+                top: r0.top + dy,
+                right: r0.right + dx,
+                bottom: r0.bottom + dy,
+            };
+            let wid = app.ui_settings.canvas_items.get(ci).map(|c| c.wid as usize);
+            if let Some(wid) = wid {
+                draw_widget_ex(app, hdc, &r, wid, th, s, false, true, false);
+            }
+        }
+    }
+
+    // —— 下排 5 个整条矩形（标题栏/工具栏/状态栏/目录栏/自定义空行）——
+    let strip_titles = ["标题栏", "工具栏", "状态栏", "目录栏", "自定义空行"];
+    for (i, sr) in g.ui_strips.iter().enumerate() {
+        if sr.right <= sr.left || sr.bottom <= sr.top { continue; }
+        // 死数据底板（surface）+ 1px border
+        unsafe {
+            let bg = CreateSolidBrush(th.surface);
+            let _ = FillRect(hdc, sr, bg);
+            let _ = DeleteObject(bg.into());
+            let p = CreatePen(PS_SOLID, 1, th.border);
+            let op = SelectObject(hdc, p.into());
+            let ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+            let _ = Rectangle(hdc, sr.left, sr.top, sr.right, sr.bottom);
+            let _ = SelectObject(hdc, ob);
+            let _ = SelectObject(hdc, op);
+            let _ = DeleteObject(p.into());
+        }
+        // 标题（左上）
+        let title_r = RECT {
+            left: sr.left + px(6.0),
+            top: sr.top + px(2.0),
+            right: sr.right - px(4.0),
+            bottom: sr.top + px(16.0),
+        };
+        set_color(hdc, th.text_dim);
+        paint::draw_text(hdc, strip_titles[i], title_r,
+            DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
+        // 内容：i<3 → bars[i] 里的组件名（死数据展示）；i==3 目录栏 → 死数据；i==4 空
+        let sub_r = RECT {
+            left: sr.left + px(6.0),
+            top: sr.top + px(20.0),
+            right: sr.right - px(6.0),
+            bottom: sr.bottom - px(2.0),
+        };
+        set_color(hdc, th.text);
+        let text = if i < 3 {
+            let ids = app.ui_settings.bars.get(i).cloned().unwrap_or_default();
+            ids.iter()
+                .filter_map(|&w| WIDGETS.get(w as usize).map(|x| x.name))
+                .collect::<Vec<_>>()
+                .join("  ·  ")
+        } else if i == 3 {
+            "(目录栏：侧栏开/关按钮)".to_string()
+        } else {
+            "（空 —— 拖组件到这里）".to_string()
+        };
+        paint::draw_text(hdc, &text, sub_r, DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS);
+    }
+
+    // —— 拖动高亮：拖到预览 = accent 边框 + 拖到整条 = accent 边框 ——
     if let Some(d) = &app.settings_drag {
-        if let Some((bi, _)) = drop_target(app, g, d.cur.0, d.cur.1) {
-            {
-                let br = g.ui_pv_bars[bi];
-                if br.right > br.left && br.bottom > br.top {
-                    unsafe {
-                        let p = windows::Win32::Graphics::Gdi::CreatePen(
-                            windows::Win32::Graphics::Gdi::PS_SOLID,
-                            2,
-                            th.accent,
-                        );
-                        let op = SelectObject(hdc, p.into());
-                        let ob = SelectObject(
-                            hdc,
-                            windows::Win32::Graphics::Gdi::GetStockObject(
-                                windows::Win32::Graphics::Gdi::NULL_BRUSH,
-                            ),
-                        );
-                        let _ = windows::Win32::Graphics::Gdi::Rectangle(
-                            hdc, br.left, br.top, br.right, br.bottom,
-                        );
-                        let _ = SelectObject(hdc, ob);
-                        let _ = SelectObject(hdc, op);
-                        let _ = DeleteObject(p.into());
-                    }
+        let target = drop_target(app, g, d.cur.0, d.cur.1);
+        if let Some(t) = target {
+            let br = match t {
+                DropTarget::Preview => g.ui_preview,
+                DropTarget::Strip(i) => g.ui_strips[i],
+            };
+            if br.right > br.left && br.bottom > br.top {
+                unsafe {
+                    let p = CreatePen(PS_SOLID, 2, th.accent);
+                    let op = SelectObject(hdc, p.into());
+                    let ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+                    let _ = Rectangle(hdc, br.left, br.top, br.right, br.bottom);
+                    let _ = SelectObject(hdc, ob);
+                    let _ = SelectObject(hdc, op);
+                    let _ = DeleteObject(p.into());
                 }
             }
         }
     }
 }
 
-/// 组件当前装在哪条带（没装返回 None）。
-pub fn widget_bar_of(app: &App, wid: u16) -> Option<usize> {
-    app.ui_settings.bars.iter().position(|b| b.contains(&wid))
+/// 画布里组件的像素尺寸（和 `canvas_item_rects` 保持一致）。
+fn canvas_widget_w(app: &App, wid: u16) -> i32 {
+    let s = app.metrics.scale;
+    let w = WIDGETS.get(wid as usize).map(|wd| wd.w).unwrap_or(28.0);
+    ((w * s).round() as i32).max((28.0 * s).round() as i32)
+}
+fn canvas_widget_h(app: &App, wid: u16) -> i32 {
+    let s = app.metrics.scale;
+    let long = WIDGETS.get(wid as usize).map(|wd| wd.long).unwrap_or(false);
+    (if long { 30.0 } else { 28.0 } * s).round() as i32
 }
 
-/// 组件的"老家"：出厂排布里它在哪条带。点一下装上时用这个。
-fn home_bar_of(wid: u16) -> usize {
-    for (bi, b) in default_bars().iter().enumerate() {
-        if b.contains(&wid) {
-            return bi;
-        }
-    }
-    1
+/// 组件是否已经在**预览画布**里 —— 已存在的调色板卡片变灰、不可选中。
+fn widget_is_placed(app: &App, wid: u16) -> bool {
+    app.ui_settings.canvas_items.iter().any(|c| c.wid == wid)
 }
 
-/// 没装 → 装到它本来该待的那条带；装了 → 摘掉（回到调色板等着再装）。
+/// 画布里已放置组件的矩形（绝对窗口坐标，由预览画布 + 归一化偏移推出来）。
 ///
-/// 出厂时 15 个组件全装在带子里，于是"添加"这件事根本无从下手 —— 拖到预览里
-/// 反而变成"拿掉"。给调色板加这条"点一下就装/不装"的通路，添加才真的可行。
-fn toggle_widget(app: &mut App, wid: u16) {
-    if let Some(bi) = widget_bar_of(app, wid) {
-        app.ui_settings.bars[bi].retain(|v| *v != wid);
-    } else {
-        let bi = home_bar_of(wid);
-        let v = &mut app.ui_settings.bars[bi];
-        if !v.contains(&wid) {
-            v.push(wid);
-        }
+/// **绘制与命中测试共用这一个函数** —— 拆成两份早晚会错位。
+fn canvas_item_rects(app: &App, g: &Geom) -> Vec<(usize, RECT)> {
+    let pv = g.ui_preview;
+    let s = app.metrics.scale;
+    let px = |v: f32| (v * s).round() as i32;
+    let pw = pv.right - pv.left;
+    let ph = pv.bottom - pv.top;
+    if pw <= 0 || ph <= 0 {
+        return Vec::new();
     }
-    after_change(app);
+    app.ui_settings
+        .canvas_items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, it)| {
+            let wd = WIDGETS.get(it.wid as usize)?;
+            let w = px(wd.w).max(px(28.0));
+            let h = if wd.long { px(30.0) } else { px(28.0) };
+            let left = pv.left + (it.nx * pw as f32).round() as i32;
+            let top = pv.top + (it.ny * ph as f32).round() as i32;
+            Some((
+                i,
+                RECT {
+                    left,
+                    top,
+                    right: (left + w).min(pv.right),
+                    bottom: (top + h).min(pv.bottom),
+                },
+            ))
+        })
+        .collect()
 }
 
-/// 落点判定：预览里那三条 1:1 的真带。
-///
-/// `finish_drag()`（真的改配置）和 `paint_ui_tab()`（画投放高亮）共用这一份。
-fn drop_target(app: &App, g: &Geom, x: i32, y: i32) -> Option<(usize, Vec<RECT>)> {
-    let tol = (6.0 * app.metrics.scale).round() as i32;
-    for bi in 0..3 {
-        let br = &g.ui_pv_bars[bi];
-        if br.right > br.left
-            && br.bottom > br.top
-            && x >= br.left
-            && x < br.right
-            && y >= br.top - tol
-            && y < br.bottom + tol
+/// round 25：死数据画 C:\Windows 详细列表预览。
+/// 上方顶 chrome（标题栏 26）+ 左侧侧栏（120）+ 中部列表（不可滚动）；
+/// 圆角渲染（按外观页"全局"圆角）。
+fn paint_preview_canvas(app: &App, hdc: HDC, r: &RECT, th: Theme, s: f32) {
+    let _ = app;
+    if r.right <= r.left || r.bottom <= r.top { return; }
+    let px = |v: f32| (v * s).round() as i32;
+    let w = r.right - r.left;
+    let h = r.bottom - r.top;
+    unsafe {
+        // 底板（surface）+ 圆角
+        let bg = CreateSolidBrush(th.surface);
+        let _ = FillRect(hdc, r, bg);
+        let _ = DeleteObject(bg.into());
+        // 1px 描边
+        let p = CreatePen(PS_SOLID, 1, th.border);
+        let op = SelectObject(hdc, p.into());
+        let ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        // 圆角半径：按外观页"全局"圆角
+        let rad = app.radius_of("global") as i32;
+        let d = (rad * 2).min(w).min(h);
+        let _ = RoundRect(hdc, r.left, r.top, r.right, r.bottom, d, d);
+        let _ = SelectObject(hdc, ob);
+        let _ = SelectObject(hdc, op);
+        let _ = DeleteObject(p.into());
+
+        // 内部布局：标题栏 (26) + 工具栏 (40) + 内容区 + 状态栏 (23) + 侧栏
+        let title_h = px(26.0);
+        let toolbar_h = px(40.0);
+        let status_h = px(23.0);
+        let sidebar_w = px(110.0);
+        let title_r = RECT { left: r.left, top: r.top, right: r.right, bottom: r.top + title_h };
+        let toolbar_r = RECT { left: r.left, top: title_r.bottom, right: r.right, bottom: title_r.bottom + toolbar_h };
+        let status_r = RECT { left: r.left, bottom: r.bottom, top: r.bottom - status_h, right: r.right };
+        let sidebar_r = RECT { left: r.left, top: toolbar_r.bottom, right: r.left + sidebar_w, bottom: status_r.top };
+        let view_r = RECT { left: sidebar_r.right, top: toolbar_r.bottom, right: r.right, bottom: status_r.top };
+
+        // 标题栏：底色 chrome_bg，左侧放 4 个模拟 tab 名
+        let cbg = CreateSolidBrush(th.chrome_bg);
+        let _ = FillRect(hdc, &title_r, cbg);
+        let _ = DeleteObject(cbg.into());
+        let font = paint::ui_font(s);
+        let oldf = SelectObject(hdc, font.into());
+        SetBkMode(hdc, TRANSPARENT);
+        let mut tx = title_r.left + px(8.0);
+        for (i, name) in ["此电脑", "C:", "下载", "图片"].iter().enumerate() {
+            set_color(hdc, if i == 0 { th.text } else { th.text_dim });
+            let tr = RECT { left: tx, top: title_r.top, right: tx + px(70.0), bottom: title_r.bottom };
+            paint::draw_text(hdc, name, tr, DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
+            tx += px(72.0);
+        }
+        SelectObject(hdc, oldf);
+
+        // 工具栏
+        let cbg2 = CreateSolidBrush(th.window_bg);
+        let _ = FillRect(hdc, &toolbar_r, cbg2);
+        let _ = DeleteObject(cbg2.into());
+        // 工具栏按钮"返回 / 前进 / 上级" 三个死圆角按钮
+        let mut bx = toolbar_r.left + px(6.0);
+        let bh = toolbar_r.bottom - toolbar_r.top - px(8.0);
+        for _ in 0..3 {
+            let cr = RECT { left: bx, top: toolbar_r.top + px(4.0), right: bx + bh, bottom: toolbar_r.top + px(4.0) + bh };
+            let cbg3 = CreateSolidBrush(th.surface_alt);
+            let _ = FillRect(hdc, &cr, cbg3);
+            let _ = DeleteObject(cbg3.into());
+            bx += bh + px(4.0);
+        }
+        // 死"地址栏"长输入框
+        let addr_w = (toolbar_r.right - bx - px(6.0)).max(px(60.0));
+        let addr_r = RECT { left: bx, top: toolbar_r.top + px(4.0), right: bx + addr_w, bottom: toolbar_r.top + px(4.0) + bh };
+        let sab = CreateSolidBrush(th.surface);
+        let _ = FillRect(hdc, &addr_r, sab);
+        let _ = DeleteObject(sab.into());
+        let sp = CreatePen(PS_SOLID, 1, th.border);
+        let sop = SelectObject(hdc, sp.into());
+        let sob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        let _ = Rectangle(hdc, addr_r.left, addr_r.top, addr_r.right, addr_r.bottom);
+        let _ = SelectObject(hdc, sob);
+        let _ = SelectObject(hdc, sop);
+        let _ = DeleteObject(sp.into());
+
+        // 侧栏（窄条）："主文件夹/桌面/下载/文档/图片/音乐/视频/此电脑"
+        let sbg = CreateSolidBrush(th.chrome_bg);
+        let _ = FillRect(hdc, &sidebar_r, sbg);
+        let _ = DeleteObject(sbg.into());
+        let oldf2 = SelectObject(hdc, font.into());
+        let sfont_h = px(14.0);
+        let mut sy = sidebar_r.top + px(8.0);
+        for (i, name) in ["主文件夹", "桌面", "下载", "文档", "图片", "音乐", "视频", "此电脑"].iter().enumerate() {
+            set_color(hdc, if i == 7 { th.text } else { th.text_dim });
+            let sr2 = RECT { left: sidebar_r.left + px(6.0), top: sy, right: sidebar_r.right - px(4.0), bottom: sy + sfont_h + px(2.0) };
+            paint::draw_text(hdc, name, sr2, DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
+            sy += sfont_h + px(8.0);
+        }
+        SelectObject(hdc, oldf2);
+
+        // 内容区：详细列表（4 列：名称/修改日期/类型/大小）
+        let cbg4 = CreateSolidBrush(th.window_bg);
+        let _ = FillRect(hdc, &view_r, cbg4);
+        let _ = DeleteObject(cbg4.into());
+        let oldf3 = SelectObject(hdc, font.into());
+        let col_name_w = (view_r.right - view_r.left) * 50 / 100;
+        let col_date_w = (view_r.right - view_r.left) * 20 / 100;
+        let col_size_w = (view_r.right - view_r.left) * 12 / 100;
+        let col_kind_w = view_r.right - view_r.left - col_name_w - col_date_w - col_size_w;
+        // 表头
+        let header_r = RECT { left: view_r.left, top: view_r.top, right: view_r.right, bottom: view_r.top + px(22.0) };
+        let hbg = CreateSolidBrush(th.surface);
+        let _ = FillRect(hdc, &header_r, hbg);
+        let _ = DeleteObject(hbg.into());
+        set_color(hdc, th.text_dim);
+        let mut hx = view_r.left + px(8.0);
+        for (label, w) in [("名称", col_name_w), ("修改日期", col_date_w), ("类型", col_kind_w), ("大小", col_size_w)] {
+            let lr = RECT { left: hx, top: header_r.top, right: hx + w - px(8.0), bottom: header_r.bottom };
+            paint::draw_text(hdc, label, lr, DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS);
+            hx += w;
+        }
+        // 死数据 11 行
+        let rows = [
+            ("文件夹", "2026/09/03 14:22", "文件夹", ""),
+            ("主文件夹", "2026/09/03 14:22", "文件夹", ""),
+            ("桌面", "2026/09/03 14:22", "文件夹", ""),
+            ("下载", "2026/09/03 14:22", "文件夹", ""),
+            ("文档", "2026/09/03 14:22", "文件夹", ""),
+            ("图片", "2026/09/03 14:22", "文件夹", ""),
+            ("音乐", "2026/09/03 14:22", "文件夹", ""),
+            ("视频", "2026/09/03 14:22", "文件夹", ""),
+            ("本地磁盘 (C:)", "2026/09/03 14:22", "本地磁盘", "221 GB / 369 GB"),
+            ("本地磁盘 (D:)", "2026/09/03 14:22", "本地磁盘", "393 GB / 954 GB"),
+            ("回收站", "2026/09/03 14:22", "系统文件夹", ""),
+        ];
+        let row_h = px(18.0);
+        let mut ry = header_r.bottom + px(2.0);
+        for row in &rows {
+            if ry + row_h > view_r.bottom { break; }
+            set_color(hdc, th.text);
+            let mut cx = view_r.left + px(8.0);
+            for (i, txt) in [row.0, row.1, row.2, row.3].iter().enumerate() {
+                let cw = [col_name_w, col_date_w, col_kind_w, col_size_w][i];
+                let lr = RECT { left: cx, top: ry, right: cx + cw - px(8.0), bottom: ry + row_h };
+                paint::draw_text(hdc, txt, lr, DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS);
+                cx += cw;
+            }
+            ry += row_h;
+        }
+        SelectObject(hdc, oldf3);
+
+        // 状态栏
+        let sbg2 = CreateSolidBrush(th.status_bg);
+        let _ = FillRect(hdc, &status_r, sbg2);
+        let _ = DeleteObject(sbg2.into());
+        let oldf4 = SelectObject(hdc, font.into());
+        set_color(hdc, th.text_dim);
+        paint::draw_text(hdc, "11 个项目", RECT { left: status_r.left + px(8.0), top: status_r.top, right: status_r.right - px(40.0), bottom: status_r.bottom },
+            DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
+        SelectObject(hdc, oldf4);
+    }
+}
+
+/// 落点判定（round 25 画布形态）：
+/// - 落在预览画布里 → DropTarget::Preview
+/// - 落在某个整条矩形里 → DropTarget::Strip(i)
+/// - 否则 None
+#[derive(Copy, Clone, Debug)]
+enum DropTarget {
+    Preview,
+    Strip(usize),
+}
+
+fn drop_target(_app: &App, g: &Geom, x: i32, y: i32) -> Option<DropTarget> {
+    let _ = _app;
+    // 预览
+    let pv = g.ui_preview;
+    if pv.right > pv.left && pv.bottom > pv.top
+        && x >= pv.left && x < pv.right && y >= pv.top && y < pv.bottom
+    {
+        return Some(DropTarget::Preview);
+    }
+    // 整条
+    for (i, sr) in g.ui_strips.iter().enumerate() {
+        if sr.right > sr.left && sr.bottom > sr.top
+            && x >= sr.left && x < sr.right && y >= sr.top && y < sr.bottom
         {
-            let items = preview_item_rects(app, &g.ui_preview, bi)
-                .into_iter()
-                .map(|(_, r)| r)
-                .collect();
-            return Some((bi, items));
+            return Some(DropTarget::Strip(i));
         }
     }
     None
@@ -1290,6 +1611,7 @@ fn draw_widget_ex(
 ///
 /// 画（draw_window_preview）和落点判定（preview_item_rects）共用这一份 ——
 /// 画在哪就判定在哪，不会出现"看着能放、放了没反应"。
+#[allow(dead_code)]
 fn preview_layout(app: &App, host: &RECT) -> paint::Layout {
     let mut pl = paint::layout_sized(app, host.right - host.left, host.bottom - host.top);
     paint::translate_layout(&mut pl, host.left, host.top);
@@ -1297,6 +1619,7 @@ fn preview_layout(app: &App, host: &RECT) -> paint::Layout {
 }
 
 /// 预览里三条带（标题栏/工具栏/状态栏）的屏幕矩形。
+#[allow(dead_code)]
 pub fn preview_bands(app: &App, host: &RECT) -> [RECT; 3] {
     if host.right <= host.left || host.bottom <= host.top {
         return [RECT::default(); 3];
@@ -1309,6 +1632,7 @@ pub fn preview_bands(app: &App, host: &RECT) -> [RECT; 3] {
 ///
 /// 直接从真布局里取（pl.back / pl.address / pl.min_btn …），和画出来的
 /// 一像素不差 —— 上一版用 layout_bar 自算一份，插进去的位置和看着的会歪。
+#[allow(dead_code)]
 fn preview_item_rects(app: &App, host: &RECT, bar: usize) -> Vec<(u16, RECT)> {
     if bar >= BAR_NAMES.len() {
         return Vec::new();
@@ -1363,6 +1687,7 @@ fn preview_item_rects(app: &App, host: &RECT, bar: usize) -> Vec<(u16, RECT)> {
 /// "挤在一起看都看不清，和我的软件界面也不一样"。
 ///
 /// 整个过程必须 SaveDC/IntersectClipRect/RestoreDC 包住（记忆 DC 全窗口共享）。
+#[allow(dead_code)]
 fn draw_window_preview(app: &mut App, hdc: HDC, host: &RECT, th: Theme, s: f32) {
     let _ = s;
     let r = *host;
@@ -2185,20 +2510,36 @@ fn is_fixed(tab: u8, id: u32) -> bool {
 /// 开始拖一张卡（列表里的或「更多」里的）。
 pub fn begin_drag(app: &mut App, l: &Layout, hit: &Hit, x: i32, y: i32) -> bool {
     let g = geom(app, l);
-    let (id, rect, from_dock) = match hit {
+    let (id, rect, from_dock, from_canvas) = match hit {
         Hit::Card(i) => match (g.card_ids.get(*i), g.cards.get(*i)) {
-            (Some(id), Some(r)) => (*id, *r, false),
+            (Some(id), Some(r)) => {
+                // 变灰 = 已经在画布里，最多只允许添加一次 → 不可选中
+                if widget_is_placed(app, (*id & 0xFF) as u16) {
+                    return false;
+                }
+                (*id, *r, false, None)
+            }
             _ => return false,
         },
+        Hit::Canvas(i) => match canvas_item_rects(app, &g).get(*i) {
+            Some((_, r)) => {
+                let wid = match app.ui_settings.canvas_items.get(*i) {
+                    Some(c) => c.wid,
+                    None => return false,
+                };
+                (wid as u32, *r, false, Some(*i))
+            }
+            None => return false,
+        },
         Hit::Chip(i) => match (g.chip_ids.get(*i), g.chips.get(*i)) {
-            (Some(id), Some(r)) => (*id, *r, true),
+            (Some(id), Some(r)) => (*id, *r, true, None),
             _ => return false,
         },
         // 「右键菜单」页里那块**真实渲染的菜单**：直接拖条目改顺序
         Hit::MenuRow(i) => {
             let id = visible_menu_ids(app).get(*i).copied().unwrap_or(0) as u32;
             match g.menu_rows.get(*i) {
-                Some(r) => (id, *r, false),
+                Some(r) => (id, *r, false, None),
                 None => return false,
             }
         }
@@ -2211,6 +2552,7 @@ pub fn begin_drag(app: &mut App, l: &Layout, hit: &Hit, x: i32, y: i32) -> bool 
         cur: (x, y),
         rect,
         from_dock,
+        from_canvas,
     });
     true
 }
@@ -2237,44 +2579,82 @@ pub fn finish_drag(app: &mut App, l: &Layout, x: i32, y: i32) {
         hide(app, d.tab, d.id);
         return;
     }
-    // 「界面」页：落点按**那三条整条**算 —— 拖进去就是装进来，拖到条外面就是
-    // 拿掉，在同一条里挪就是换位置。整条里装的正是"组件里的子组件"。
+    // 「界面」页（round 25 画布形态）：
+    //   - 从画布起的拖：还在预览内 = 改位置；拖出预览 = 删除元素
+    //   - 从调色板起的拖：落预览 = 放下到该位置；落整条 = 装进那条整条
+    //   - 原地单击 = 快速添加到画布中心
+    //   - 组件最多添加一次（已在画布 → 调色板变灰、不可选中）
     if d.tab == crate::app::SETTINGS_TAB_UI {
-        let wid = (d.id & 0xFF) as u16;
-        let from_bar = d.id & 0x8000_0000 != 0;
-        let src_bar = if from_bar {
-            Some(((d.id >> 16) & 0xFF) as usize)
-        } else {
-            None
-        };
-        let src_slot = ((d.id >> 8) & 0xFF) as usize;
-        // 原地单击（鼠标没动）= 装/不装切换。出厂时 15 个组件全装满了，
-        // 光靠拖是"搬"不是"加"，这条通路才让"添加组件"真的做得成。
-        if !from_bar && (d.cur.0 - d.grab.0).abs() + (d.cur.1 - d.grab.1).abs() <= 3 {
-            toggle_widget(app, wid);
+        let pv = g.ui_preview;
+        let pw = (pv.right - pv.left).max(1);
+        let ph = (pv.bottom - pv.top).max(1);
+
+        // —— 画布元素：改位置 / 删除 ——
+        if let Some(ci) = d.from_canvas {
+            if x >= pv.left && x < pv.right && y >= pv.top && y < pv.bottom {
+                // 保持按下时的抓取偏移，元素左上被钳在预览内
+                let off_x = d.grab.0 - d.rect.left;
+                let off_y = d.grab.1 - d.rect.top;
+                let w = d.rect.right - d.rect.left;
+                let h = d.rect.bottom - d.rect.top;
+                let left = (x - off_x - pv.left).clamp(0, (pw - w).max(0));
+                let top = (y - off_y - pv.top).clamp(0, (ph - h).max(0));
+                if let Some(it) = app.ui_settings.canvas_items.get_mut(ci) {
+                    it.nx = left as f32 / pw as f32;
+                    it.ny = top as f32 / ph as f32;
+                }
+            } else if ci < app.ui_settings.canvas_items.len() {
+                // 拖到预览窗口外 = 删除这个元素
+                app.ui_settings.canvas_items.remove(ci);
+            }
+            after_change(app);
             return;
         }
-        // 一个组件只能待在一处：先从所有带子里摘掉
-        for b in app.ui_settings.bars.iter_mut() {
-            b.retain(|v| *v != wid);
+
+        let wid = (d.id & 0xFF) as u16;
+        // 唯一性兜底：已经在画布里就不允许再加（正常路径 begin_drag 已拦）
+        if widget_is_placed(app, wid) {
+            return;
         }
-        if let Some((bi, items)) = drop_target(app, &g, x, y) {
-            let mut slot = items.len();
-            for (k, br) in items.iter().enumerate() {
-                if x < (br.left + br.right) / 2 {
-                    slot = k;
-                    break;
+        // 原地单击（位移 ≤3px）= 快速添加到画布中心
+        if (d.cur.0 - d.grab.0).abs() + (d.cur.1 - d.grab.1).abs() <= 3 {
+            let w = canvas_widget_w(app, wid);
+            let h = canvas_widget_h(app, wid);
+            app.ui_settings.canvas_items.push(CanvasItem {
+                wid,
+                nx: (((pw - w) / 2) as f32 / pw as f32).clamp(0.0, 1.0),
+                ny: (((ph - h) / 2) as f32 / ph as f32).clamp(0.0, 1.0),
+            });
+            after_change(app);
+            return;
+        }
+
+        match drop_target(app, &g, x, y) {
+            Some(DropTarget::Preview) => {
+                // 落在预览里 = 以落点为组件中心放下
+                let w = canvas_widget_w(app, wid);
+                let h = canvas_widget_h(app, wid);
+                let left = (x - pv.left - w / 2).clamp(0, (pw - w).max(0));
+                let top = (y - pv.top - h / 2).clamp(0, (ph - h).max(0));
+                app.ui_settings.canvas_items.push(CanvasItem {
+                    wid,
+                    nx: left as f32 / pw as f32,
+                    ny: top as f32 / ph as f32,
+                });
+            }
+            Some(DropTarget::Strip(i)) => {
+                // 落在整条（标题栏/工具栏/状态栏/目录栏/自定义空行）= 装进那条
+                while app.ui_settings.bars.len() <= i {
+                    app.ui_settings.bars.push(Vec::new());
                 }
+                for b in app.ui_settings.bars.iter_mut() {
+                    b.retain(|v| *v != wid);
+                }
+                app.ui_settings.bars[i].push(wid);
             }
-            // 从同一条里往后拖时，源槽位已经被摘掉了，插入点要跟着前移一格
-            if src_bar == Some(bi) && src_slot < slot {
-                slot -= 1;
+            None => {
+                // 落在别处 = 不添加（也不删任何已有元素）
             }
-            let v = &mut app.ui_settings.bars[bi];
-            if slot > v.len() {
-                slot = v.len();
-            }
-            v.insert(slot, wid);
         }
         after_change(app);
         return;

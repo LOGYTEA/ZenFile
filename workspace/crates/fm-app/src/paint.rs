@@ -1159,27 +1159,11 @@ pub fn paint_title_bar(app: &mut App, hdc: HDC, l: &Layout) {
         let old = SelectObject(hdc, font.into());
         SetBkMode(hdc, TRANSPARENT);
 
-        // 标签页。**分栏时这一条让位给每个窗格自己的标签条**
-        // （见 `paint_panes`），否则同一排标签会被画两遍。
-        if !app.split() {
-            paint_tab_strip(app, hdc, l, app.focus_pane);
-        } else {
-            // 分栏：标题栏那块地盘改成一行「目录A 丨 目录B」。
-            // 窗格自己的标签条只有 26px 高、挤在各自角落里，一路看过去
-            // 认不出"现在到底看着哪两处"；标题栏这一行才是总览。
-            let cap = app.split_caption();
-            if !cap.is_empty() {
-                let mut r = l.tabs;
-                r.left += (8.0 * app.metrics.scale).round() as i32;
-                SetTextColor(hdc, t.text);
-                draw_text(
-                    hdc,
-                    &cap,
-                    r,
-                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
-                );
-            }
-        }
+        // 标签页。单窗格画焦点窗格的整条；**分栏时顶部也要有这条多标签**
+        // （用户明确要求：最顶上的软件标题栏还是有多标签，不是变成一行
+        // "目录A 丨 目录B" 文字）。窗格自己那条 26px 的 strip 作为局部
+        // 指示保留在各窗格顶上 —— 一个是总览、一个是局部，不算重复。
+        paint_tab_strip(app, hdc, l, app.focus_pane);
         // （原"- ZenFile"字样已按用户要求删掉：标题栏右侧那块地盘留给标签）
         // 侧栏折叠开关（最左）与更多菜单（最小化左侧）
         draw_chrome_button(

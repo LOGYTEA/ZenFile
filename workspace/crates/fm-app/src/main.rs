@@ -1115,6 +1115,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                                 settings::geom(app, &l).menu_idx.get(i).copied();
                         }
                         Some(settings::Hit::OpenWith(_)) => {}
+                        Some(settings::Hit::Canvas(_)) => {}
                         None => {
                             app.settings_hover_menu = None;
                         }
@@ -1317,10 +1318,15 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             if let Some(i) = hit_tab(app, &l, x, y) {
                 // 关闭按钮压在标签右上角，命中优先级必须高于"切换标签"，
                 // 否则每次点 × 都会先切一次标签（然后才关掉别的）。
-                let pl = if app.split() {
+                // 点在**顶部标题栏那条**（单窗格 / 分栏总览）→ 用全局布局算
+                // × 的位置；点在窗格自己那条 26px strip 里 → 用窗格布局。
+                let on_top = y >= l.title.top && y <= l.title.bottom;
+                let pl = if on_top {
+                    l.clone()
+                } else if app.split() {
                     paint::pane_layout(app, &l, app.focus_pane)
                 } else {
-                    l
+                    l.clone()
                 };
                 if inside(&pl.tab_close_rect(i, pl_tab_count(app), &app.metrics), x, y) {
                     app.close_tab(i);
@@ -2693,9 +2699,12 @@ unsafe fn handle_hit_test(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     let l = paint::layout_for(app);
     let border = (4.0 * app.metrics.scale).round() as i32;
     let plus = l.new_tab_rect(app.tab_count(), &app.metrics);
-    // 分栏之后窗口顶部那条标签栏是空的（每条标签归各自的窗格画），
-    // 这里的命中必须跟着关掉，否则会点到"看不见的标签"。
-    let has_top_tabs = !app.split();
+    // 窗口顶部那条标签栏**单窗格和分栏都画**（分栏 = 焦点窗格的总览条，
+    // 见 paint_title_bar）—— 命中必须跟着一起开。之前这里写 `!app.split()`，
+    // 分栏后顶部标签全被判成 HTCAPTION：按下被系统当"拖窗口"吞掉，窗口
+    // 收不到 WM_LBUTTONDOWN —— 表现是"顶部标签点不动、拖不动，还会把整个
+    // 窗口拖跑"（绘制与命中必须共用同一判定）。
+    let has_top_tabs = true;
     // 标题栏上的自有控件（侧栏开关 / 更多菜单 / 新建标签 / 三大金刚键）所在
     // 的位置一律不算边框 —— 它们本来就压在窗口最外侧那几像素上。
     let on_caption_ctrl = inside(&l.sidebar_toggle, pt.x, pt.y)
@@ -2759,8 +2768,18 @@ unsafe fn handle_hit_test(hwnd: HWND, lparam: LPARAM) -> LRESULT {
 }
 
 fn hit_tab(app: &App, l: &paint::Layout, x: i32, y: i32) -> Option<usize> {
-    // 分栏时窗口顶部那条标签栏不存在，标签在自己的窗格顶上 ——
-    // 命中要用"光标所在窗格"覆写过的 Layout，否则点窗格里的标签永远点不中。
+    // 顶部标题栏 tab 条：**单窗格和分栏都画**（分栏 = 焦点窗格的总览条），
+    // 所以先测顶部。
+    if y >= l.title.top && y <= l.title.bottom {
+        let n = app.panes.get(app.focus_pane).map(|p| p.tabs.len()).unwrap_or(0);
+        for i in 0..n {
+            if inside(&l.tab_rect(i, n, &app.metrics), x, y) {
+                return Some(i);
+            }
+        }
+    }
+    // 分栏时每个窗格顶部还有一条 26px 的局部标签条 —— 光标落在哪个窗格
+    // 就用那个窗格覆写过的 Layout 测，否则点窗格里的标签永远点不中。
     if app.split() {
         if let Some(pi) = paint::pane_index_at(app, l, x, y) {
             let pl = paint::pane_layout(app, l, pi);
@@ -2770,14 +2789,6 @@ fn hit_tab(app: &App, l: &paint::Layout, x: i32, y: i32) -> Option<usize> {
                         return Some(i);
                     }
                 }
-            }
-        }
-        return None;
-    }
-    if y >= l.title.top && y <= l.title.bottom {
-        for i in 0..app.tab_count() {
-            if inside(&l.tab_rect(i, app.tab_count(), &app.metrics), x, y) {
-                return Some(i);
             }
         }
     }
