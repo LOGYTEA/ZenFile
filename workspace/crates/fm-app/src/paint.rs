@@ -1529,12 +1529,17 @@ fn draw_caption_button(app: &App, hdc: HDC, r: &RECT, which: u8) {
 fn draw_chrome_button(app: &App, hdc: HDC, r: &RECT, glyph: ChromeGlyph, hover: bool) {
     let t = &app.theme;
     unsafe {
-        // 两个自有按键（菜单键 / 侧栏折叠键）平时**都是透明**的，
-        // 只在鼠标悬停时才亮。第33轮给菜单键加过常驻底色（t.surface），
-        // 第36轮按用户要求去掉 —— 平时标题栏只有那一条横线，
-        // 悬停才浮出圆角块。
-        let bg = if hover { t.hover_bg } else { t.chrome_bg };
-        fill_radius(app, hdc, "title.button", r, bg, None);
+        // 两个自有按键（菜单键 / 侧栏折叠键）平时**一个像素都不画**，
+        // 只在鼠标悬停时才浮出圆角块。
+        //
+        // 注意：**不能靠"填成 chrome_bg"来当透明**。暗色主题里标题栏底色是
+        // `title_bg` = #000000，而 `chrome_bg` = #191919 —— 差 25 级，
+        // 方块照样在标题栏上显形（用户截图里那个深灰块就是这么来的，
+        // 第36轮只把 `t.surface` 换回 `t.chrome_bg`，等于没去掉）。
+        // 真正的透明就是**不调 FillRect**，只画图标。
+        if hover {
+            fill_radius(app, hdc, "title.button", r, t.hover_bg, None);
+        }
         draw_chrome_glyph(app, hdc, r, glyph);
     }
 }
