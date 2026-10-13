@@ -1362,15 +1362,15 @@ fn paint_tab_strip(app: &mut App, hdc: HDC, l: &Layout, pi: usize) {
             if let Some(h) = tab_icons[i] {
                 app.icons.draw(hdc, h, icon_x, icon_y, icon_s);
             } else if let Some(g) = tab_glyphs[i] {
-                let gf = glyph_font(app.metrics.scale);
-                let og = SelectObject(hdc, gf.into());
-                draw_text(
-                    hdc,
-                    g,
-                    RECT { left: icon_x, top: icon_y, right: icon_x + icon_s, bottom: icon_y + icon_s },
-                    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-                );
-                SelectObject(hdc, og);
+                // 设置齿轮：主题接管时走自绘 Gear 字形
+                let ir = RECT { left: icon_x, top: icon_y, right: icon_x + icon_s, bottom: icon_y + icon_s };
+                if !(g == "\u{E713}"
+                    && draw_ui_icon(hdc, crate::icon_theme::Ui::Gear, &ir, icon_s, fg)) {
+                    let gf = glyph_font(app.metrics.scale);
+                    let og = SelectObject(hdc, gf.into());
+                    draw_text(hdc, g, ir, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                    SelectObject(hdc, og);
+                }
             }
             // 标题文字右侧要留出关闭按钮的位置，否则长标题会被 × 压住
             let mut tr = pad_rect_width(&r, 10);
@@ -1398,11 +1398,14 @@ fn paint_tab_strip(app: &mut App, hdc: HDC, l: &Layout, pi: usize) {
                 if hovered {
                     fill_radius(app, hdc, "title.tab", &cr, t.hover_bg, None);
                 }
-                SetTextColor(hdc, if i == app.panes[pi].active || hovered { t.text } else { t.text_dim });
-                let g = glyph_font(app.metrics.scale);
-                let old_g = SelectObject(hdc, g.into());
-                draw_text(hdc, "\u{E8BB}", cr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-                SelectObject(hdc, old_g);
+                let cc = if i == app.panes[pi].active || hovered { t.text } else { t.text_dim };
+                if !draw_ui_icon(hdc, crate::icon_theme::Ui::Close, &cr, (11.0 * app.metrics.scale).round() as i32, cc) {
+                    SetTextColor(hdc, cc);
+                    let g = glyph_font(app.metrics.scale);
+                    let old_g = SelectObject(hdc, g.into());
+                    draw_text(hdc, "\u{E8BB}", cr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                    SelectObject(hdc, old_g);
+                }
             }
         }
 
@@ -1560,15 +1563,13 @@ fn paint_pane_title(app: &mut App, hdc: HDC, l: &Layout, pi: usize, focused: boo
                 drew_icon = true;
             }
         } else if settings {
-            let gf = glyph_font(app.metrics.scale);
-            let og = SelectObject(hdc, gf.into());
-            draw_text(
-                hdc,
-                "\u{E713}",
-                RECT { left: icon_x, top: icon_y, right: icon_x + icon_s, bottom: icon_y + icon_s },
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-            );
-            SelectObject(hdc, og);
+            let ir = RECT { left: icon_x, top: icon_y, right: icon_x + icon_s, bottom: icon_y + icon_s };
+            if !draw_ui_icon(hdc, crate::icon_theme::Ui::Gear, &ir, icon_s, t.text) {
+                let gf = glyph_font(app.metrics.scale);
+                let og = SelectObject(hdc, gf.into());
+                draw_text(hdc, "\u{E713}", ir, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                SelectObject(hdc, og);
+            }
             drew_icon = true;
         } else if !path.as_os_str().is_empty() {
             let h = app.icons.dir_icon(&path, false);
@@ -1615,7 +1616,34 @@ pub enum ChromeGlyph {
     Plus,
 }
 
+/// 主题接管时画一枚 UI 字形（居中于 `r`，边长 `size`），返回是否画了。
+///
+/// 返回 false = 主题没接管（直角黑白默认）或渲染失败 —— 调用方继续走
+/// 原来的字体字形 / GDI 手绘路径，零回归。
+fn draw_ui_icon(hdc: HDC, kind: crate::icon_theme::Ui, r: &RECT, size: i32, color: COLORREF) -> bool {
+    let Some(h) = crate::icon_theme::ui_icon(kind, size, color) else {
+        return false;
+    };
+    let x = (r.left + r.right - size) / 2;
+    let y = (r.top + r.bottom - size) / 2;
+    unsafe {
+        let _ = DrawIconEx(hdc, x, y, h, size, size, 0, None, DI_NORMAL);
+    }
+    true
+}
+
 fn draw_chrome_glyph(app: &App, hdc: HDC, r: &RECT, which: ChromeGlyph) {
+    // 主题接管时（第49轮）：按钮字形也走自绘主题。直角黑白（默认）恒返回
+    // false → 下面的 GDI 手绘照旧，零回归。
+    let s = app.metrics.scale;
+    let (kind, sz) = match which {
+        ChromeGlyph::PaneToggle => (crate::icon_theme::Ui::PaneToggle, (17.0 * s).round() as i32),
+        ChromeGlyph::MoreDots => (crate::icon_theme::Ui::Hamburger, (15.0 * s).round() as i32),
+        ChromeGlyph::Plus => (crate::icon_theme::Ui::Plus, (13.0 * s).round() as i32),
+    };
+    if draw_ui_icon(hdc, kind, r, sz, app.theme.text) {
+        return;
+    }
     let s = app.metrics.scale;
     let cx = (r.left + r.right) / 2;
     let cy = (r.top + r.bottom) / 2;
@@ -1680,6 +1708,23 @@ fn draw_chrome_glyph(app: &App, hdc: HDC, r: &RECT, which: ChromeGlyph) {
 /// 画既不会缺字，也和资源管理器画出来的完全一样。
 fn draw_caption_glyph(app: &App, hdc: HDC, r: &RECT, which: u8) {
     let s = app.metrics.scale;
+    // 主题接管时走自绘字形；还原态（两个错开方框）用专门的 Restore 字形。
+    let kind = match which {
+        1 => Some(crate::icon_theme::Ui::Min),
+        2 => {
+            if unsafe { IsZoomed(app.hwnd) }.0 != 0 {
+                Some(crate::icon_theme::Ui::Restore)
+            } else {
+                Some(crate::icon_theme::Ui::Max)
+            }
+        }
+        _ => Some(crate::icon_theme::Ui::Close),
+    };
+    if let Some(k) = kind {
+        if draw_ui_icon(hdc, k, r, (13.0 * s).round() as i32, app.theme.text) {
+            return;
+        }
+    }
     let cx = (r.left + r.right) / 2;
     let cy = (r.top + r.bottom) / 2;
     // 符号本体 11px（100% 缩放）：1px 笔画在小尺寸下才不至于糊成一团。
@@ -2165,12 +2210,21 @@ pub fn paint_toolbar(app: &mut App, hdc: HDC, l: &Layout) {
             }
             fill_radius(app, hdc, "toolbar.button", &r, t.row_hover, None);
         }
-        SetTextColor(hdc, if app.can_back() { t.text } else { t.text_dim });
-        draw_text(hdc, "\u{E72B}", l.back, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_CENTER);
-        SetTextColor(hdc, if app.can_forward() { t.text } else { t.text_dim });
-        draw_text(hdc, "\u{E72A}", l.forward, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_CENTER);
-        SetTextColor(hdc, t.text);
-        draw_text(hdc, "\u{E74A}", l.up, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_CENTER);
+        let nav_sz = (20.0 * app.metrics.scale).round() as i32;
+        let c_back = if app.can_back() { t.text } else { t.text_dim };
+        if !draw_ui_icon(hdc, crate::icon_theme::Ui::Back, &l.back, nav_sz, c_back) {
+            SetTextColor(hdc, c_back);
+            draw_text(hdc, "\u{E72B}", l.back, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_CENTER);
+        }
+        let c_fwd = if app.can_forward() { t.text } else { t.text_dim };
+        if !draw_ui_icon(hdc, crate::icon_theme::Ui::Forward, &l.forward, nav_sz, c_fwd) {
+            SetTextColor(hdc, c_fwd);
+            draw_text(hdc, "\u{E72A}", l.forward, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_CENTER);
+        }
+        if !draw_ui_icon(hdc, crate::icon_theme::Ui::Up, &l.up, nav_sz, t.text) {
+            SetTextColor(hdc, t.text);
+            draw_text(hdc, "\u{E74A}", l.up, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_CENTER);
+        }
         SelectObject(hdc, old_g);
 
         // 搜索框底色 + 1px 边框：否则 EDIT 与工具栏同色，肉眼不可见。
@@ -2226,30 +2280,41 @@ fn paint_bulk_button(app: &App, hdc: HDC, l: &Layout) {
 
         SetBkMode(hdc, TRANSPARENT);
         // 主字形：占据整块（略偏左上，给右下角的小三角腾位置）
-        let g = glyph_font(s);
-        let og = SelectObject(hdc, g.into());
-        SetTextColor(hdc, if enabled { t.text } else { t.text_dim });
         let gr = RECT {
             left: r.left - (2.0 * s) as i32,
             top: r.top - (3.0 * s) as i32,
             right: r.right - (1.0 * s) as i32,
             bottom: r.bottom - (3.0 * s) as i32,
         };
-        draw_text(hdc, "\u{E8AC}", gr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        let main_col = if enabled { t.text } else { t.text_dim };
+        if !draw_ui_icon(
+            hdc,
+            crate::icon_theme::Ui::Rename,
+            &gr,
+            (19.0 * s).round() as i32,
+            main_col,
+        ) {
+            let g = glyph_font(s);
+            let og = SelectObject(hdc, g.into());
+            SetTextColor(hdc, main_col);
+            draw_text(hdc, "\u{E8AC}", gr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            SelectObject(hdc, og);
+        }
         // 右下角小三角："这是一个下拉，不是普通按钮"。用一个更小的字形字号，
         // 免得它和主字形抢视觉重量。
-        let small = caret_font(s);
-        let os = SelectObject(hdc, small.into());
-        SetTextColor(hdc, t.text_dim);
         let ar = RECT {
             left: r.left + (16.0 * s) as i32,
             top: r.bottom - (14.0 * s) as i32,
             right: r.right,
             bottom: r.bottom - (2.0 * s) as i32,
         };
-        draw_text(hdc, "\u{E70D}", ar, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        SelectObject(hdc, os);
-        SelectObject(hdc, og);
+        if !draw_ui_icon(hdc, crate::icon_theme::Ui::ChevronDown, &ar, (11.0 * s).round() as i32, t.text_dim) {
+            let small = caret_font(s);
+            let os = SelectObject(hdc, small.into());
+            SetTextColor(hdc, t.text_dim);
+            draw_text(hdc, "\u{E70D}", ar, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            SelectObject(hdc, os);
+        }
     }
 }
 
@@ -2312,6 +2377,12 @@ pub fn tick_busy_strip(hwnd: HWND, app: &App) {
 /// 收起 = 朝右（▶），展开 = 朝下（▼）。尺寸比之前的字形小近一半 —— 之前是
 /// 16px 的 Segoe MDL2 字符，图标格大半是留白，看着又大又糊。
 pub fn draw_tree_chevron(hdc: HDC, r: &RECT, color: COLORREF, down: bool) {
+    // 主题接管时（第49轮）：树箭头也走主题字形（圆角套把三角的角倒圆）。
+    let sz = ((r.right - r.left).min(r.bottom - r.top)).max(8);
+    let kind = if down { crate::icon_theme::Ui::ChevronDown } else { crate::icon_theme::Ui::ChevronRight };
+    if draw_ui_icon(hdc, kind, r, sz, color) {
+        return;
+    }
     let cx = (r.left + r.right) / 2;
     let cy = (r.top + r.bottom) / 2;
     let a = ((r.right - r.left) * 7 / 16).max(3); // 槽位 16px → 三角 7px
@@ -4352,6 +4423,12 @@ pub fn status_view_hit(l: &Layout, m: &Metrics, x: i32, y: i32) -> Option<fm_cor
 ///   * 大图标 = 2×2 的**方格子**（外框 + 内部留白，像缩略图格子）
 ///   * 详细信息 = 一个**表格**：顶部一条表头线 + 若干行，行里还有列分隔
 unsafe fn draw_view_glyph(hdc: HDC, r: &RECT, grid: bool, color: COLORREF) {
+    // 主题接管时（第49轮）：这两个视图字形也走主题。
+    let sz = ((r.right - r.left).min(r.bottom - r.top) - 4).max(10);
+    let kind = if grid { crate::icon_theme::Ui::ViewGrid } else { crate::icon_theme::Ui::ViewList };
+    if draw_ui_icon(hdc, kind, r, sz, color) {
+        return;
+    }
     let brush = CreateSolidBrush(color);
     let w = r.right - r.left;
     let h = r.bottom - r.top;
@@ -4564,17 +4641,28 @@ fn paint_search_decor(hwnd: HWND, hdc_in: Option<HDC>) {
         let lw = (1.0 * scale).round().max(1.0) as i32;
         let cx = (6.0 * scale).round() as i32 + m;
         let cy = (r.top + r.bottom) / 2 - m / 4;   // 偏上一点点：给下方手柄留位，整体仍与文字齐平
-        let pen = CreatePen(PS_SOLID, lw, t.text_dim);
-        let op = SelectObject(hdc, pen.into());
-        let ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        let _ = Ellipse(hdc, cx - m, cy - m, cx + m, cy + m);
-        // 手柄：从圆右下 45° 伸出去的那一小段
-        let h = ((m as f32 * 0.9) as i32).max(3);
-        let _ = MoveToEx(hdc, cx + m / 2, cy + m / 2, None);
-        let _ = LineTo(hdc, cx + m / 2 + h, cy + m / 2 + h);
-        let _ = SelectObject(hdc, ob);
-        let _ = SelectObject(hdc, op);
-        let _ = DeleteObject(pen.into());
+        // 主题接管时：放大镜也走主题字形（第49轮）。占位宽度仍按 m 算，
+        // 免得提示文字的起点随主题切换跳动。
+        let themed = draw_ui_icon(
+            hdc,
+            crate::icon_theme::Ui::Search,
+            &RECT { left: cx - m, top: cy - m, right: cx + m, bottom: cy + m },
+            (2 * m + ((2.0 * scale).round() as i32).max(2)).max(10),
+            t.text_dim,
+        );
+        if !themed {
+            let pen = CreatePen(PS_SOLID, lw, t.text_dim);
+            let op = SelectObject(hdc, pen.into());
+            let ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+            let _ = Ellipse(hdc, cx - m, cy - m, cx + m, cy + m);
+            // 手柄：从圆右下 45° 伸出去的那一小段
+            let h = ((m as f32 * 0.9) as i32).max(3);
+            let _ = MoveToEx(hdc, cx + m / 2, cy + m / 2, None);
+            let _ = LineTo(hdc, cx + m / 2 + h, cy + m / 2 + h);
+            let _ = SelectObject(hdc, ob);
+            let _ = SelectObject(hdc, op);
+            let _ = DeleteObject(pen.into());
+        }
         if empty {
             // 提示文字：起点跟着**放大镜实际占位**（左内边距 + 直径 + 间隙），
             // 不能写死 26 —— 半径随 scale 变，写死就会出现字压在放大镜上。

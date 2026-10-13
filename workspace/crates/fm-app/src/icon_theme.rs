@@ -12,6 +12,7 @@
 //!   - 图标由本模块渲染，调用方（`IconCache`）负责缓存与销毁；
 //!   - 直角黑白组合**绝不能**落到本模块（is_default_combo 的调用方守卫）。
 
+use windows::Win32::Foundation::COLORREF;
 use windows::Win32::Graphics::Gdi::{
     CreateBitmap, CreateDIBSection, DeleteObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
     DIB_RGB_COLORS,
@@ -122,6 +123,11 @@ pub fn set_theme(style: &str, tone: &str, dark: bool) {
                 let _ = windows::Win32::UI::WindowsAndMessaging::DestroyIcon(h);
             }
         }
+        for (_, _, _, h) in UI.drain(..) {
+            if !h.0.is_null() {
+                let _ = windows::Win32::UI::WindowsAndMessaging::DestroyIcon(h);
+            }
+        }
         SPEC = next;
     }
 }
@@ -190,6 +196,299 @@ pub fn dir_kind(path: &std::path::Path) -> Kind {
         }
     }
     Kind::Folder
+}
+
+// ---------------------------------------------------------------- UI 线形字形
+
+/// 界面按钮字形（第49轮）。标题栏/目录栏/状态栏的按钮图标也归主题管：
+/// 与文件图标同一套 SDF 渲染，但画的是**线条**字形，颜色由调用方给
+/// （theme.text / text_dim），风格旋钮控制笔帽与圆角。
+///
+/// 默认（直角黑白）组合下 `ui_icon` 恒返回 None —— 调用方走原来的
+/// Segoe MDL2 字体字形 / GDI 手绘，零回归。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Ui {
+    /// ←（工具栏返回）
+    Back,
+    /// →（工具栏前进）
+    Forward,
+    /// ↑（工具栏上级）
+    Up,
+    /// 放大镜（搜索框）
+    Search,
+    /// 铅笔（批量重命名）
+    Rename,
+    /// ▼（下拉 / 树展开）
+    ChevronDown,
+    /// ▶（树收起）
+    ChevronRight,
+    /// 侧栏开关（方框 + 左填栏）
+    PaneToggle,
+    /// 主菜单（三条杠）
+    Hamburger,
+    /// 新建标签（十字）
+    Plus,
+    /// —（最小化）
+    Min,
+    /// □（最大化）
+    Max,
+    /// ⧉（还原）
+    Restore,
+    /// ×（关闭）
+    Close,
+    /// 状态栏：图标视图（2×2 空心格）
+    ViewGrid,
+    /// 状态栏：列表视图
+    ViewList,
+    /// 齿轮（设置标签）
+    Gear,
+}
+
+/// UI 字形缓存：(字形, 边长, COLORREF) → HICON。句柄由本模块持有并在切主题时销毁。
+static mut UI: Vec<(Ui, i32, u32, HICON)> = Vec::new();
+
+/// 取一枚主题 UI 字形。主题未接管或渲染失败返回 None —— 调用方走原路径。
+///
+/// `size` 是成品边长（像素，含 DPI），内部 4× 超采样。
+pub fn ui_icon(kind: Ui, size: i32, color: COLORREF) -> Option<HICON> {
+    unsafe {
+        if SPEC.is_none() {
+            return None;
+        }
+        let size = size.clamp(10, 96);
+        let ckey = color.0;
+        for (k, s, c, h) in UI.iter() {
+            if *k == kind && *s == size && *c == ckey {
+                return Some(*h);
+            }
+        }
+        let round = SPEC.as_ref().map(|s| s.round).unwrap_or(false);
+        let rgb = [
+            (ckey & 0xFF) as u8,
+            ((ckey >> 8) & 0xFF) as u8,
+            ((ckey >> 16) & 0xFF) as u8,
+        ];
+        let h = render_ui(kind, round, rgb, size);
+        if h.0.is_null() {
+            return None;
+        }
+        if UI.len() > 512 {
+            // 防呆上界：字形 × 尺寸 × 颜色 的组合数有限，超了整表清空重来
+            for (_, _, _, h) in UI.drain(..) {
+                if !h.0.is_null() {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::DestroyIcon(h);
+                }
+            }
+        }
+        UI.push((kind, size, ckey, h));
+        Some(h)
+    }
+}
+
+fn render_ui(kind: Ui, round: bool, rgb: [u8; 3], size: i32) -> HICON {
+    let mut cv = Cv::new(size);
+    draw_ui(kind, &mut cv, round, rgb);
+    bake(&cv, size)
+}
+
+/// 线段笔画 SDF（设计单位）。`round`=圆头（胶囊），否则平头（方帽矩形）。
+///
+/// 这是所有线条字形的唯一笔画原语：风格差异（圆头/平头）集中在这里，
+/// 各字形本身不用关心风格。
+fn sd_stroke(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32, hw: f32, round: bool) -> f32 {
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    let len2 = dx * dx + dy * dy;
+    if len2 < 1e-6 {
+        return ((px - x0).powi(2) + (py - y0).powi(2)).sqrt() - hw;
+    }
+    let len = len2.sqrt();
+    let t = ((px - x0) * dx + (py - y0) * dy) / len2;
+    if round {
+        let tc = t.clamp(0.0, 1.0);
+        let ex = px - (x0 + tc * dx);
+        let ey = py - (y0 + tc * dy);
+        (ex * ex + ey * ey).sqrt() - hw
+    } else {
+        // 平头帽：以线段中点为原点的局部 (perp, along) 坐标里做盒 SDF
+        let cross = ((px - x0) * dy - (py - y0) * dx) / len;
+        let along = t * len - len * 0.5;
+        let qx = cross.abs() - hw;
+        let qy = along.abs() - len * 0.5;
+        let ox = qx.max(0.0);
+        let oy = qy.max(0.0);
+        (ox * ox + oy * oy).sqrt() + qx.max(qy).min(0.0)
+    }
+}
+
+fn bbox_of(pts: &[[f32; 2]], pad: f32) -> [f32; 4] {
+    let mut x0 = f32::MAX;
+    let mut y0 = f32::MAX;
+    let mut x1 = f32::MIN;
+    let mut y1 = f32::MIN;
+    for p in pts {
+        x0 = x0.min(p[0]);
+        y0 = y0.min(p[1]);
+        x1 = x1.max(p[0]);
+        y1 = y1.max(p[1]);
+    }
+    [x0 - pad, y0 - pad, x1 + pad, y1 + pad]
+}
+
+impl Cv {
+    /// 画一笔线段（bbox 自动包住笔画）。风格差异全在 `sd_stroke` 里。
+    fn stroke(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, hw: f32, round: bool, col: [u8; 3]) {
+        let m = hw + 1.0;
+        let bbox = [x0.min(x1) - m, y0.min(y1) - m, x0.max(x1) + m, y0.max(y1) + m];
+        self.fill(bbox, col, move |x, y| sd_stroke(x, y, x0, y0, x1, y1, hw, round));
+    }
+
+    /// 实心多边形（点按顺时针）。`round` 时把凸角倒圆（近似：点向重心收再外扩）。
+    fn fill_poly(&mut self, pts: &[[f32; 2]], round: bool, col: [u8; 3]) {
+        let r = if round { 1.7 } else { 0.0 };
+        let n = pts.len();
+        let mut cx = 0.0;
+        let mut cy = 0.0;
+        for p in pts {
+            cx += p[0];
+            cy += p[1];
+        }
+        cx /= n as f32;
+        cy /= n as f32;
+        let mut inset = [[0.0f32; 2]; 8];
+        for (i, p) in pts.iter().enumerate() {
+            inset[i] = [
+                cx + (p[0] - cx) * (1.0 - r / 6.0),
+                cy + (p[1] - cy) * (1.0 - r / 6.0),
+            ];
+        }
+        let shrink = 1.0 - r / 6.0;
+        let _ = shrink;
+        self.fill(bbox_of(pts, r + 1.0), col, move |x, y| sd_poly(x, y, &inset[..n]) - r);
+    }
+
+    /// 圆角矩形**描边**（环）。
+    fn ring_rrect(&mut self, x: f32, y: f32, w: f32, h: f32, hw: f32, r: f32, col: [u8; 3]) {
+        self.fill([x - 1.0, y - 1.0, x + w + 1.0, y + h + 1.0], col, move |px, py| {
+            sd_rrect(px, py, x, y, w, h, r).max(-sd_rrect(px, py, x + hw, y + hw, w - 2.0 * hw, h - 2.0 * hw, (r - hw).max(0.2)))
+        });
+    }
+
+    /// 圆形描边（环）。
+    fn ring_circle(&mut self, cx: f32, cy: f32, rad: f32, hw: f32, col: [u8; 3]) {
+        self.fill([cx - rad - 1.0, cy - rad - 1.0, cx + rad + 1.0, cy + rad + 1.0], col, move |x, y| {
+            sd_ellipse(x, y, cx, cy, rad, rad).abs() - hw
+        });
+    }
+}
+
+/// 画一枚 UI 字形（32 单位设计网格）。
+fn draw_ui(kind: Ui, cv: &mut Cv, round: bool, col: [u8; 3]) {
+    // 笔宽：圆角套略粗（圆头在细笔下显不出来），直角套略细（锐利）。
+    let hw = if round { 2.0 } else { 1.7 };
+    let cap = round;
+    match kind {
+        Ui::Back => {
+            cv.stroke(12.0, 16.0, 26.0, 16.0, hw, cap, col);
+            cv.fill_poly(&[[6.0, 16.0], [16.0, 9.5], [16.0, 22.5]], round, col);
+        }
+        Ui::Forward => {
+            cv.stroke(6.0, 16.0, 20.0, 16.0, hw, cap, col);
+            // 三角必须顺时针（sd_poly 的内部判据），反了整个箭头就只剩杆
+            cv.fill_poly(&[[26.0, 16.0], [16.0, 22.5], [16.0, 9.5]], round, col);
+        }
+        Ui::Up => {
+            cv.stroke(16.0, 26.0, 16.0, 14.0, hw, cap, col);
+            cv.fill_poly(&[[16.0, 6.0], [22.5, 16.0], [9.5, 16.0]], round, col);
+        }
+        Ui::Search => {
+            // 圆环 + 斜手柄（原 GDI 画法的同一构图）
+            cv.ring_circle(13.5, 13.5, 8.0, hw, col);
+            cv.stroke(19.5, 19.5, 26.5, 26.5, hw * 1.15, cap, col);
+        }
+        Ui::Rename => {
+            // 铅笔：粗斜杆 + 左下笔尖三角
+            cv.stroke(10.5, 21.5, 22.0, 10.0, 2.6, cap, col);
+            cv.fill_poly(&[[4.5, 27.5], [8.5, 18.0], [16.5, 24.5]], round, col);
+        }
+        Ui::ChevronDown => {
+            cv.fill_poly(&[[8.0, 12.5], [24.0, 12.5], [16.0, 21.5]], round, col);
+        }
+        Ui::ChevronRight => {
+            cv.fill_poly(&[[12.5, 8.0], [21.5, 16.0], [12.5, 24.0]], round, col);
+        }
+        Ui::PaneToggle => {
+            let r = if round { 3.0 } else { 0.5 };
+            cv.ring_rrect(4.0, 8.5, 24.0, 15.0, hw, r, col);
+            // 左侧填实的一栏："被收起的那一栏"
+            let r2 = if round { 1.6 } else { 0.3 };
+            cv.fill([6.0, 10.5, 13.5, 21.5], col, move |x, y| sd_rrect(x, y, 6.5, 11.0, 6.0, 10.0, r2));
+        }
+        Ui::Hamburger => {
+            for y in [10.5f32, 16.0, 21.5] {
+                cv.stroke(8.0, y, 24.0, y, hw * 0.85, cap, col);
+            }
+        }
+        Ui::Plus => {
+            cv.stroke(16.0, 8.0, 16.0, 24.0, hw, cap, col);
+            cv.stroke(8.0, 16.0, 24.0, 16.0, hw, cap, col);
+        }
+        Ui::Min => {
+            // 与原 GDI 版同一位置约定：横线压在几何中心之下一点，不"贴地"
+            cv.stroke(9.0, 19.5, 23.0, 19.5, hw, cap, col);
+        }
+        Ui::Max => {
+            let r = if round { 3.0 } else { 0.5 };
+            cv.ring_rrect(8.0, 8.0, 16.0, 16.0, hw, r, col);
+        }
+        Ui::Restore => {
+            // 后框只画上边 + 右边（与原 GDI 版同构），前框完整
+            let r = if round { 2.6 } else { 0.5 };
+            cv.stroke(12.5, 7.0, 26.0, 7.0, hw, cap, col);
+            cv.stroke(26.0, 7.0, 26.0, 20.5, hw, cap, col);
+            cv.ring_rrect(6.0, 12.0, 14.5, 14.5, hw, r, col);
+        }
+        Ui::Close => {
+            cv.stroke(9.5, 9.5, 22.5, 22.5, hw, cap, col);
+            cv.stroke(22.5, 9.5, 9.5, 22.5, hw, cap, col);
+        }
+        Ui::ViewGrid => {
+            // 2×2 空心格（照原 GDI 版：空心比实心更像"图标视图"）
+            let r = if round { 2.2 } else { 0.4 };
+            let t = hw * 0.85;
+            for (gx, gy) in [(5.0f32, 5.0f32), (18.0, 5.0), (5.0, 18.0), (18.0, 18.0)] {
+                cv.ring_rrect(gx, gy, 9.0, 9.0, t, r, col);
+            }
+        }
+        Ui::ViewList => {
+            // 表头条 + 三行 + 一条列分隔线（照原 GDI 版构图）
+            cv.fill([5.0, 6.0, 27.0, 10.0], col, |x, y| {
+                sd_rrect(x, y, 5.0, 6.0, 22.0, 4.0, if round { 1.8 } else { 0.3 })
+            });
+            for y in [14.5f32, 19.5, 24.5] {
+                cv.stroke(5.0, y, 27.0, y, hw * 0.75, cap, col);
+            }
+            cv.stroke(19.0, 13.0, 19.0, 26.0, hw * 0.6, cap, col);
+        }
+        Ui::Gear => {
+            // 齿轮：环 + 6 枚径向齿 + 中心轴
+            cv.ring_circle(16.0, 16.0, 9.0, hw * 1.15, col);
+            for k in 0..6 {
+                let a = (k as f32) * std::f32::consts::PI / 3.0;
+                let (s, c) = a.sin_cos();
+                cv.stroke(
+                    16.0 + 8.5 * c,
+                    16.0 + 8.5 * s,
+                    16.0 + 12.5 * c,
+                    16.0 + 12.5 * s,
+                    hw * 1.05,
+                    cap,
+                    col,
+                );
+            }
+            cv.fill([12.5, 12.5, 19.5, 19.5], col, |x, y| sd_ellipse(x, y, 16.0, 16.0, 3.4, 3.4));
+        }
+    }
 }
 
 /// 按扩展名归类（文件图标入口用）。未识别 → Generic。
@@ -613,7 +912,12 @@ pub fn render(kind: Kind, round: bool, color: bool, dark: bool, size: i32) -> HI
     let size = size.clamp(16, 256);
     let mut cv = Cv::new(size);
     draw(kind, &mut cv, round, color, dark);
+    bake(&cv, size)
+}
 
+/// 画布 → HICON：4× 超采样缓冲 box 降采样成 premultiplied BGRA，
+/// 再包一层全 0 掩码的 32bpp 图标。文件图标与 UI 字形共用这一段。
+fn bake(cv: &Cv, size: i32) -> HICON {
     let ss = SS as usize;
     let out = size as usize;
     // box 降采样 → premultiplied BGRA
