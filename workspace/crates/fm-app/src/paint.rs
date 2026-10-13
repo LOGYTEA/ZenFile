@@ -758,6 +758,60 @@ pub fn pane_layout(app: &App, l: &Layout, i: usize) -> Layout {
     o
 }
 
+/// 点 (x, y) 是否落在**两个窗格之间的分隔线**上。
+///
+/// 返回 `(是否竖线, 左/上窗格, 右/下窗格)`。不分栏（≤1 个窗格）恒 None。
+///
+/// 判据：两个窗格在该轴上**紧贴**（间距 ≤ 容差），且光标离那条公共边
+/// ≤ 容差、落在两者在另一轴上的重叠区间内。窗格矩形是归一化的，先落到
+/// 像素再比 —— 归一化坐标下"紧贴"会被 round 摆动干扰。
+pub fn pane_div_at(app: &App, l: &Layout, x: i32, y: i32) -> Option<(bool, usize, usize)> {
+    if app.panes.len() < 2 {
+        return None;
+    }
+    let outer = l.view;
+    let tol = (5.0 * app.metrics.scale).round() as i32;
+    let rects: Vec<RECT> = app.panes.iter().map(|p| p.rect.to_px(&outer)).collect();
+    for i in 0..rects.len() {
+        for j in (i + 1)..rects.len() {
+            let (a, b) = (rects[i], rects[j]);
+            // 竖线：a 在左、b 在右，a.right ≈ b.left
+            if (a.right - b.left).abs() <= tol && (x - a.right).abs() <= tol {
+                let y0 = a.top.max(b.top);
+                let y1 = a.bottom.min(b.bottom);
+                if y >= y0 && y <= y1 {
+                    return Some((true, i, j));
+                }
+            }
+            // b 在左、a 在右
+            if (b.right - a.left).abs() <= tol && (x - b.right).abs() <= tol {
+                let y0 = a.top.max(b.top);
+                let y1 = a.bottom.min(b.bottom);
+                if y >= y0 && y <= y1 {
+                    return Some((true, j, i));
+                }
+            }
+            // 横线：a 在上、b 在下，a.bottom ≈ b.top
+            if (a.bottom - b.top).abs() <= tol && (y - a.bottom).abs() <= tol {
+                let x0 = a.left.max(b.left);
+                let x1 = a.right.min(b.right);
+                if x >= x0 && x <= x1 {
+                    return Some((false, i, j));
+                }
+            }
+            // b 在上、a 在下
+            if (b.bottom - a.top).abs() <= tol && (y - b.bottom).abs() <= tol {
+                let x0 = a.left.max(b.left);
+                let x1 = a.right.min(b.right);
+                if x >= x0 && x <= x1 {
+                    return Some((false, j, i));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// 内容区里的"8 向贴"判定：四边各占 30% 的带，两带相交处是四角，
 /// 正中间那块是 Center（合并进目标窗格，不分栏）。
 pub fn dock_zone_at(l: &Layout, x: i32, y: i32) -> crate::app::DockZone {
@@ -1364,7 +1418,7 @@ pub fn paint_panes(app: &mut App, hdc: HDC, l: &Layout) {
     }
     let saved = app.focus_pane;
     let n = app.panes.len();
-    let strip = (26.0 * app.metrics.scale).round() as i32;
+    let strip = pane_strip_px(app.metrics.scale);
     let outer = l.view;
     let t = app.theme;
     for i in 0..n {
@@ -1384,11 +1438,24 @@ pub fn paint_panes(app: &mut App, hdc: HDC, l: &Layout) {
             FillRect(hdc, &pr, b);
             let _ = DeleteObject(b.into());
         }
-        paint_tab_strip(app, hdc, &l2, i);
+        // 贴边窗格顶部是**标题条**（只显示当前文件夹名），不再是多标签条
+        //（用户要求：贴边窗口最多一个标签，不要里面还套一层 ×/+）。
+        //
+        // `i == saved` 判焦点 —— 不能在 paint_pane_title 里拿 `app.focus_pane`
+        // 比，因为这个循环逐窗格把 focus_pane 设成 i，比出来恒真（两个窗格
+        // 都画出强调下划线 = 又一圈蓝边）。
+        paint_pane_title(app, hdc, &l2, i, i == saved);
         paint_view(app, hdc, &l2);
         // 窗格之间的缝：只有"右边和下边"需要画，最外圈本来就是窗口边界。
+        //
+        // 颜色恒为中性分隔色 —— 早先焦点窗格用强调色（蓝）描边，用户明确
+        // 要求去掉（"这个窗口会有蓝边"）。焦点改由标题条底部的强调下划线
+        // 与标签高亮表达，不再给整圈边框上色。
+        //
+        // 但**正在拖的那条分隔线**（或正悬停的）仍给强调色：那是操作反馈，
+        // 鼠标一松就消失，不是常驻边框。
         unsafe {
-            let line = CreateSolidBrush(if i == saved { t.accent } else { t.surface_alt });
+            let line = CreateSolidBrush(t.surface_alt);
             let edge = RECT { left: pr.left, top: pr.bottom - 2, right: pr.right, bottom: pr.bottom };
             FillRect(hdc, &edge, line);
             let edge2 = RECT { left: pr.right - 2, top: pr.top, right: pr.right, bottom: pr.bottom };
@@ -1397,6 +1464,134 @@ pub fn paint_panes(app: &mut App, hdc: HDC, l: &Layout) {
         }
     }
     app.focus_pane = saved;
+    // 高亮正在拖 / 悬停的那条窗格分隔线（覆盖在中性缝之上）
+    let hot = app
+        .pane_div_drag
+        .as_ref()
+        .map(|d| Some((d.vertical, d.a, d.b)))
+        .unwrap_or(app.hover_pane_div);
+    if let Some((vertical, a, b)) = hot {
+        if a < n && b < n {
+            let ra = app.panes[a].rect.to_px(&outer);
+            let rb = app.panes[b].rect.to_px(&outer);
+            let accent = app.theme.accent;
+            unsafe {
+                let br = CreateSolidBrush(accent);
+                if vertical {
+                    let x = ra.right;
+                    let y0 = ra.top.max(rb.top);
+                    let y1 = ra.bottom.min(rb.bottom);
+                    if y1 > y0 {
+                        let r = RECT { left: x - 1, top: y0, right: x + 1, bottom: y1 };
+                        FillRect(hdc, &r, br);
+                    }
+                } else {
+                    let y = ra.bottom;
+                    let x0 = ra.left.max(rb.left);
+                    let x1 = ra.right.min(rb.right);
+                    if x1 > x0 {
+                        let r = RECT { left: x0, top: y - 1, right: x1, bottom: y + 1 };
+                        FillRect(hdc, &r, br);
+                    }
+                }
+                let _ = DeleteObject(br.into());
+            }
+        }
+    }
+}
+
+/// 贴边窗格顶部的**标题条**：只画当前文件夹的图标 + 名字。
+///
+/// 不再画多标签（×/+）——用户要求贴边窗口最多一个标签，顶部显示文件夹名。
+/// 焦点态用标题条底部一条强调下划线表达（替代原先整圈蓝边）。
+/// `focused` 由调用方传入：循环里 focus_pane 被逐窗格改写，这里比不准。
+fn paint_pane_title(app: &mut App, hdc: HDC, l: &Layout, pi: usize, focused: bool) {
+    let t = app.theme;
+    let Some(tab) = app.panes.get(pi).and_then(|p| p.tabs.get(p.active)) else {
+        return;
+    };
+    let title = tab.title.clone();
+    let home = tab.home;
+    let recycle = tab.recycle;
+    let settings = tab.settings;
+    let path = tab.path.clone();
+    let r = l.title;
+    unsafe {
+        // 底色与标签条一致（chrome_bg），让标题条看起来像"一个恒定的标签"
+        let bg = CreateSolidBrush(t.chrome_bg);
+        FillRect(hdc, &r, bg);
+        let _ = DeleteObject(bg.into());
+
+        let font = ui_font(app.metrics.scale);
+        let old = SelectObject(hdc, font.into());
+        SetBkMode(hdc, TRANSPARENT);
+
+        // 图标 16px 压在左边
+        let icon_s = (16.0 * app.metrics.scale).round() as i32;
+        let icon_x = r.left + (10.0 * app.metrics.scale).round() as i32;
+        let icon_y = (r.top + r.bottom - icon_s) / 2;
+        let mut drew_icon = false;
+        if home {
+            if let Some(h) = crate::icons::stock_icon(
+                windows::Win32::UI::Shell::SIID_DESKTOPPC.0,
+                false,
+            ) {
+                app.icons.draw(hdc, h, icon_x, icon_y, icon_s);
+                drew_icon = true;
+            }
+        } else if recycle {
+            if let Some(h) = crate::icons::stock_icon(
+                if app.recycle_items.is_empty() {
+                    windows::Win32::UI::Shell::SIID_RECYCLER.0
+                } else {
+                    windows::Win32::UI::Shell::SIID_RECYCLERFULL.0
+                },
+                false,
+            ) {
+                app.icons.draw(hdc, h, icon_x, icon_y, icon_s);
+                drew_icon = true;
+            }
+        } else if settings {
+            let gf = glyph_font(app.metrics.scale);
+            let og = SelectObject(hdc, gf.into());
+            draw_text(
+                hdc,
+                "\u{E713}",
+                RECT { left: icon_x, top: icon_y, right: icon_x + icon_s, bottom: icon_y + icon_s },
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+            SelectObject(hdc, og);
+            drew_icon = true;
+        } else if !path.as_os_str().is_empty() {
+            let h = app.icons.dir_icon(&path, false);
+            if !h.0.is_null() {
+                app.icons.draw(hdc, h, icon_x, icon_y, icon_s);
+                drew_icon = true;
+            }
+        }
+        let _ = drew_icon;
+
+        // 文字：跟着图标右边，右侧留白（没有 × 了，不用留关闭位）
+        let mut tr = r;
+        tr.left = icon_x + icon_s + (7.0 * app.metrics.scale).round() as i32;
+        tr.right -= (12.0 * app.metrics.scale).round() as i32;
+        SetTextColor(hdc, t.text);
+        draw_text(
+            hdc,
+            &title,
+            tr,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+        );
+
+        // 焦点下划线：只有焦点窗格画，替代原先的整圈强调边框
+        if focused {
+            let accent = CreateSolidBrush(t.accent);
+            let line = RECT { left: r.left, top: r.bottom - 2, right: r.right, bottom: r.bottom };
+            FillRect(hdc, &line, accent);
+            let _ = DeleteObject(accent.into());
+        }
+        SelectObject(hdc, old);
+    }
 }
 
 /// 标题栏自有按钮的形状。**一律用几何图形画，不依赖图标字体** ——

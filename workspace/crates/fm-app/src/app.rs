@@ -725,6 +725,12 @@ pub struct App {
     pub drag_split: Option<SplitDrag>,
     /// 鼠标正悬停在哪条分隔线上（只为了把光标换成左右箭头）。
     pub hover_split: Option<Split>,
+    /// 鼠标正悬停在**窗格之间**的分隔线上：`(是否竖线, 左/上窗格, 右/下窗格)`。
+    ///
+    /// 只为换光标（↔ / ↕）与绘制高亮，不参与任何业务判定。
+    pub hover_pane_div: Option<(bool, usize, usize)>,
+    /// 正在拖窗格之间的分隔线（自由调整两个窗格的布局大小）。
+    pub pane_div_drag: Option<PaneDivDrag>,
     /// 用户在 ZenFile 里手动改过的视图：路径(小写,无尾斜杠) -> 视图。
     ///
     /// 优先级高于资源管理器那套 bag。原因很实在：bag 只有在资源管理器
@@ -756,6 +762,25 @@ pub struct SplitDrag {
     pub start_x: i32,
     /// 拖动开始时的宽度（DIP）
     pub start_w: i32,
+}
+
+/// 拖**窗格之间**的分隔线：把两个相邻窗格的宽/高按拖动量重新分配。
+///
+/// 只处理"两个窗格共享一条边"的情况（1/2 二分贴靠的产物）。多格 2x2
+/// 四分不在支持范围 —— 四角贴靠已按用户要求砍掉。
+pub struct PaneDivDrag {
+    /// true = 竖分隔线（左右两窗格，改宽度）；false = 横线（上下，改高度）
+    pub vertical: bool,
+    /// 分隔线左/上侧那个窗格的下标
+    pub a: usize,
+    /// 右/下侧
+    pub b: usize,
+    /// 按下时光标的归一化坐标（0..1，相对内容区）——竖线用 x，横线用 y。
+    /// 拖动量按"相对按下点"算，否则一按下分隔线就瞬移到光标正下方。
+    pub start_n: f32,
+    /// 按下时两个窗格的归一化矩形（快照，拖动过程中反复从它推导）
+    pub ra: RectF,
+    pub rb: RectF,
 }
 
 /// 拖标签松手之后要做什么。`App::finish_tab_drag` 只负责算，执行在 WndProc。
@@ -1155,6 +1180,8 @@ impl App {
             index_cancel: None,
             drag_split: None,
             hover_split: None,
+            hover_pane_div: None,
+            pane_div_drag: None,
             drag: None,
             drop_target: None,
             view_overrides,
@@ -1450,9 +1477,12 @@ impl App {
         }
         match zone {
             DockZone::Center => {
-                // 中央 = 合进目标窗格，不做分栏
-                self.panes[dst].tabs.push(t);
-                self.panes[dst].active = self.panes[dst].tabs.len() - 1;
+                // 中央 = 合进目标窗格，不做分栏。贴边窗格最多一个标签，
+                // 所以这里不是 push 而是**替换**目标窗格那一个。
+                let p = &mut self.panes[dst];
+                p.tabs.clear();
+                p.tabs.push(t);
+                p.active = 0;
                 self.focus_pane = dst;
             }
             DockZone::Left | DockZone::Right | DockZone::Top | DockZone::Bottom => {
@@ -1868,8 +1898,17 @@ impl App {
             None => dv(),
         };
         tab.sort = SortSpec { key: parse_sort(&self.cfg.files.view.sort_key), descending: self.cfg.files.view.sort_descending };
-        self.pane_mut().tabs.push(tab);
-        self.pane_mut().active = self.pane().tabs.len() - 1;
+        // 贴边窗格最多一个标签（用户要求）：分栏时新建标签不叠加，直接
+        // **替换**当前窗格的那一个。顶部总览条照旧可切到别的窗格。
+        if self.split() {
+            let p = self.pane_mut();
+            p.tabs.clear();
+            p.tabs.push(tab);
+            p.active = 0;
+        } else {
+            self.pane_mut().tabs.push(tab);
+            self.pane_mut().active = self.pane().tabs.len() - 1;
+        }
         self.reload();
         self.invalidate();
     }
@@ -1880,6 +1919,27 @@ impl App {
     }
 
     pub fn close_tab(&mut self, index: usize) {
+        // 贴边窗格只有一个标签：关掉它 = 收掉整个窗格（用户要求贴边窗口
+        // 最多一个标签，没有标签的窗格没有存在意义）。全收完就退回单窗格。
+        if self.split() && self.pane().tabs.len() <= 1 {
+            let i = self.focus_pane.min(self.panes.len() - 1);
+            self.panes.remove(i);
+            if self.panes.is_empty() {
+                self.panes.push(Pane::default());
+                self.focus_pane = 0;
+                self.open_tab(PathBuf::from(HOME_PATH));
+            } else {
+                if self.focus_pane >= self.panes.len() {
+                    self.focus_pane = self.panes.len() - 1;
+                }
+                // 剩下唯一窗格时让它占满，不留残缺矩形
+                self.ensure_pane();
+                self.reload();
+            }
+            self.hover_tab = None;
+            self.invalidate();
+            return;
+        }
         // 只剩一个标签也允许关：点了 × 窗口却纹丝不动，是"按钮坏了"的典型观感。
         // 资源管理器在这里是关掉整个窗口，而我们有托盘模式，关窗口 ≠ 退出，
         // 所以照样关，然后补一个新的主页标签回来。

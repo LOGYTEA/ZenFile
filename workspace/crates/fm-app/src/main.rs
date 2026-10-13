@@ -947,7 +947,19 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 13 | 17 => IDC_SIZENWSE, // HTTOPLEFT / HTBOTTOMRIGHT
                 14 | 16 => IDC_SIZENESW, // HTTOPRIGHT / HTBOTTOMLEFT
                 _ => {
-                    if app.drag_split.is_some() || app.hover_split.is_some() {
+                    // 窗格分隔线：竖线 ↔，横线 ↕（拖拽中或悬停都算）
+                    let pane_div = app
+                        .pane_div_drag
+                        .as_ref()
+                        .map(|d| Some(d.vertical))
+                        .unwrap_or(app.hover_pane_div.map(|(v, _, _)| v));
+                    if let Some(vertical) = pane_div {
+                        if vertical {
+                            IDC_SIZEWE
+                        } else {
+                            IDC_SIZENS
+                        }
+                    } else if app.drag_split.is_some() || app.hover_split.is_some() {
                         IDC_SIZEWE
                     } else if over_text_input(app, hwnd) {
                         // 地址栏/搜索框上要出 I 形光标：它们平时是画在父窗口上的
@@ -1176,8 +1188,45 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 let _ = InvalidateRect(Some(hwnd), None, true);
                 return LRESULT(0);
             }
+            // 正在拖窗格分隔线：按相对按下点的拖动量重新分配两个窗格的宽/高
+            if let Some(drag) = app.pane_div_drag.take() {
+                let outer = l.view;
+                let span = if drag.vertical {
+                    (outer.right - outer.left).max(1) as f32
+                } else {
+                    (outer.bottom - outer.top).max(1) as f32
+                };
+                let cur = if drag.vertical {
+                    (x - outer.left) as f32 / span
+                } else {
+                    (y - outer.top) as f32 / span
+                };
+                let d = (cur - drag.start_n).clamp(-0.9, 0.9);
+                // 最小尺寸：任一边不窄于内容区的 12%，否则一拖就把某个窗格挤没
+                let min = 0.12f32;
+                let (ra, rb) = (drag.ra, drag.rb);
+                if drag.vertical {
+                    // a 的右沿 + d = 新分隔线位置；a 占 [a.left, 新位置]，b 占 [新位置, b.right]
+                    let mut nx = ra.x + ra.w + d;
+                    nx = nx.max(ra.x + min).min(ra.x + ra.w + rb.w - min);
+                    app.panes[drag.a].rect.w = nx - ra.x;
+                    app.panes[drag.b].rect.x = nx;
+                    app.panes[drag.b].rect.w = (ra.x + ra.w + rb.w) - nx;
+                } else {
+                    let mut ny = ra.y + ra.h + d;
+                    ny = ny.max(ra.y + min).min(ra.y + ra.h + rb.h - min);
+                    app.panes[drag.a].rect.h = ny - ra.y;
+                    app.panes[drag.b].rect.y = ny;
+                    app.panes[drag.b].rect.h = (ra.y + ra.h + rb.h) - ny;
+                }
+                app.pane_div_drag = Some(drag);
+                let _ = InvalidateRect(Some(hwnd), None, true);
+                return LRESULT(0);
+            }
             // 分隔线悬停（只为了把光标换成 ↔）
             let hover_split = paint::split_hit(app, &l, x, y);
+            // 窗格分隔线悬停：换 ↔ / ↕ 光标并高亮那条线
+            let hover_pane_div = paint::pane_div_at(app, &l, x, y);
             let in_close = inside(&l.close_btn, x, y);
             let mut chrome = 0u8;
             if inside(&l.sidebar_toggle, x, y) {
@@ -1328,6 +1377,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 || hover_sidebar != app.sidebar_hover
                 || hover_addr != app.addr_hover
                 || hover_split != app.hover_split
+                || hover_pane_div != app.hover_pane_div
                 || hover_bulk != app.hover_bulk
                 || hover_row != app.hover_row
                 || hover_pane != app.hover_pane
@@ -1348,6 +1398,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 app.hover_row = hover_row;
                 app.hover_pane = hover_pane;
                 app.hover_split = hover_split;
+                app.hover_pane_div = hover_pane_div;
                 app.hovering_close = in_close;
                 app.hover_chrome = chrome;
                 app.hover_tab = hover_tab;
@@ -1526,6 +1577,28 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 };
                 app.drag_split = Some(app::SplitDrag { which, start_x: x, start_w });
                 SetCapture(hwnd);
+                return LRESULT(0);
+            }
+            // 窗格之间的分隔线：按下开始拖，自由调整两个窗格的宽/高。
+            // 必须排在标签/内容命中之前 —— 它压在两个窗格的公共边上。
+            if let Some((vertical, a, b)) = paint::pane_div_at(app, &l, x, y) {
+                let outer = l.view;
+                let n = if vertical {
+                    (x - outer.left) as f32 / (outer.right - outer.left).max(1) as f32
+                } else {
+                    (y - outer.top) as f32 / (outer.bottom - outer.top).max(1) as f32
+                };
+                app.pane_div_drag = Some(app::PaneDivDrag {
+                    vertical,
+                    a,
+                    b,
+                    start_n: n,
+                    ra: app.panes[a].rect,
+                    rb: app.panes[b].rect,
+                });
+                app.hover_pane_div = Some((vertical, a, b));
+                SetCapture(hwnd);
+                let _ = InvalidateRect(Some(hwnd), None, false);
                 return LRESULT(0);
             }
             // 标签栏的命中**必须排在设置页/回收站之前**：那两个分支处理完就
@@ -1903,6 +1976,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                         app::Split::Column(_) => app.persist_view_pref(),
                     }
                     paint::reposition(app);
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                    return LRESULT(0);
+                }
+            }
+            // 拖完窗格分隔线：松手收摊，清掉高亮
+            {
+                let app = &mut *app_ptr;
+                if app.pane_div_drag.take().is_some() {
+                    let _ = ReleaseCapture();
+                    app.hover_pane_div = None;
                     let _ = InvalidateRect(Some(hwnd), None, true);
                     return LRESULT(0);
                 }
@@ -3147,25 +3230,14 @@ unsafe fn handle_hit_test(hwnd: HWND, lparam: LPARAM) -> LRESULT {
 fn hit_tab(app: &App, l: &paint::Layout, x: i32, y: i32) -> Option<usize> {
     // 顶部标题栏 tab 条：**单窗格和分栏都画**（分栏 = 焦点窗格的总览条），
     // 所以先测顶部。
+    //
+    // 贴边窗格自己那条 26px 顶带现在是**标题条**（只显示文件夹名，没有
+    // 标签、没有 ×），所以这里不再对它做标签命中 —— 点它就是点窗格本身。
     if y >= l.title.top && y <= l.title.bottom {
         let n = app.panes.get(app.focus_pane).map(|p| p.tabs.len()).unwrap_or(0);
         for i in 0..n {
             if inside(&l.tab_rect(i, n, &app.metrics), x, y) {
                 return Some(i);
-            }
-        }
-    }
-    // 分栏时每个窗格顶部还有一条 26px 的局部标签条 —— 光标落在哪个窗格
-    // 就用那个窗格覆写过的 Layout 测，否则点窗格里的标签永远点不中。
-    if app.split() {
-        if let Some(pi) = paint::pane_index_at(app, l, x, y) {
-            let pl = paint::pane_layout(app, l, pi);
-            if y >= pl.title.top && y <= pl.title.bottom {
-                for i in 0..app.panes[pi].tabs.len() {
-                    if inside(&pl.tab_rect(i, app.panes[pi].tabs.len(), &app.metrics), x, y) {
-                        return Some(i);
-                    }
-                }
             }
         }
     }
