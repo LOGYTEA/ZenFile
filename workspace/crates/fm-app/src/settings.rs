@@ -261,6 +261,30 @@ pub fn radius_has_kids(id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 一个分组下面**所有叶子**的 id（第35轮）。
+///
+/// 分组节点（「标题栏圆角」这种）不对应界面上某块独立底板，它是
+/// "本组里那些圆角块的共同默认值"。用户拖分组滑杆时，要落到这些叶子上，
+/// 否则就出现"树里有这一项、真界面却什么都不变"的空壳。
+pub fn radius_leaves_of(group: &str) -> Vec<String> {
+    let tree = radius_tree();
+    let Some(n) = radius_find(group, &tree) else {
+        return Vec::new();
+    };
+    fn walk(n: &RadiusNode, out: &mut Vec<String>) {
+        if n.kids.is_empty() {
+            out.push(n.id.to_string());
+            return;
+        }
+        for k in &n.kids {
+            walk(k, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(n, &mut out);
+    out
+}
+
 /// 选中项的完整路径，例如 "全局圆角 › 侧栏圆角 › 鼠标悬停圆角"。
 pub fn radius_label(id: &str) -> String {
     fn walk(id: &str, nodes: &[RadiusNode], acc: &mut Vec<&'static str>) -> bool {

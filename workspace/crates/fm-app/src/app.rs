@@ -1681,6 +1681,9 @@ impl App {
             return v;
         }
         let max = crate::settings::radius_max(id);
+        // 「子项没单独设 → 用它所在分组的值」。这一条**本来就实现了**
+        // （第35轮之前就有），所以「标题栏圆角」这类分组并非完全空壳 ——
+        // 前提是子项**自己没有**被写进配置。
         if let Some(page) = id.split('.').next() {
             if page != id {
                 if let Some(v) = r.get(page).copied() {
@@ -1696,13 +1699,48 @@ impl App {
         crate::settings::radius_default(id)
     }
 
+    /// 「分组节点」当前的实际取值（第35轮）。
+    ///
+    /// 一个分组（标题栏圆角 / 地址栏圆角 / …）**不对应界面上一块独立的底板**，
+    /// 它是"本组里那些圆角块的共同默认值"。所以用户选中一个分组时：
+    ///   - 如果本组下**所有**叶子都还没单独设过值 → 改分组就等于批量改它们，
+    ///     此时必须**把值写进每个叶子**（否则叶子下次 `radius_of` 又回落到
+    ////   默认值，改动看着"没生效"）；
+    ///   - 如果已有叶子单独设过 → 只改那些"跟随分组"的，保留用户自己的设定。
+    ///
+    /// 这才是"分组节点不是空壳"的正确实现方式。返回受影响的叶子 id 列表。
+    pub fn radius_group_children(&self, group: &str) -> Vec<String> {
+        crate::settings::radius_leaves_of(group)
+    }
+
     /// 改一个圆角项并写回用户层。
     pub fn set_radius(&mut self, id: &str, v: u32) {
         let v = v.min(crate::settings::radius_max(id));
         self.cfg.ui.radius.insert(id.to_string(), v);
-        let _ = fm_core::config::Config::save_user_patch(&serde_json::json!({
-            "ui": { "radius": { id: v } }
-        }));
+        let mut patch = serde_json::json!({ "ui": { "radius": { id: v } } });
+        // **分组节点要落到它的每一个叶子上**（第35轮）。
+        //
+        // 为什么必须写叶子：`radius_of` 的回落链是「叶子自己的值 → 分组的值
+        // → global → 硬编码默认」，所以只写分组时叶子确实会跟着变 —— 但那只在
+        // 叶子**还没被写进配置**时成立。用户先前拖过某个叶子（比如把
+        // title.tab 单独调大），那个值就永久盖住了分组，以后再调分组对这一项
+        // 就完全没反应 —— 树里明明有这一项，界面却不动，正是"空壳"。
+        //
+        // 批量写叶子 = 语义明确："我现在把这一组统一下设成 v"，用户的单独
+        // 设定被这一组的新值取代（这正是他此刻的操作意图）。
+        if crate::settings::radius_has_kids(id) {
+            for k in crate::settings::radius_leaves_of(id) {
+                let kv = v.min(crate::settings::radius_max(&k));
+                self.cfg.ui.radius.insert(k.clone(), kv);
+            }
+            let mut m = serde_json::Map::new();
+            for k in crate::settings::radius_leaves_of(id) {
+                let kv = self.cfg.ui.radius.get(&k).copied().unwrap_or(v);
+                m.insert(k, serde_json::Value::from(kv));
+            }
+            patch["ui"]["radius"] = serde_json::Value::Object(m);
+        }
+        let _ = fm_core::config::Config::save_user_patch(&patch);
     }
 
     /// 改「选中行首竖线」的形状并写回用户层（设置-交互页）。

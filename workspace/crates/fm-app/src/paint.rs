@@ -1628,17 +1628,29 @@ pub(crate) unsafe fn draw_sel_bar(app: &App, hdc: HDC, host: RECT, t: Theme) {
     let clip = CreateRoundRectRgn(
         host.left, host.top, host.right, host.bottom, r * 2, r * 2,
     );
-    let band = CreateRectRgn(host.left, bar_top, host.left + bar_w, bar_top + bar_h);
+    // band 放宽：空心时条可能比 bar_w 宽（stroke×2），留足余量给 Region 裁
+    let band_w = (bar_w + 24).min(host.right - host.left);
+    let band = CreateRectRgn(host.left, bar_top, host.left + band_w, bar_top + bar_h);
     let _ = CombineRgn(Some(clip), Some(clip), Some(band), RGN_AND);
     let _ = DeleteObject(band.into());
 
     let saved = SaveDC(hdc);
     let _ = SelectObject(hdc, clip.into());
     if sb.hollow {
-        // 空心：只描边不填色。线宽太粗会盖满整个条，clamp 到条的短边以内。
+        // 空心：只描边不填色。
+        //
+        // **描边粗细必须真的可调**（第35轮）：原来这里 `.min(bar_w)` 把线宽
+        // 夹到条宽以内，而空心条的宽度本来就 = w（3px），于是 stroke 无论
+        // 调 1 还是 6 都被夹成 3 —— 参数在真窗口上完全无效，是个空壳。
+        //
+        // 正确做法：空心时**条的外框按 stroke 撑开**（w 视为最小宽度），
+        // 这样 stroke 就是真的可见边厚；超出宿主底色的部分交给 Region 裁剪，
+        // 不会溢出（Region 已经在上面裁好了）。
         let stroke = (((sb.stroke as f32) * sc).round().max(1.0) as i32)
-            .min(bar_w)
-            .min(bar_h);
+            .min(bar_h)
+            .max(1);
+        // 空心条的可见宽度 = max(w, stroke*2)（左右各 stroke）
+        let hollow_w = (stroke * 2).max(bar_w);
         let p = CreatePen(PS_SOLID, stroke, t.accent);
         let op = SelectObject(hdc, p.into());
         let ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
@@ -1648,7 +1660,7 @@ pub(crate) unsafe fn draw_sel_bar(app: &App, hdc: HDC, host: RECT, t: Theme) {
             hdc,
             host.left,
             bar_top,
-            host.left + bar_w + 1,
+            host.left + hollow_w + 1,
             bar_top + bar_h + 1,
         );
         let _ = SelectObject(hdc, ob);
