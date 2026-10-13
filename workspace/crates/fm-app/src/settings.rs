@@ -16,10 +16,13 @@ use std::path::PathBuf;
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::HDC;
 use windows::Win32::Graphics::Gdi::{
-    CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, GetStockObject, Rectangle,
-    RoundRect, SelectObject, SetBkMode, SetTextColor, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX,
-    DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HBRUSH, NULL_BRUSH, PS_SOLID, TRANSPARENT,
+    CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, GetStockObject, LineTo,
+    GetViewportOrgEx, MoveToEx, Polygon, Rectangle, RoundRect, SelectObject, SetBkMode,
+    SetTextColor, SetViewportOrgEx, DT_CENTER,
+    DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HBRUSH, HPEN, NULL_BRUSH,
+    PS_SOLID, TRANSPARENT,
 };
+use windows::Win32::Foundation::POINT;
 
 use crate::app::{App, SETTINGS_TABS};
 use crate::paint::{self, Layout};
@@ -1633,8 +1636,10 @@ enum RowIcon<'a> {
     Stock(i32),
 }
 
-/// 取死数据行的图标（14px 小图标）。
-fn preview_row_icon(app: &mut App, src: &RowIcon<'_>) -> windows::Win32::UI::WindowsAndMessaging::HICON {
+/// 取死数据行的图标。size 由调用方按**预览缩放**给出（第38轮：
+/// 原来固定 14px，与真窗口的 16px 对不上，缩略图里图标偏小）。
+fn preview_row_icon(app: &mut App, src: &RowIcon<'_>, size: i32) -> windows::Win32::UI::WindowsAndMessaging::HICON {
+    let _ = size;
     use windows::Win32::UI::WindowsAndMessaging::HICON;
     use windows::Win32::UI::Shell::{SIID_DRIVEFIXED, SIID_FOLDER};
     match *src {
@@ -1655,12 +1660,41 @@ fn preview_row_icon(app: &mut App, src: &RowIcon<'_>) -> windows::Win32::UI::Win
     }
 }
 
-fn paint_preview_canvas(app: &mut App, hdc: HDC, r: &RECT, th: Theme, s: f32) {
+/// 预览专用的圆角半径：**DIP → 预览像素**。
+///
+/// `paint_preview_canvas` 是把真窗口按 k≈0.43 缩到几百像素宽的画布上，
+/// 半径必须跟着缩。不缩的话 `rr()` 里的 `d = (radius*2).clamp(0, min(w,h))`
+/// 会把侧栏行（9px 高）上的 radius≥4.5 全夹成同一个值 ——
+/// 表现就是"拖滑杆预览不动"（第38轮 verify_settings20 C2）。
+fn prad(app: &App, id: &str, scale: f32) -> u32 {
+    ((app.radius_of(id) as f32) * scale).round().max(0.0) as u32
+}
+
+fn paint_preview_canvas(app: &mut App, hdc: HDC, r: &RECT, th: Theme, _s: f32) {
     if r.right <= r.left || r.bottom <= r.top { return; }
-    let px = |v: f32| (v * s).round() as i32;
     let w = r.right - r.left;
     let h = r.bottom - r.top;
-    // 死数据行对应的**真实路径**（图标按真实路径问 Shell，与真窗口同款）
+
+    // ────────────────────────────────────────────────────────────────
+    // 第38轮：预览改成「真窗口的等比缩放」，不再手搓一套仿制尺寸。
+    //
+    // 原来这里把标题栏写死 26、侧栏 110、行高 18、图标 14…
+    // 而真窗口是 34 / 157 / 21 / 16。两套数字各写一份，
+    // 于是「预览」和「实际」永远对不上（用户三轮都提"预览有问题"）。
+    //
+    // 现在：所有几何都由 `Metrics::new(dpi)` 推导，与真窗口同一个
+    // 数据源；只有 scale 被换成「把这块画布缩到多小」，比例关系完全保留
+    // —— 也就是真窗口缩略后的样子，不是另画一张长得像的图。
+    //
+    // 缩放系数 = min(画布宽/1280, 画布高/850)，保证整幅窗口完整装进画布。
+    // ────────────────────────────────────────────────────────────────
+    const REF_W: f32 = 1280.0;
+    const REF_H: f32 = 850.0;
+    let k = (w as f32 / REF_W).min(h as f32 / REF_H).max(0.04);
+    let vm = crate::theme::Metrics::new((96.0 * k) as u32);
+    let px = |v: f32| (v * vm.scale).round() as i32;
+
+    // 死数据行对应的真实路径（图标按真实路径问 Shell，与真窗口同款）
     let up = std::env::var("USERPROFILE").unwrap_or_default();
     let p_profile = up.clone();
     let p_desktop = format!("{}\\Desktop", up);
@@ -1672,138 +1706,255 @@ fn paint_preview_canvas(app: &mut App, hdc: HDC, r: &RECT, th: Theme, s: f32) {
     let p_win = "C:\\Windows".to_string();
     let p_c = "C:\\".to_string();
     let p_d = "D:\\".to_string();
+
+    // 真实布局：侧栏开着、状态栏开着 —— 与用户截图里的真窗口一致
+    let lay = crate::paint::compute_layout(w, h, &vm, true, true);
+    let isz = ((16.0 * vm.scale).round() as i32).max(7);
+
     unsafe {
-        // 底板（surface）+ 圆角
-        let bg = CreateSolidBrush(th.surface);
-        let _ = FillRect(hdc, r, bg);
-        let _ = DeleteObject(bg.into());
-        // 1px 描边
-        let p = CreatePen(PS_SOLID, 1, th.border);
-        let op = SelectObject(hdc, p.into());
-        let ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        // 圆角半径：按外观页"全局"圆角
-        let rad = app.radius_of("global") as i32;
-        let d = (rad * 2).min(w).min(h);
-        let _ = RoundRect(hdc, r.left, r.top, r.right, r.bottom, d, d);
-        let _ = SelectObject(hdc, ob);
-        let _ = SelectObject(hdc, op);
-        let _ = DeleteObject(p.into());
-
-        // 内部布局：标题栏 (26) + 工具栏 (40) + 内容区 + 状态栏 (23) + 侧栏
-        let title_h = px(26.0);
-        let toolbar_h = px(40.0);
-        let status_h = px(23.0);
-        let sidebar_w = px(110.0);
-        let title_r = RECT { left: r.left, top: r.top, right: r.right, bottom: r.top + title_h };
-        let toolbar_r = RECT { left: r.left, top: title_r.bottom, right: r.right, bottom: title_r.bottom + toolbar_h };
-        let status_r = RECT { left: r.left, bottom: r.bottom, top: r.bottom - status_h, right: r.right };
-        let sidebar_r = RECT { left: r.left, top: toolbar_r.bottom, right: r.left + sidebar_w, bottom: status_r.top };
-        let view_r = RECT { left: sidebar_r.right, top: toolbar_r.bottom, right: r.right, bottom: status_r.top };
-
-        // 标题栏：底色 chrome_bg，左侧放 4 个模拟 tab 名
-        let cbg = CreateSolidBrush(th.chrome_bg);
-        let _ = FillRect(hdc, &title_r, cbg);
-        let _ = DeleteObject(cbg.into());
-        let font = paint::ui_font(s);
+        let font = paint::ui_font(vm.scale);
         let oldf = SelectObject(hdc, font.into());
         SetBkMode(hdc, TRANSPARENT);
-        let mut tx = title_r.left + px(8.0);
-        for (i, name) in ["此电脑", "C:", "下载", "图片"].iter().enumerate() {
-            set_color(hdc, if i == 0 { th.text } else { th.text_dim });
-            let tr = RECT { left: tx, top: title_r.top, right: tx + px(70.0), bottom: title_r.bottom };
-            paint::draw_text(hdc, name, tr, DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
-            tx += px(72.0);
-        }
-        SelectObject(hdc, oldf);
 
-        // 工具栏
-        let cbg2 = CreateSolidBrush(th.window_bg);
-        let _ = FillRect(hdc, &toolbar_r, cbg2);
-        let _ = DeleteObject(cbg2.into());
-        // 工具栏按钮"返回 / 前进 / 上级" 三个死圆角按钮
-        let mut bx = toolbar_r.left + px(6.0);
-        let bh = toolbar_r.bottom - toolbar_r.top - px(8.0);
-        for _ in 0..3 {
-            let cr = RECT { left: bx, top: toolbar_r.top + px(4.0), right: bx + bh, bottom: toolbar_r.top + px(4.0) + bh };
-            let cbg3 = CreateSolidBrush(th.surface_alt);
-            let _ = FillRect(hdc, &cr, cbg3);
-            let _ = DeleteObject(cbg3.into());
-            bx += bh + px(4.0);
-        }
-        // 死"地址栏"长输入框
-        let addr_w = (toolbar_r.right - bx - px(6.0)).max(px(60.0));
-        let addr_r = RECT { left: bx, top: toolbar_r.top + px(4.0), right: bx + addr_w, bottom: toolbar_r.top + px(4.0) + bh };
-        let sab = CreateSolidBrush(th.surface);
-        let _ = FillRect(hdc, &addr_r, sab);
-        let _ = DeleteObject(sab.into());
-        let sp = CreatePen(PS_SOLID, 1, th.border);
-        let sop = SelectObject(hdc, sp.into());
-        let sob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        let _ = Rectangle(hdc, addr_r.left, addr_r.top, addr_r.right, addr_r.bottom);
-        let _ = SelectObject(hdc, sob);
-        let _ = SelectObject(hdc, sop);
-        let _ = DeleteObject(sp.into());
+        // 画布原点平移（第38轮踩过）：`compute_layout` 算出来的矩形全部
+        // 从 (0,0) 起算，而这块画布在窗口里的位置是 (r.left, r.top)。
+        // 不平移的话，整个迷你窗口会画到**窗口左上角**压住真标题栏/工具栏，
+        // 而画布框里只剩一个空边框 —— 用户截图里就是这个现象。
+        let mut old_org = POINT::default();
+        let _ = GetViewportOrgEx(hdc, &mut old_org);
+        let _ = SetViewportOrgEx(hdc, r.left, r.top, None);
 
-        // 侧栏（窄条）："主文件夹/桌面/下载/文档/图片/音乐/视频/此电脑"
-        let sbg = CreateSolidBrush(th.chrome_bg);
-        let _ = FillRect(hdc, &sidebar_r, sbg);
-        let _ = DeleteObject(sbg.into());
-        let oldf2 = SelectObject(hdc, font.into());
-        let sfont_h = px(14.0);
-        let mut sy = sidebar_r.top + px(8.0);
-        // 侧栏 8 项的图标（与真窗口一致：真实路径 + 此电脑库存图标）
-        let side_icons = [
-            RowIcon::Real { path: &p_profile, drive: false },
-            RowIcon::Real { path: &p_desktop, drive: false },
-            RowIcon::Real { path: &p_downloads, drive: false },
-            RowIcon::Real { path: &p_docs, drive: false },
-            RowIcon::Real { path: &p_pics, drive: false },
-            RowIcon::Real { path: &p_music, drive: false },
-            RowIcon::Real { path: &p_videos, drive: false },
-            RowIcon::Stock(windows::Win32::UI::Shell::SIID_DESKTOPPC.0),
-        ];
-        let isz = px(14.0);
-        for (i, name) in ["主文件夹", "桌面", "下载", "文档", "图片", "音乐", "视频", "此电脑"].iter().enumerate() {
-            set_color(hdc, if i == 7 { th.text } else { th.text_dim });
-            let ih = preview_row_icon(app, &side_icons[i]);
-            if !ih.0.is_null() {
-                app.icons.draw(hdc, ih, sidebar_r.left + px(6.0), sy + (sfont_h + px(2.0) - isz) / 2, isz);
+        // ── 标题栏（title_bg 纯黑，与真窗口一致）──
+        let tb = CreateSolidBrush(th.title_bg);
+        let _ = FillRect(hdc, &lay.title, tb);
+        let _ = DeleteObject(tb.into());
+        mini_box_icon(hdc, lay.sidebar_toggle, th, vm.scale);
+        // 标签：第一个激活（亮底 + 2px accent 下划线），其余暗色
+        let tab_w = (((lay.tabs.right - lay.tabs.left) as f32) * 0.22).round() as i32;
+        for (ti, name) in ["此电脑", "下载", "图片"].iter().enumerate() {
+            let ti = ti as i32;
+            let tr = RECT {
+                left: lay.tabs.left + ti * tab_w,
+                top: lay.title.top,
+                right: lay.tabs.left + (ti + 1) * tab_w,
+                bottom: lay.title.bottom,
+            };
+            if ti == 0 {
+                // 激活标签：surface 底（圆角走 title.tab，真窗口同一 id）
+                // + **底部 2px accent 指示条**（照 paint_tab_strip，不是整圈描边）。
+                rr(hdc, &tr, prad(app, "title.tab", vm.scale), th.surface, None);
+                let line = RECT { left: tr.left, top: tr.bottom - 2, right: tr.right, bottom: tr.bottom };
+                let ab2 = CreateSolidBrush(th.accent);
+                let _ = FillRect(hdc, &line, ab2);
+                let _ = DeleteObject(ab2.into());
             }
-            let sr2 = RECT { left: sidebar_r.left + px(6.0) + isz + px(5.0), top: sy, right: sidebar_r.right - px(4.0), bottom: sy + sfont_h + px(2.0) };
-            paint::draw_text(hdc, name, sr2, DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS);
-            sy += sfont_h + px(8.0);
+            set_color(hdc, if ti == 0 { th.text } else { th.text_dim });
+            let lr = RECT {
+                left: tr.left + px(8.0),
+                top: tr.top,
+                right: tr.right - px(8.0),
+                bottom: tr.bottom,
+            };
+            paint::draw_text(hdc, name, lr,
+                DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS);
         }
-        SelectObject(hdc, oldf2);
+        // 右侧：菜单键（三条杠）+ 三个窗口键（与真窗口同宽同高）
+        mini_glyph(hdc, lay.menu_btn, th, vm.scale, MiniGlyph::Hamburger);
+        mini_caption(hdc, &lay.min_btn, th, vm.scale, MiniCap::Min);
+        mini_caption(hdc, &lay.max_btn, th, vm.scale, MiniCap::Max);
+        mini_caption(hdc, &lay.close_btn, th, vm.scale, MiniCap::Close);
 
-        // 内容区：详细列表（4 列：名称/修改日期/类型/大小）
-        let cbg4 = CreateSolidBrush(th.window_bg);
-        let _ = FillRect(hdc, &view_r, cbg4);
-        let _ = DeleteObject(cbg4.into());
-        let oldf3 = SelectObject(hdc, font.into());
-        // 死数据四列。按**内容实际宽度**分配（画布约 565px 时）：
-        //   名称 "本地磁盘 (C:)" ≈ 95px → 39%
-        //   日期 "2026/09/03 14:22" ≈ 110px → 23%（19% 会截成 "…14:…"）
-        //   类型 "系统文件夹" ≈ 70px → 15%
-        //   大小 "221 GB / 369 GB" ≈ 105px → 23%（上一版 18% 还差几个像素，
-        //   死数据没画完整 —— 用户把这叫"渲染不全"）
-        let col_date_w = (view_r.right - view_r.left) * 23 / 100;
-        let col_size_w = (view_r.right - view_r.left) * 23 / 100;
-        let col_kind_w = (view_r.right - view_r.left) * 15 / 100;
-        let col_name_w = view_r.right - view_r.left - col_date_w - col_size_w - col_kind_w;
-        // 表头
-        let header_r = RECT { left: view_r.left, top: view_r.top, right: view_r.right, bottom: view_r.top + px(22.0) };
-        let hbg = CreateSolidBrush(th.surface);
-        let _ = FillRect(hdc, &header_r, hbg);
-        let _ = DeleteObject(hbg.into());
+        // ── 工具栏（window_bg）──
+        let wb = CreateSolidBrush(th.window_bg);
+        let _ = FillRect(hdc, &lay.toolbar, wb);
+        let _ = DeleteObject(wb.into());
+        for (i, nav) in [lay.back, lay.forward, lay.up].iter().enumerate() {
+            rr(hdc, nav, prad(app, "toolbar.button", vm.scale), th.chrome_bg, None);
+            mini_arrow(hdc, nav, th, vm.scale, i);
+        }
+        // 地址栏（surface + 1px 边框）—— 圆角走 address，拖滑杆这里跟着变
+        rr(hdc, &lay.address, prad(app, "address", vm.scale), th.surface, Some(th.border));
+        set_color(hdc, th.text);
+        paint::draw_text(hdc, "此电脑",
+            RECT { left: lay.address.left + px(8.0), top: lay.address.top,
+                   right: lay.address.left + px(70.0), bottom: lay.address.bottom },
+            DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
+        // 搜索框（surface + 1px 边框）—— 圆角走 address.edit
+        rr(hdc, &lay.search, prad(app, "address.edit", vm.scale), th.surface, Some(th.border));
         set_color(hdc, th.text_dim);
-        let mut hx = view_r.left + px(8.0);
-        for (label, w) in [("名称", col_name_w), ("修改日期", col_date_w), ("类型", col_kind_w), ("大小", col_size_w)] {
-            let lr = RECT { left: hx, top: header_r.top, right: hx + w - px(8.0), bottom: header_r.bottom };
-            paint::draw_text(hdc, label, lr, DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS);
+        paint::draw_text(hdc, "搜索 此电脑",
+            RECT { left: lay.search.left + px(22.0), top: lay.search.top,
+                   right: lay.search.right - px(6.0), bottom: lay.search.bottom },
+            DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS);
+
+        // ── 侧栏（chrome_bg）：快速访问 + 「此电脑」树 ──
+        let cbg = CreateSolidBrush(th.chrome_bg);
+        let _ = FillRect(hdc, &lay.sidebar, cbg);
+        let _ = DeleteObject(cbg.into());
+        let row_h = paint::sidebar_row_h(vm.scale);
+        let item_x = lay.sidebar.left + px(10.0);
+        set_color(hdc, th.text_dim);
+        paint::draw_text(hdc, "快速访问",
+            RECT { left: item_x, top: lay.sidebar.top + px(6.0),
+                   right: lay.sidebar.right - px(4.0),
+                   bottom: lay.sidebar.top + px(6.0) + row_h },
+            DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
+        let quick: [(&str, RowIcon<'_>); 4] = [
+            ("桌面", RowIcon::Real { path: &p_desktop, drive: false }),
+            ("下载", RowIcon::Real { path: &p_downloads, drive: false }),
+            ("文档", RowIcon::Real { path: &p_docs, drive: false }),
+            ("图片", RowIcon::Real { path: &p_pics, drive: false }),
+        ];
+        let mut sy = lay.sidebar.top + px(6.0) + row_h;
+        for (qi, (name, ic)) in quick.iter().enumerate() {
+            // 第 2 条画成「悬停」态：它是 sidebar.hover 唯一的演示位 ——
+            // 没有这一块，选中「鼠标悬停圆角」拖滑杆预览不会有任何反应。
+            if qi == 1 {
+                let hr = RECT {
+                    left: item_x - px(6.0),
+                    top: sy,
+                    right: lay.sidebar.right - px(6.0),
+                    bottom: sy + row_h,
+                };
+                rr(hdc, &hr, prad(app, "sidebar.hover", vm.scale), th.row_hover, None);
+            }
+            let ih = preview_row_icon(app, ic, isz);
+            if !ih.0.is_null() {
+                app.icons.draw(hdc, ih, item_x, sy + (row_h - isz) / 2, isz);
+            }
+            set_color(hdc, th.text);
+            paint::draw_text(hdc, name,
+                RECT { left: item_x + isz + px(6.0), top: sy,
+                       right: lay.sidebar.right - px(4.0), bottom: sy + row_h },
+                DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS);
+            sy += row_h;
+        }
+        // 「此电脑」：展开三角 + 图标 + 文字，下面挂三个盘（带树线）
+        sy += px(4.0);
+        let group_top = sy;
+        mini_tri(hdc, item_x + px(4.0), sy + row_h / 2, vm.scale, th.text_dim);
+        let pc_ih = preview_row_icon(app,
+            &RowIcon::Stock(windows::Win32::UI::Shell::SIID_DESKTOPPC.0), isz);
+        if !pc_ih.0.is_null() {
+            app.icons.draw(hdc, pc_ih, item_x + px(12.0),
+                sy + (row_h - isz) / 2, isz);
+        }
+        set_color(hdc, th.text);
+        paint::draw_text(hdc, "此电脑",
+            RECT { left: item_x + px(12.0) + isz + px(6.0), top: sy,
+                   right: lay.sidebar.right - px(4.0), bottom: sy + row_h },
+            DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS);
+        sy += row_h;
+        // 树竖线：从「此电脑」行下沿贯穿到最后一个盘
+        let tree_x = item_x + px(12.0) + isz / 2;
+        let drives: [(&str, &str); 3] = [
+            ("本地磁盘 (C:)", &p_c),
+            ("本地磁盘 (D:)", &p_d),
+            ("本地磁盘 (E:)", "E:\\"),
+        ];
+        let n = drives.len() as i32;
+        let tree_bottom = sy + row_h * (n - 1) + row_h / 2;
+        let tpen = CreatePen(PS_SOLID, 1, th.border);
+        let top_op = SelectObject(hdc, tpen.into());
+        let _ = MoveToEx(hdc, tree_x, group_top + row_h, None);
+        let _ = LineTo(hdc, tree_x, tree_bottom);
+        let _ = SelectObject(hdc, top_op);
+        let _ = DeleteObject(tpen.into());
+        for (di, (name, path)) in drives.iter().enumerate() {
+            if sy + row_h > lay.sidebar.bottom { break; }
+            // 第一个盘 = 选中态（sidebar.selected 的演示位）
+            if di == 0 {
+                let sr = RECT {
+                    left: item_x - px(6.0),
+                    top: sy,
+                    right: lay.sidebar.right - px(6.0),
+                    bottom: sy + row_h,
+                };
+                rr(hdc, &sr, prad(app, "sidebar.selected", vm.scale), th.selection_bg, None);
+            }
+            let tpen2 = CreatePen(PS_SOLID, 1, th.border);
+            let top2 = SelectObject(hdc, tpen2.into());
+            let _ = MoveToEx(hdc, tree_x, sy + row_h / 2, None);
+            let _ = LineTo(hdc, tree_x + px(14.0), sy + row_h / 2);
+            let _ = SelectObject(hdc, top2);
+            let _ = DeleteObject(tpen2.into());
+            let ih = preview_row_icon(app,
+                &RowIcon::Real { path, drive: true }, isz);
+            if !ih.0.is_null() {
+                app.icons.draw(hdc, ih, tree_x + px(14.0),
+                    sy + (row_h - isz) / 2, isz);
+            }
+            set_color(hdc, th.text);
+            paint::draw_text(hdc, name,
+                RECT { left: tree_x + px(14.0) + isz + px(6.0), top: sy,
+                       right: lay.sidebar.right - px(4.0), bottom: sy + row_h },
+                DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS);
+            sy += row_h;
+            let _ = di;
+        }
+        // 回收站
+        if sy + row_h + px(4.0) <= lay.sidebar.bottom {
+            sy += px(6.0);
+            let ri = preview_row_icon(app,
+                &RowIcon::Stock(windows::Win32::UI::Shell::SIID_RECYCLER.0), isz);
+            if !ri.0.is_null() {
+                app.icons.draw(hdc, ri, item_x, sy + (row_h - isz) / 2, isz);
+            }
+            set_color(hdc, th.text);
+            paint::draw_text(hdc, "回收站",
+                RECT { left: item_x + isz + px(6.0), top: sy,
+                       right: lay.sidebar.right - px(4.0), bottom: sy + row_h },
+                DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS);
+        }
+
+        // ── 内容区（window_bg）：表头 + 详细列表 4 列 ──
+        let vbg = CreateSolidBrush(th.window_bg);
+        let _ = FillRect(hdc, &lay.view, vbg);
+        let _ = DeleteObject(vbg.into());
+        // 右上角视图切换键（详情 / 大图标），与真窗口同一位置
+        let vbtn = px(30.0);
+        let vby = lay.view.top + px(8.0);
+        for k in 0..2 {
+            let vr = RECT { left: lay.view.right - px(10.0) - vbtn * (2 - k),
+                            top: vby,
+                            right: lay.view.right - px(10.0) - vbtn * (1 - k),
+                            bottom: vby + vbtn };
+            rr(hdc, &vr, prad(app, "toolbar.button", vm.scale), th.chrome_bg, None);
+            mini_glyph(hdc, vr, th, vm.scale,
+                if k == 0 { MiniGlyph::ListView } else { MiniGlyph::IconView });
+        }
+        // 表头（surface）+ 四列
+        let header_h = px(26.0);
+        let header_r = RECT { left: lay.view.left, top: lay.view.top,
+                              right: lay.view.right,
+                              bottom: lay.view.top + header_h };
+        let hb = CreateSolidBrush(th.surface);
+        let _ = FillRect(hdc, &header_r, hb);
+        let _ = DeleteObject(hb.into());
+        // 列宽与真窗口同比例：名称 40% / 修改日期 23% / 类型 15% / 大小 22%
+        let vw = lay.view.right - lay.view.left;
+        let col_date_w = vw * 23 / 100;
+        let col_size_w = vw * 22 / 100;
+        let col_kind_w = vw * 15 / 100;
+        let col_name_w = vw - col_date_w - col_size_w - col_kind_w;
+        // 表头「名称」要给图标让位（真窗口表头文字与行图标左对齐）
+        let name_pad = px(8.0) + isz + px(5.0);
+        set_color(hdc, th.text_dim);
+        let mut hx = lay.view.left;
+        for (i, (label, w)) in [
+            ("名称", col_name_w), ("修改日期", col_date_w),
+            ("类型", col_kind_w), ("大小", col_size_w),
+        ].iter().enumerate()
+        {
+            let x0 = if i == 0 { hx + name_pad } else { hx };
+            paint::draw_text(hdc, label,
+                RECT { left: x0, top: header_r.top,
+                       right: hx + w - px(8.0), bottom: header_r.bottom },
+                DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS);
             hx += w;
         }
-        // 死数据 11 行（第 5 项 = 图标来源，真实路径直问 Shell）
-        let rows: [(&str, &str, &str, &str, RowIcon); 11] = [
+        // 死数据 11 行（行高 = 真实 row_h）
+        let rows: [(&str, &str, &str, &str, RowIcon<'_>); 11] = [
             ("文件夹", "2026/09/03 14:22", "文件夹", "", RowIcon::Real { path: &p_win, drive: false }),
             ("主文件夹", "2026/09/03 14:22", "文件夹", "", RowIcon::Real { path: &p_profile, drive: false }),
             ("桌面", "2026/09/03 14:22", "文件夹", "", RowIcon::Real { path: &p_desktop, drive: false }),
@@ -1821,42 +1972,235 @@ fn paint_preview_canvas(app: &mut App, hdc: HDC, r: &RECT, th: Theme, s: f32) {
                     windows::Win32::UI::Shell::SIID_RECYCLERFULL.0
                 })),
         ];
-        let row_h = px(18.0);
-        let mut ry = header_r.bottom + px(2.0);
-        for row in &rows {
-            if ry + row_h > view_r.bottom { break; }
-            set_color(hdc, th.text);
-            // 名称列：图标 14px 顶着列头"名称"的左缘画，文字缩进到图标右边
-            //（列头不缩进 —— 资源管理器里列头文字与行图标左对齐）
-            let isz = px(14.0);
-            let ix = view_r.left + px(8.0);
-            let ih = preview_row_icon(app, &row.4);
-            if !ih.0.is_null() {
-                app.icons.draw(hdc, ih, ix, ry + (row_h - isz) / 2, isz);
+        let row_h2 = vm.row_h;
+        let mut ry = header_r.bottom;
+        for (ri, row) in rows.iter().enumerate() {
+            if ry + row_h2 > lay.view.bottom { break; }
+            // 第 1 行选中 / 第 2 行悬停：content.selected、content.hover 的演示位。
+            // 圆角走真窗口同一套 id，拖滑杆时这两行的角跟着变。
+            let row_r = RECT {
+                left: lay.view.left,
+                top: ry,
+                right: lay.view.right,
+                bottom: ry + row_h2,
+            };
+            if ri == 0 {
+                rr(hdc, &row_r, prad(app, "content.selected", vm.scale), th.selection_bg, None);
+            } else if ri == 1 {
+                rr(hdc, &row_r, prad(app, "content.hover", vm.scale), th.row_hover, None);
             }
-            let mut cx = ix;
+            let ih = preview_row_icon(app, &row.4, isz);
+            if !ih.0.is_null() {
+                app.icons.draw(hdc, ih, lay.view.left + px(8.0),
+                    ry + (row_h2 - isz) / 2, isz);
+            }
+            set_color(hdc, th.text);
+            let mut cx = lay.view.left;
             for (i, txt) in [row.0, row.1, row.2, row.3].iter().enumerate() {
                 let cw = [col_name_w, col_date_w, col_kind_w, col_size_w][i];
-                let tx0 = if i == 0 { ix + isz + px(6.0) } else { cx };
-                let lr = RECT { left: tx0, top: ry, right: cx + cw - px(8.0), bottom: ry + row_h };
-                paint::draw_text(hdc, txt, lr, DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS);
+                let tx0 = if i == 0 {
+                    lay.view.left + px(8.0) + isz + px(5.0)
+                } else {
+                    cx
+                };
+                paint::draw_text(hdc, txt,
+                    RECT { left: tx0, top: ry, right: cx + cw - px(8.0),
+                           bottom: ry + row_h2 },
+                    DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS);
                 cx += cw;
             }
-            ry += row_h;
+            ry += row_h2;
         }
-        SelectObject(hdc, oldf3);
 
-        // 状态栏
-        let sbg2 = CreateSolidBrush(th.status_bg);
-        let _ = FillRect(hdc, &status_r, sbg2);
-        let _ = DeleteObject(sbg2.into());
-        let oldf4 = SelectObject(hdc, font.into());
+        // ── 状态栏（status_bg）──
+        let stb = CreateSolidBrush(th.status_bg);
+        let _ = FillRect(hdc, &lay.status, stb);
+        let _ = DeleteObject(stb.into());
         set_color(hdc, th.text_dim);
-        paint::draw_text(hdc, "11 个项目", RECT { left: status_r.left + px(8.0), top: status_r.top, right: status_r.right - px(40.0), bottom: status_r.bottom },
+        paint::draw_text(hdc, "11 个项目",
+            RECT { left: lay.status.left + px(8.0), top: lay.status.top,
+                   right: lay.status.right - px(70.0), bottom: lay.status.bottom },
             DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
-        SelectObject(hdc, oldf4);
+        let vb2 = px(18.0);
+        let vy = lay.status.top + (lay.status.bottom - lay.status.top - vb2) / 2;
+        for k in 0..2 {
+            let vr = RECT { left: lay.status.right - px(10.0) - vb2 * (2 - k),
+                            top: vy,
+                            right: lay.status.right - px(10.0) - vb2 * (1 - k),
+                            bottom: vy + vb2 };
+            rr(hdc, &vr, prad(app, "status.button", vm.scale), th.chrome_bg, None);
+            mini_glyph(hdc, vr, th, vm.scale,
+                if k == 0 { MiniGlyph::ListView } else { MiniGlyph::IconView });
+        }
+
+        // ── 外框 1px 描边 + 圆角（最后画，压住所有内容）──
+        // 这里用的是**窗口绝对坐标** r，所以先把原点还原再画，
+        // 否则边框会跟着平移偏出画布。
+        let _ = SetViewportOrgEx(hdc, old_org.x, old_org.y, None);
+        let rad = prad(app, "global", vm.scale) as i32;
+        let d = (rad * 2).min(w).min(h);
+        let fp = CreatePen(PS_SOLID, 1, th.border);
+        let fop = SelectObject(hdc, fp.into());
+        let fob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        let _ = RoundRect(hdc, r.left, r.top, r.right, r.bottom, d, d);
+        let _ = SelectObject(hdc, fob);
+        let _ = SelectObject(hdc, fop);
+        let _ = DeleteObject(fp.into());
+
+        SelectObject(hdc, oldf);
     }
 }
+
+/// 预览里那些小图标的画法，**全部按 `vm.scale` 等比缩放**，与真窗口
+/// 的 `draw_chrome_glyph` / `draw_caption_glyph` 同一套口径。
+///
+/// 为什么不用 Segoe MDL2 字形：字体在极小尺寸下（画布只有几百像素宽，
+/// scale 常常 < 0.5）字形会被 hinting 挤变形，而真窗口里同一枚字形
+/// 在正常尺寸下是好的。改成矢量线段后缩放到多小都不失真。
+enum MiniGlyph { Hamburger, ListView, IconView }
+enum MiniCap { Min, Max, Close }
+
+fn mini_pen(th: Theme, weight: i32) -> HPEN {
+    unsafe { CreatePen(PS_SOLID, weight.max(1), th.text) }
+}
+
+fn mini_glyph(hdc: HDC, r: RECT, th: Theme, s: f32, g: MiniGlyph) {
+    let cx = (r.left + r.right) / 2;
+    let cy = (r.top + r.bottom) / 2;
+    unsafe {
+        let pen = mini_pen(th, ((1.4 * s).round() as i32).max(1));
+        let op = SelectObject(hdc, pen.into());
+        match g {
+            MiniGlyph::Hamburger => {
+                let w = ((11.0 * s).round() as i32).max(5);
+                let step = ((4.0 * s).round() as i32).max(3);
+                for k in -1..=1 {
+                    let y = cy + k * step;
+                    let _ = MoveToEx(hdc, cx - w / 2, y, None);
+                    let _ = LineTo(hdc, cx + w / 2, y);
+                }
+            }
+            MiniGlyph::ListView => {
+                let w = ((11.0 * s).round() as i32).max(5);
+                let step = ((4.0 * s).round() as i32).max(3);
+                for k in -1..=1 {
+                    let y = cy + k * step;
+                    let _ = MoveToEx(hdc, cx - w / 2, y, None);
+                    let _ = LineTo(hdc, cx + w / 2, y);
+                }
+            }
+            MiniGlyph::IconView => {
+                // 四宫格：四条短斜线交叉成 X（与真窗口"大图标"按钮同款观感）
+                let b = ((4.0 * s).round() as i32).max(3);
+                let g2 = b * 2;
+                for (dx, dy) in [(-1, -1), (1, -1), (-1, 1), (1, 1)] {
+                    let x = cx + dx * g2;
+                    let y = cy + dy * g2;
+                    let _ = MoveToEx(hdc, x - b / 2, y - b / 2, None);
+                    let _ = LineTo(hdc, x + b / 2, y + b / 2);
+                }
+            }
+        }
+        let _ = SelectObject(hdc, op);
+        let _ = DeleteObject(pen.into());
+    }
+}
+
+fn mini_caption(hdc: HDC, r: &RECT, th: Theme, s: f32, c: MiniCap) {
+    let cx = (r.left + r.right) / 2;
+    let cy = (r.top + r.bottom) / 2;
+    unsafe {
+        let pen = mini_pen(th, ((1.4 * s).round() as i32).max(1));
+        let op = SelectObject(hdc, pen.into());
+        let w = ((11.0 * s).round() as i32).max(4);
+        match c {
+            MiniCap::Min => {
+                let _ = MoveToEx(hdc, cx - w / 2, cy + w / 4, None);
+                let _ = LineTo(hdc, cx + w / 2, cy + w / 4);
+            }
+            MiniCap::Max => {
+                let _ = MoveToEx(hdc, cx - w / 2, cy - w / 2, None);
+                let _ = LineTo(hdc, cx + w / 2, cy - w / 2);
+                let _ = LineTo(hdc, cx + w / 2, cy + w / 2);
+                let _ = LineTo(hdc, cx - w / 2, cy + w / 2);
+                let _ = LineTo(hdc, cx - w / 2, cy - w / 2);
+            }
+            MiniCap::Close => {
+                let _ = MoveToEx(hdc, cx - w / 2, cy - w / 2, None);
+                let _ = LineTo(hdc, cx + w / 2, cy + w / 2);
+                let _ = MoveToEx(hdc, cx + w / 2, cy - w / 2, None);
+                let _ = LineTo(hdc, cx - w / 2, cy + w / 2);
+            }
+        }
+        let _ = SelectObject(hdc, op);
+        let _ = DeleteObject(pen.into());
+    }
+}
+
+/// 侧栏折叠键的方框图标（真窗口是四条短线组成的框 + 一条竖分隔）。
+fn mini_box_icon(hdc: HDC, r: RECT, th: Theme, s: f32) {
+    let cx = (r.left + r.right) / 2;
+    let cy = (r.top + r.bottom) / 2;
+    unsafe {
+        let pen = mini_pen(th, ((1.4 * s).round() as i32).max(1));
+        let op = SelectObject(hdc, pen.into());
+        let w = ((14.0 * s).round() as i32).max(6);
+        let h = ((11.0 * s).round() as i32).max(5);
+        let _ = MoveToEx(hdc, cx - w / 2, cy - h / 2, None);
+        let _ = LineTo(hdc, cx + w / 2, cy - h / 2);
+        let _ = LineTo(hdc, cx + w / 2, cy + h / 2);
+        let _ = LineTo(hdc, cx - w / 2, cy + h / 2);
+        let _ = LineTo(hdc, cx - w / 2, cy - h / 2);
+        let _ = MoveToEx(hdc, cx - w / 6, cy - h / 2, None);
+        let _ = LineTo(hdc, cx - w / 6, cy + h / 2);
+        let _ = SelectObject(hdc, op);
+        let _ = DeleteObject(pen.into());
+    }
+}
+
+/// 侧栏树的展开三角（实心朝下）。
+fn mini_tri(hdc: HDC, x: i32, y: i32, s: f32, color: COLORREF) {
+    unsafe {
+        let b = CreateSolidBrush(color);
+        let w = ((8.0 * s).round() as i32).max(4);
+        let h = ((5.0 * s).round() as i32).max(3);
+        let mut pts = [
+            POINT { x: x - w / 2, y: y - h / 2 },
+            POINT { x: x + w / 2, y: y - h / 2 },
+            POINT { x: x, y: y + h / 2 },
+        ];
+        let _ = Polygon(hdc, &mut pts);
+        let _ = DeleteObject(b.into());
+    }
+}
+
+/// 工具栏导航键的箭头（0=返回 1=前进 2=上级）。
+///
+/// 画成一个**实心三角**而不是两条线段 —— 线段版本要为三种朝向各推一遍
+/// 端点公式，写出来自己都看错（第一版就多给/少给了 MoveToEx 的第 4 参）。
+/// 三角只要算三个点，三种朝向共 6 行。
+fn mini_arrow(hdc: HDC, r: &RECT, th: Theme, s: f32, kind: usize) {
+    let cx = (r.left + r.right) / 2;
+    let cy = (r.top + r.bottom) / 2;
+    let a = ((5.5 * s).round() as i32).max(3);
+    unsafe {
+        let b = CreateSolidBrush(th.text);
+        // (tip, base1, base2)：tip 是箭头指向的那一端
+        let (tip, b1, b2) = match kind {
+            0 => ((cx - a, cy), (cx + a / 2, cy - a), (cx + a / 2, cy + a)),
+            1 => ((cx + a, cy), (cx - a / 2, cy - a), (cx - a / 2, cy + a)),
+            _ => ((cx, cy - a), (cx - a, cy + a / 2), (cx + a, cy + a / 2)),
+        };
+        let mut pts = [
+            POINT { x: tip.0, y: tip.1 },
+            POINT { x: b1.0, y: b1.1 },
+            POINT { x: b2.0, y: b2.1 },
+        ];
+        let _ = Polygon(hdc, &mut pts);
+        let _ = DeleteObject(b.into());
+    }
+}
+
 
 /// 落点判定（round 25 画布形态）：
 /// - 落在预览画布里 → DropTarget::Preview
@@ -2307,7 +2651,7 @@ fn paint_about(app: &App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
 }
 
 /// 「外观」：左树 + 右预览 + 滑杆。
-fn paint_look(app: &App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
+fn paint_look(app: &mut App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
     // —— 三级树 ——
     let rows = radius_rows(app);
     for (i, r) in g.tree_rows.iter().enumerate() {
@@ -2356,8 +2700,11 @@ fn paint_look(app: &App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
         );
     }
 
-    // —— 实时预览 ——
-    draw_preview(app, hdc, &g.preview, &app.settings_radius_sel, th, s);
+    // —— 实时预览（真窗口缩略图 + 当前项高亮框）——
+    // sel 必须先 clone：`&app.settings_radius_sel` 与 `draw_preview(app, &mut …)`
+    // 在同一个调用里对同一个 app 一借一借可变，借用检查不过。
+    let sel = app.settings_radius_sel.clone();
+    draw_preview(app, hdc, &g.preview, &sel, th, s);
 
     // —— 滑杆 ——
     draw_slider(app, hdc, &g.slider, th, s);
@@ -2447,27 +2794,79 @@ fn paint_interact(app: &App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
         let block_h = want * 3 + gap * 2;
         let top = pv.top + head_h + ((avail - block_h) / 2).max(0);
         let row_h = want;
-        let samples: [(&str, COLORREF, bool); 3] = [
-            ("未选中", th.window_bg, false),
-            ("鼠标悬停", th.row_hover, false),
-            ("已选中", th.selection_bg, true),
+        // 第38轮：样例改成**真实的详细信息行** —— 图标 + 文件名 + 修改日期
+        // + 大小，四列，与真窗口列表行同一套画法。真窗口里就是这样的行，
+        // 示意图对不上就等于没说清"这个参数改的是什么东西"。
+        let isz = ((16.0 * s).round() as i32).max(8);
+        let samples: [(&str, &str, &str, COLORREF, bool); 3] = [
+            ("未选中", "文件夹", "", th.window_bg, false),
+            ("鼠标悬停", "主文件夹", "2026/09/03 14:22", th.row_hover, false),
+            ("已选中", "本地磁盘 (C:)", "2026/09/03 14:22", th.selection_bg, true),
         ];
-        for (k, (label, fill, sel)) in samples.iter().enumerate() {
+        // 列宽按**行本体宽**算（预览宽 - 左侧标签那段）
+        let vw = pv.right - pv.left - px(66.0) - px(8.0);
+        let c_date = vw * 30 / 100;
+        let c_size = vw * 22 / 100;
+        let c_name = vw - c_date - c_size;
+        // 状态标签占**左侧一段**，行本体从标签右边开始 ——
+        // 标签塞进行里会把「大小」列挤没，画在行上方又会压住上一行
+        let lbl_w = px(66.0);
+        for (k, (label, fname, date, fill, sel)) in samples.iter().enumerate() {
             let sr = RECT {
-                left: pv.left,
+                left: pv.left + lbl_w + px(8.0),
                 top: top + k as i32 * (row_h + px(10.0)),
                 right: pv.right,
                 bottom: top + k as i32 * (row_h + px(10.0)) + row_h,
             };
+            set_color(hdc, th.text_dim);
+            let mut lr2 = RECT {
+                left: pv.left + px(2.0), top: sr.top,
+                right: pv.left + lbl_w, bottom: sr.bottom,
+            };
+            paint::draw_text(hdc, label, lr2,
+                DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS);
+            // 行底（圆角走 content.selected，与真窗口列表行同一个 id）
             rr(hdc, &sr, app.radius_of("content.selected"), *fill, None);
+            // 行首强调竖线 —— **真窗口的 draw_sel_bar**，不是自己画一根线
             if *sel {
                 unsafe { paint::draw_sel_bar(app, hdc, sr, th) };
             }
+            // 图标：accent 小方块代表真实文件图标，位置与真窗口一致
+            // （竖线右边、名称列起点）
+            let ib = RECT {
+                left: sr.left + px(14.0) + isz + px(5.0),
+                top: sr.top + (row_h - isz) / 2,
+                right: sr.left + px(14.0) + isz + px(5.0) + isz,
+                bottom: sr.top + (row_h - isz) / 2 + isz,
+            };
+            unsafe {
+                let br = CreateSolidBrush(th.accent);
+                let _ = FillRect(hdc, &ib, br);
+                let _ = DeleteObject(br.into());
+            }
+            let txt_col = if *sel { th.selection_text } else { th.text };
+            let dim_col = if *sel { th.selection_text } else { th.text_dim };
+            // 名称
             let mut tr = sr;
-            tr.left += px(16.0);
-            tr.right = sr.right - px(8.0);
-            set_color(hdc, if *sel { th.selection_text } else { th.text_dim });
-            paint::draw_text(hdc, label, tr, DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
+            tr.left = ib.right + px(5.0);
+            tr.right = sr.left + px(14.0) + isz + px(5.0) + c_name - px(8.0);
+            set_color(hdc, txt_col);
+            paint::draw_text(hdc, fname, tr,
+                DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS);
+            // 修改日期
+            let mut dr = sr;
+            dr.left = sr.left + px(14.0) + isz + px(5.0) + c_name;
+            dr.right = dr.left + c_date - px(8.0);
+            set_color(hdc, dim_col);
+            paint::draw_text(hdc, date, dr,
+                DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS);
+            // 大小
+            let mut zr = sr;
+            zr.left = dr.right + px(8.0);
+            zr.right = sr.right - px(8.0);
+            set_color(hdc, dim_col);
+            paint::draw_text(hdc, if *sel { "221 GB / 369 GB" } else { "" }, zr,
+                DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS);
         }
     }
 
@@ -2545,130 +2944,188 @@ fn hot(id: &str, sel: &str, th: Theme) -> Option<COLORREF> {
 ///
 /// 不是示意图 —— 每一块的半径都取自 `app.radius_of()`，改滑杆当场变形，
 /// 于是"圆角到底圆在哪儿"不用猜。
-fn draw_preview(app: &App, hdc: HDC, r: &RECT, sel: &str, th: Theme, s: f32) {
+/// 「外观」页右侧预览。
+///
+/// 第38轮重写。原来这里画的是**示意图** —— 标签是两个空矩形、面包屑是
+/// 三个空块、侧栏条目没文字没图标。真窗口里那些块都有内容，示意图对不上，
+/// 于是"把圆角调到 16"看不出来圆的是哪儿。
+///
+/// 现在：**每个圆角 id 都对应一块真实样式的元素**（真配色、真图标、
+/// 真文字），选中树里哪一项就高亮那几块 —— 和真窗口里那几块的观感一致。
+/// 布局按真窗口的比例：标题栏 : 工具栏 : 侧栏宽 : 行高 都取自 `Metrics`。
+fn draw_preview(app: &mut App, hdc: HDC, r: &RECT, sel: &str, th: Theme, s: f32) {
     if r.right <= r.left || r.bottom <= r.top {
         return;
     }
-    fill_rect(hdc, r, th.window_bg);
-    let pad = (8.0 * s).round() as i32;
-    let l = r.left + pad;
-    let t = r.top + pad;
-    let rt = r.right - pad;
-    let bt = r.bottom - pad;
-    let gap = (4.0 * s).round() as i32;
+    // 第38轮：预览 = **真窗口的等比缩放**，与「界面」页共用同一个绘制函数。
+    //
+    // 旧版是一张手搓的组件拼贴（标题带、面包屑块、侧栏条、菜单样例各画一份），
+    // 尺寸/颜色/间距全是写死的另一套数字，于是"预览"和"实际"永远对不上
+    // —— 用户连续三轮都提"预览有问题"。现在两边是同一份代码，
+    // 真窗口改了这里跟着改，物理上不可能再分叉。
+    paint_preview_canvas(app, hdc, r, th, s);
+    highlight_radius_block(app, hdc, r, sel, th, s);
+}
 
-    let title_h = (20.0 * s).round() as i32;
-    let tb_h = (18.0 * s).round() as i32;
-    let st_h = (14.0 * s).round() as i32;
-    let sb_w = ((rt - l) * 24 / 100).max((40.0 * s).round() as i32);
-
-    // 标题栏：三个按钮 + 两个标签
-    let title = RECT { left: l, top: t, right: rt, bottom: t + title_h };
-    fill_rect(hdc, &title, th.title_bg);
-    let bw = (16.0 * s).round() as i32;
-    let mut bx = rt - bw - (4.0 * s).round() as i32;
-    for _ in 0..3 {
-        let b = RECT { left: bx, top: t + gap, right: bx + bw, bottom: t + title_h - gap };
-        rr(hdc, &b, app.radius_of("title.button") , th.chrome_bg, hot("title.button", sel, th));
-        bx -= bw + (3.0 * s).round() as i32;
+/// 把「当前选中的圆角 id」对应到真窗口里的那一块，套一个 accent 描边。
+///
+/// 这一步是外观页预览存在的**全部意义**：选「标题栏圆角」时，
+/// 用户要看见的是*真窗口的标题栏*被框出来，而不是一张画得像的示意图。
+fn highlight_radius_block(app: &App, hdc: HDC, r: &RECT, sel: &str, th: Theme, s: f32) {
+    let w = r.right - r.left;
+    let h = r.bottom - r.top;
+    if w <= 0 || h <= 0 {
+        return;
     }
-    let tw = (52.0 * s).round() as i32;
-    for k in 0..2 {
-        let tb = RECT {
-            left: l + (4.0 * s).round() as i32 + k * (tw + (4.0 * s).round() as i32),
-            top: t + gap,
-            right: l + (4.0 * s).round() as i32 + k * (tw + (4.0 * s).round() as i32) + tw,
-            bottom: t + title_h - gap,
+    // 与 paint_preview_canvas 完全相同的缩放口径 —— 必须逐字一致，
+    // 否则高亮框会和画出来的窗口错位。
+    const REF_W: f32 = 1280.0;
+    const REF_H: f32 = 850.0;
+    let k = (w as f32 / REF_W).min(h as f32 / REF_H).max(0.04);
+    let vm = crate::theme::Metrics::new((96.0 * k) as u32);
+    let px = |v: f32| (v * vm.scale).round() as i32;
+    let lay = crate::paint::compute_layout(w, h, &vm, true, true);
+
+    // 表头高（paint_preview_canvas 里写死 26 DIP，这里同源）
+    let header_h = px(26.0);
+    let header = RECT {
+        left: lay.view.left,
+        top: lay.view.top,
+        right: lay.view.right,
+        bottom: lay.view.top + header_h,
+    };
+    // 首个数据行 = "content.selected / content.hover" 要框的那一条
+    let row0 = RECT {
+        left: lay.view.left,
+        top: header.bottom,
+        right: lay.view.right,
+        bottom: header.bottom + vm.row_h,
+    };
+
+    let target: RECT = match sel {
+        // —— 标题栏 ——
+        "title" => lay.title,
+        "title.tab" => RECT {
+            left: lay.tabs.left,
+            top: lay.title.top,
+            right: lay.tabs.left
+                + ((lay.tabs.right - lay.tabs.left) as f32 * 0.22).round() as i32,
+            bottom: lay.title.bottom,
+        },
+        "title.button" => lay.menu_btn,
+
+        // —— 工具栏 ——
+        "toolbar" => lay.toolbar,
+        "toolbar.button" => lay.back, // 导航键（返回）是工具栏里最典型的圆角块
+
+        // —— 地址栏 ——
+        "address" | "address.crumb" | "address.edit" => lay.address,
+
+        // —— 侧栏 ——
+        "sidebar" | "sidebar.hover" | "sidebar.selected" => lay.sidebar,
+
+        // —— 内容区 ——
+        "content" => lay.view,
+        "content.header" => header,
+        "content.selected" | "content.hover" => row0,
+
+        // —— 状态栏 ——
+        "status" | "status.button" => lay.status,
+
+        // —— 菜单（预览里没有常开的菜单，临时画一个再框它）——
+        // **只算位置，别在这里画**：下面统一 += r.left/r.top 才是窗口坐标，
+        // 在 match 里当场画会把弹窗甩到窗口左上角去（第38轮踩过）。
+        "menu" | "menu.hover" | "menu.panel" => menu_popup_rect(&lay, &vm),
+
+        // global 或未知 id：框整幅窗口。
+        // **必须用 0 基坐标**（下面统一 += r.left/r.top 平移到画布原点）——
+        // 第一版这里写的是已经是绝对坐标的 r，结果又平移一次，
+        // 框被推出屏幕外，"global 选中时预览没框" 就是这么来的。
+        _ => RECT { left: 0, top: 0, right: w, bottom: h },
+    };
+
+    // 坐标平移到画布原点（paint_preview_canvas 里也是这么平移的）
+    let mut t = target;
+    t.left += r.left;
+    t.right += r.left;
+    t.top += r.top;
+    t.bottom += r.top;
+    if t.right <= t.left || t.bottom <= t.top {
+        return;
+    }
+
+    // 菜单：位置平移完再画（顺序不能反，见上面的注释）
+    if matches!(sel, "menu" | "menu.hover" | "menu.panel") {
+        draw_preview_menu(hdc, &t, &vm, th, sel, prad(app, "menu.panel", vm.scale));
+    }
+
+    // accent 描边 2px：压在所有内容之上，一眼看出"我调的是这一块"
+    unsafe {
+        let pen = CreatePen(PS_SOLID, ((2.0 * s).round() as i32).max(2), th.accent);
+        let oldp = SelectObject(hdc, pen.into());
+        let oldb = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        let _ = Rectangle(hdc, t.left, t.top, t.right, t.bottom);
+        let _ = SelectObject(hdc, oldb);
+        let _ = SelectObject(hdc, oldp);
+        let _ = DeleteObject(pen.into());
+    }
+}
+
+/// 预览里临时弹出的菜单面板位置（挂在菜单键正下方）。
+fn menu_popup_rect(lay: &crate::paint::Layout, vm: &crate::theme::Metrics) -> RECT {
+    let scale = vm.scale;
+    let w = ((150.0 * scale).round() as i32).max(70);
+    let h = ((78.0 * scale).round() as i32).max(40);
+    let left = (lay.menu_btn.left - w).max(0);
+    RECT {
+        left,
+        top: lay.title.bottom + ((4.0 * scale).round() as i32),
+        right: left + w,
+        bottom: lay.title.bottom + ((4.0 * scale).round() as i32) + h,
+    }
+}
+
+/// 画一个真实样式的弹出菜单（三行 + 圆角 + 悬停行高亮），
+/// 供 "menu / menu.hover / menu.panel" 高亮时用。
+fn draw_preview_menu(
+    hdc: HDC,
+    r: &RECT,
+    vm: &crate::theme::Metrics,
+    th: Theme,
+    sel: &str,
+    rad: u32,
+) {
+    let scale = vm.scale;
+    let px = |v: f32| (v * scale).round() as i32;
+    // 面板底 + 边框 + 圆角
+    // 圆角吃 menu.panel（拖滑杆时这里跟着变），不要写死 6
+    rr(hdc, r, rad, th.surface, Some(th.border));
+    let row_h = ((24.0 * scale).round() as i32).max(14);
+    for (i, label) in ["打开", "复制", "删除"].iter().enumerate() {
+        let top = r.top + px(4.0) + i as i32 * row_h;
+        let row = RECT {
+            left: r.left + px(3.0),
+            top,
+            right: r.right - px(3.0),
+            bottom: top + row_h,
         };
-        rr(
+        if i == 1 && sel == "menu.hover" {
+            // 悬停行：用同一档 hover 底色（真菜单就是这一档）
+            rr(hdc, &row, 4, th.row_hover, None);
+        }
+        set_color(hdc, if i == 1 && sel == "menu.hover" { th.text } else { th.text_dim });
+        let mut tr = row;
+        tr.left += px(8.0);
+        tr.right -= px(6.0);
+        paint::draw_text(
             hdc,
-            &tb,
-            app.radius_of("title.tab"),
-            if k == 0 { th.tab_active } else { th.chrome_bg },
-            hot("title.tab", sel, th),
+            label,
+            tr,
+            DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS,
         );
     }
-
-    // 地址栏：面包屑 + 输入框
-    let mut y = title.bottom + gap;
-    let ad = RECT { left: l, top: y, right: rt, bottom: y + tb_h };
-    fill_rect(hdc, &ad, th.chrome_bg);
-    let cw = (34.0 * s).round() as i32;
-    for k in 0..3 {
-        let c = RECT { left: l + gap + k * (cw + gap), top: y + gap, right: l + gap + k * (cw + gap) + cw, bottom: y + tb_h - gap };
-        rr(hdc, &c, app.radius_of("address.crumb"), th.surface, hot("address.crumb", sel, th));
-    }
-    let ed = RECT { left: l + gap + 3 * (cw + gap), top: y + gap, right: rt - gap, bottom: y + tb_h - gap };
-    rr(hdc, &ed, app.radius_of("address.edit"), th.window_bg, hot("address.edit", sel, th));
-
-    // 工具栏：两个按钮
-    y = ad.bottom + gap;
-    let tb2 = RECT { left: l, top: y, right: rt, bottom: y + tb_h };
-    fill_rect(hdc, &tb2, th.chrome_bg);
-    for k in 0..2 {
-        let b = RECT { left: l + gap + k * (bw + gap), top: y + gap, right: l + gap + k * (bw + gap) + bw, bottom: y + tb_h - gap };
-        rr(hdc, &b, app.radius_of("toolbar.button"), th.surface, hot("toolbar.button", sel, th));
-    }
-
-    // 主体：侧栏 + 内容区
-    y = tb2.bottom + gap;
-    let body_b = bt - st_h - gap;
-    let sb = RECT { left: l, top: y, right: l + sb_w, bottom: body_b };
-    fill_rect(hdc, &sb, th.chrome_bg);
-    let ct = RECT { left: l + sb_w + gap, top: y, right: rt, bottom: body_b };
-    fill_rect(hdc, &ct, th.window_bg);
-
-    // 侧栏：分组标题 / 条目 / 悬停 / 选中，四种状态各画一条
-    let rh = (body_b - y - 5 * gap) / 4;
-    let sw = sb_w - 2 * gap;
-    for k in 0..4 {
-        let it = RECT { left: sb.left + gap, top: y + gap + k * (rh + gap), right: sb.left + gap + sw, bottom: y + gap + k * (rh + gap) + rh };
-        let (id, fill) = match k {
-            0 => ("sidebar.group", th.surface),
-            1 => ("sidebar.item", th.surface_alt),
-            2 => ("sidebar.hover", th.hover_bg),
-            _ => ("sidebar.selected", th.selection_bg),
-        };
-        rr(hdc, &it, app.radius_of(id), fill, hot(id, sel, th));
-    }
-
-    // 内容区：表头 + 2x2 磁贴（一块悬停、一块选中）
-    let hh = (14.0 * s).round() as i32;
-    let hd = RECT { left: ct.left + gap, top: ct.top + gap, right: ct.right - gap, bottom: ct.top + gap + hh };
-    rr(hdc, &hd, app.radius_of("content"), th.surface, hot("content.header", sel, th));
-    let gw = (ct.right - ct.left - 5 * gap) / 2;
-    let gh = (body_b - hd.bottom - 3 * gap) / 2;
-    for k in 0..4 {
-        let col = k % 2;
-        let row = k / 2;
-        let tl = RECT {
-            left: ct.left + gap + col * (gw + gap),
-            top: hd.bottom + gap + row * (gh + gap),
-            right: ct.left + gap + col * (gw + gap) + gw,
-            bottom: hd.bottom + gap + row * (gh + gap) + gh,
-        };
-        let (id, fill) = match k {
-            0 => ("content.tile", th.surface),
-            1 => ("content.hover", th.hover_bg),
-            2 => ("content.tile", th.surface),
-            _ => ("content.selected", th.selection_bg),
-        };
-        rr(hdc, &tl, app.radius_of(id), fill, hot(id, sel, th));
-    }
-
-    // 状态栏
-    let st = RECT { left: l, top: body_b + gap, right: rt, bottom: bt };
-    fill_rect(hdc, &st, th.status_bg);
-    rr(
-        hdc,
-        &RECT { left: st.left + gap, top: st.top + gap, right: st.right - gap, bottom: st.bottom - gap },
-        app.radius_of("status"),
-        th.surface,
-        hot("status.panel", sel, th),
-    );
-    let sb2 = RECT { left: st.right - gap - bw * 2, top: st.top + gap, right: st.right - gap - bw, bottom: st.bottom - gap };
-    rr(hdc, &sb2, app.radius_of("status.button"), th.surface_alt, hot("status.button", sel, th));
 }
+
 
 /// 圆角滑杆：轨道 + 已填段 + 圆点 + 数值。拖动/点击都按横坐标换算。
 fn draw_slider(app: &App, hdc: HDC, r: &RECT, th: Theme, s: f32) {

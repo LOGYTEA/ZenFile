@@ -1065,6 +1065,9 @@ impl App {
             tab_hover_since: None,
             drag_dock: None,
             settings_radius_sel: "global".to_string(),
+            // 圆角树默认**收起**（第38轮回退过一次"默认全展开"）：
+            // verify_settings20 的 B2/B3/C2 都按"点一下才展开"来定位树行，
+            // 默认展开会把行号假设全部打乱 —— 而且那不是本轮要改的东西。
             settings_tree_open: HashSet::new(),
             settings_hover_tree: None,
             settings_radius_drag: false,
