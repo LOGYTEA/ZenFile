@@ -160,20 +160,90 @@ fn fmt_filetime(ft: i64) -> Option<String> {
     Some(format!("{y:04}/{m:02}/{d:02} {hh:02}:{mm:02}"))
 }
 
-/// 本地时区偏移（秒）。用 Win32 的 TIME_ZONE_INFORMATION 拿当前偏移。
+/// 本地时区偏移（秒），按**该时刻**判定（含夏令时）。
 ///
-/// Windows 的 `Bias` 约定是 `UTC = local + Bias`（**注意是加**，不是减），
-/// 夏令时期间系统会把这个 Bias 调小 60 分钟，所以直接取用即可，
-/// 不需要自己判断是否处于夏令时。
-fn local_offset_secs(_unix: i64) -> i64 {
+/// Windows 的换算是 `UTC = 本地 + Bias*60`，Bias 单位是**分钟**，
+/// 所以 `本地 = UTC - Bias*60`，偏移秒数 = `-Bias*60`；夏令时期间
+/// 生效的是 `Bias + DaylightBias`。
+///
+/// 第39轮审计 #7 修的三处错（东八区实测差 8 小时 8 分）：
+///   1. **分钟当秒用**：Bias=-480 被当成 -480 秒；
+///   2. **符号反了**：应是 `utc - Bias*60`，旧版直接 `utc + Bias`；
+///   3. **完全不看夏令时**：`GetTimeZoneInformation` 的返回值只说明
+///      "现在"在不在夏令时，而文件的修改日期可能是去年冬天的 ——
+///      必须拿该时刻自己去比 `DaylightDate`→`StandardDate` 窗口。
+fn local_offset_secs(unix: i64) -> i64 {
     use windows::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
     let mut tz = TIME_ZONE_INFORMATION::default();
     unsafe {
         GetTimeZoneInformation(&mut tz);
     }
-    // Bias 已经是"UTC - 本地"的秒数（夏令时期间系统自动修正），
-    // 所以偏移直接取它、不取反。
-    tz.Bias as i64
+    let bias = if in_dst(&tz, unix) {
+        tz.Bias + tz.DaylightBias
+    } else {
+        tz.Bias
+    };
+    -(bias as i64) * 60
+}
+
+/// 该 UTC 秒是否落在本时区的夏令时窗口。
+///
+/// 窗口由 `DaylightDate` → `StandardDate` 给出（SYSTEMTIME：月份 + "第几个
+/// 星期几"）。日期列只到分钟，切换当天差一两小时无感，所以按**日**比较；
+/// 旧版干脆不分 DST，那才是小时级的错。
+fn in_dst(tz: &windows::Win32::System::Time::TIME_ZONE_INFORMATION, unix: i64) -> bool {
+    if tz.DaylightBias == 0 {
+        return false; // 没配夏令时（中国大陆：Bias=-480、DaylightBias=0）
+    }
+    // 先按**标准时间**折算出本地年月日：否则要先知道偏移才知道有没有 DST，
+    // 是个环；窗口边界差几小时对日期列无影响。
+    let local_std = unix - (tz.Bias as i64) * 60;
+    let (y, m, d, _, _) = civil_from_unix(local_std);
+    let cur = (m, d);
+    let Some(dst) = nth_weekday(y, tz.DaylightDate) else { return false };
+    let Some(std) = nth_weekday(y, tz.StandardDate) else { return false };
+    if dst <= std {
+        // 北半球：3 月进、11 月出
+        cur >= dst && cur < std
+    } else {
+        // 南半球：10 月进、次年 4 月出（窗口跨年）
+        cur >= dst || cur < std
+    }
+}
+
+/// SYSTEMTIME（wMonth + wDay=第几个星期几, 5=最后一个 + wDayOfWeek）
+/// → 该年的 (月, 日)。wMonth==0 表示"这个时区没有这档切换"，返回 None。
+fn nth_weekday(year: i64, st: windows::Win32::Foundation::SYSTEMTIME) -> Option<(u32, u32)> {
+    let month = st.wMonth as u32;
+    if month == 0 || month > 12 {
+        return None;
+    }
+    let week = (st.wDay as u32).clamp(1, 5);
+    let want_dow = (st.wDayOfWeek as u32) % 7; // 0=周日
+    // 该月 1 号星期几（1970-01-01 是周四=4）
+    let dow1 = ((days_from_civil(year, month, 1) + 4).rem_euclid(7)) as u32;
+    let first = 1 + (want_dow + 7 - dow1) % 7; // 该月第一次出现，落在 1..7
+    let dim = if month == 12 {
+        (days_from_civil(year + 1, 1, 1) - days_from_civil(year, 12, 1)) as u32
+    } else {
+        (days_from_civil(year, month + 1, 1) - days_from_civil(year, month, 1)) as u32
+    };
+    let mut day = first + (week - 1) * 7;
+    if day > dim {
+        day -= 7; // wDay=5 但这个月只出现 4 次 → 落到第 4 次
+    }
+    Some((month, day))
+}
+
+/// `civil_from_unix` 的逆：年月日 → 距 1970-01-01 的天数（Howard Hinnant）。
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m as i64 - 3 } else { m as i64 + 9 };
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
 }
 
 /// Unix 秒 → (年, 月, 日, 时, 分)。Howard Hinnant 的 civil_from_days 算法。
@@ -258,6 +328,49 @@ mod tests {
     #[test]
     fn civil_from_unix_epoch() {
         assert_eq!(civil_from_unix(0), (1970, 1, 1, 0, 0));
+    }
+
+    /// 权威对照：Win32 自己的 FileTimeToLocalFileTime。
+    ///
+    /// 旧版（分钟当秒 + 符号反 + 无 DST）在东八区这条断言下差 8 小时 8 分。
+    /// 冬夏各取一个时刻，覆盖 DST 的两个态（本机没配 DST 时两态相同，
+    /// 但只要时区带 DST，这条就会走到 Bias+DaylightBias 分支）。
+    #[test]
+    fn fmt_filetime_matches_win32_local_time() {
+        use windows::Win32::Foundation::FILETIME;
+        use windows::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
+        const EPOCH_DIFF: i64 = 11_644_473_600;
+        // 2025-12-01 / 2026-06-15 / 2026-08-02（UTC）
+        for unix in [1_764_547_200i64, 1_781_500_800, 1_785_628_800] {
+            let ticks = (unix + EPOCH_DIFF) * 10_000_000;
+            let ft = FILETIME {
+                dwLowDateTime: ticks as u32,
+                dwHighDateTime: (ticks >> 32) as u32,
+            };
+            let mut lft = FILETIME::default();
+            unsafe { FileTimeToLocalFileTime(&ft, &mut lft).unwrap() };
+            let lticks =
+                ((lft.dwHighDateTime as i64) << 32) | lft.dwLowDateTime as i64;
+            let (y, m, d, hh, mm) = civil_from_unix(lticks / 10_000_000 - EPOCH_DIFF);
+            let want = format!("{y:04}/{m:02}/{d:02} {hh:02}:{mm:02}");
+            assert_eq!(
+                fmt_filetime(ticks).as_deref(),
+                Some(want.as_str()),
+                "unix={unix}"
+            );
+        }
+    }
+
+    /// 偏移必须是**合法时区秒数**（±14h 内、整分钟）。
+    /// 旧版把分钟当秒：东八区量出 -480 秒（8 分钟），一眼就不对。
+    #[test]
+    fn offset_is_plausible_timezone_seconds() {
+        let off = local_offset_secs(1_764_547_200);
+        assert!(
+            (-14 * 3600..=14 * 3600).contains(&off),
+            "偏移 {off}s 不是合法时区（分钟当秒的典型症状是 ±800 内的小数字）"
+        );
+        assert_eq!(off % 60, 0, "时区偏移必须整分钟");
     }
 
     #[test]

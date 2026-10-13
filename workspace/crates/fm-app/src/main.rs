@@ -1061,14 +1061,23 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             // 处理整个被包在 `settings_drag.is_some()` 里，于是按下能写进
             // 一次值、按住拖全程无反应（用户报的"圆角改了没反应"就是它）。
             if app.tab().settings && app.settings_radius_drag {
-                let id = app.settings_radius_sel.clone();
-                let g = settings::geom(app, &l);
-                let max = settings::radius_max(&id).max(1);
-                let w = (g.slider.right - g.slider.left).max(1);
-                let frac = ((x - g.slider.left) as f32 / w as f32).clamp(0.0, 1.0);
-                app.set_radius(&id, (frac * max as f32).round() as u32);
-                let _ = InvalidateRect(Some(hwnd), None, true);
-                return LRESULT(0);
+                // 兜底：捕获可能被弹出的菜单/别的窗口抢走，那条 WM_LBUTTONUP
+                // 就到不了这里。左键已抬起就当场收摊并**继续走正常命中**
+                //（不 return），否则标志永真 —— 光标扫过设置页就跟着改值 +
+                // 反复写盘，设置页还点不动（第39轮审计 #11）。
+                if GetKeyState(0x01) >= 0 {
+                    app.settings_radius_drag = false;
+                    let _ = ReleaseCapture();
+                } else {
+                    let id = app.settings_radius_sel.clone();
+                    let g = settings::geom(app, &l);
+                    let max = settings::radius_max(&id).max(1);
+                    let w = (g.slider.right - g.slider.left).max(1);
+                    let frac = ((x - g.slider.left) as f32 / w as f32).clamp(0.0, 1.0);
+                    app.set_radius(&id, (frac * max as f32).round() as u32);
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                    return LRESULT(0);
+                }
             }
             // 设置页排布编辑器：正在拖卡片，只更新位置并重画，别的命中一概不理。
             if app.tab().settings && app.settings_drag.is_some() {
@@ -1553,6 +1562,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     }
                     Some(settings::Hit::RadiusSlider(sx)) => {
                         app.settings_radius_drag = true;
+                        // **必须 SetCapture**（第39轮审计 #11）：不捕获时把
+                        // 滑杆拖出窗口外松手，WM_LBUTTONUP 收不到 → 标志永真，
+                        // 之后光标扫过设置页就跟着改值 + 反复写盘，设置页还
+                        // 点不动。与 drag_split / tab_drag 同款做法。
+                        SetCapture(hwnd);
                         let id = app.settings_radius_sel.clone();
                         let g = settings::geom(app, &l);
                         let max = settings::radius_max(&id).max(1);
@@ -1780,7 +1794,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             // 圆角滑杆的拖拽到此为止（按住不放的那段由 WM_MOUSEMOVE 连续改值）
             {
                 let app = &mut *app_ptr;
-                app.settings_radius_drag = false;
+                if app.settings_radius_drag {
+                    app.settings_radius_drag = false;
+                    let _ = ReleaseCapture(); // 与按下时的 SetCapture 成对
+                }
             }
             // 拖标签：松手就落地（换顺序 / 8 向贴 / 拆成新进程）。
             // 必须排在最前面 —— 拖标签期间别的分支都不该插手。
@@ -1865,6 +1882,17 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let (x, y) = client_xy(hwnd, lparam);
             let l = paint::layout_for(app);
             if let Some(i) = hit_tab(app, &l, x, y) {
+                // 必须先落到**光标所在的窗格**（与 WM_LBUTTONDOWN 同款）：
+                // hit_tab 在分栏时可能命中的是某个窗格自己的局部标签条，
+                // 返回的 i 属于那个窗格；而 close_tab 作用在**焦点窗格**上 ——
+                // 不切焦点就会关掉另一个窗格的第 i 个标签（第39轮审计 #8 案例B：
+                // 右窗格点第 3 个，关掉的却是左窗格的第 3 个）。
+                // 顶部总览条画的就是焦点窗格，那种情况不需要切。
+                if app.split() && !(y >= l.title.top && y <= l.title.bottom) {
+                    if let Some(pi) = paint::pane_index_at(app, &l, x, y) {
+                        app.focus_pane = pi;
+                    }
+                }
                 app.close_tab(i);
                 app.hover_tab = None;
                 paint::sync_address(app);

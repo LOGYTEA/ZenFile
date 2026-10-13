@@ -96,8 +96,12 @@ pub fn resolve(input: &str, cwd: &Path) -> Result<Target> {
 /// 归一化：去掉尾部多余分隔符，并把 "." / ".." 段做词法折叠。
 pub fn normalize(path: &Path) -> PathBuf {
     let raw = path.to_string_lossy().replace('/', "\\");
-    let (prefix, rest) = if let Some(unc) = raw.strip_prefix("\\\\") {
-        (format!("\\\\\\\\{}", unc.split('\\').next().unwrap_or("")), &raw[2..])
+    let (prefix, rest) = if raw.starts_with("\\\\") {
+        // prefix 只要**两个反斜杠本身**，主机名留在 rest 里 —— 第39轮审计 #6：
+        // 旧版把 hostname 也拼进 prefix，而 rest 从 raw[2..] 起算已含主机名，
+        // `\\server\share` 归一化成 `\\server\server\share`，网络位置 100% 打不开。
+        // 附带收益：`\\?\C:\x` 这类 verbatim 路径也不会再被拼成 `\\?\?\C:\x`。
+        ("\\\\".to_string(), &raw[2..])
     } else if raw.len() >= 2 && raw.as_bytes()[1] == b':' {
         (raw[..2].to_string(), &raw[2..])
     } else {
@@ -117,7 +121,13 @@ pub fn normalize(path: &Path) -> PathBuf {
     }
     let mut out = prefix;
     for seg in stack {
-        out.push('\\');
+        // UNC 前缀本身以 "\" 结尾（就是那两个反斜杠），首段不能再补分隔符 ——
+        // 否则 `\\server\share` 拼成 `\\\server\share`（第39轮审计 #6 的后半：
+        // 前半是别把主机名同时拼进 prefix）。盘符前缀 `C:` 不以 \ 结尾，
+        // 照旧补，相对路径（空前缀）行为也不变。
+        if !out.ends_with('\\') {
+            out.push('\\');
+        }
         out.push_str(seg);
     }
     if out.is_empty() {
@@ -258,6 +268,39 @@ mod tests {
         let cwd = PathBuf::from("C:\\");
         assert_eq!(resolve("cmd", &cwd).unwrap(), Target::ShellCommand("cmd".into()));
         assert_eq!(resolve("CMD", &cwd).unwrap(), Target::ShellCommand("cmd".into()));
+    }
+
+    /// 第39轮审计 #6：UNC 主机名不许拼两遍。
+    #[test]
+    fn normalize_unc_keeps_single_hostname() {
+        assert_eq!(
+            normalize(Path::new(r"\\server\share")),
+            PathBuf::from(r"\\server\share")
+        );
+        // 尾部分隔符照旧折叠
+        assert_eq!(
+            normalize(Path::new(r"\\server\share\")),
+            PathBuf::from(r"\\server\share")
+        );
+        // ".." 词法折叠不能越过 UNC 前缀（也不能落到主机名前面）
+        assert_eq!(
+            normalize(Path::new(r"\\server\share\a\..\b")),
+            PathBuf::from(r"\\server\share\b")
+        );
+        // verbatim 前缀同理：不许多出一个 "?"
+        assert_eq!(
+            normalize(Path::new(r"\\?\C:\Windows")),
+            PathBuf::from(r"\\?\C:\Windows")
+        );
+    }
+
+    /// 普通盘符路径回归（确保前缀分支没被 UNC 改动带坏）。
+    #[test]
+    fn normalize_drive_still_works() {
+        assert_eq!(
+            normalize(Path::new(r"C:\Users\..\Temp\")),
+            PathBuf::from(r"C:\Temp")
+        );
     }
 
     #[test]

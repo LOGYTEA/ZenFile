@@ -2440,7 +2440,12 @@ impl App {
         while let Ok(msg) = self.engine_rx.try_recv() {
             match msg {
                 EngineMsg::Batch(batch) => {
-                    if let Some(tab) = self.pane_mut().tabs.iter_mut().find(|t| t.generation == batch.generation) {
+                    // 必须在**所有窗格**里找这个 generation，不能只搜焦点窗格
+                    // （第39轮审计 #8）：左右分栏时左窗格正在枚举，用户点一下
+                    // 右窗格 → 批次到达时 pane_mut() 已指向右窗格、找不到就
+                    // 静默丢弃 → 左窗格永久空白 + loading 永远 true（进度条空转），
+                    // 而且这个状态下没有任何报错线索。
+                    if let Some(tab) = self.find_tab_mut(batch.generation) {
                         if batch.done {
                             tab.loading = false;
                         }
@@ -2457,7 +2462,7 @@ impl App {
                     }
                 }
                 EngineMsg::Error(gen, e) => {
-                    if let Some(tab) = self.pane_mut().tabs.iter_mut().find(|t| t.generation == gen) {
+                    if let Some(tab) = self.find_tab_mut(gen) {
                         tab.loading = false;
                     }
                     eprintln!("枚举失败: {e}");
@@ -2479,6 +2484,19 @@ impl App {
         if changed {
             self.invalidate();
         }
+    }
+
+    /// 在**所有窗格的所有标签**里按 generation 找可变引用。
+    ///
+    /// 枚举结果属于"发起那次导航的标签"，跟当前焦点在哪个窗格无关 ——
+    /// 只搜焦点窗格会把别的窗格的批次静默丢掉（第39轮审计 #8）。
+    fn find_tab_mut(&mut self, generation: u64) -> Option<&mut Tab> {
+        for pane in self.panes.iter_mut() {
+            if let Some(t) = pane.tabs.iter_mut().find(|t| t.generation == generation) {
+                return Some(t);
+            }
+        }
+        None
     }
 
     // ------------------------------------------------------------ 选择/视图
@@ -2539,14 +2557,19 @@ impl App {
     }
 
     pub fn toggle_select(&mut self, row: usize, additive: bool, range: bool) {
+        // 锚点必须在 set_focus_row **之前**取：Shift 范围选择的起点是
+        // "上一次的焦点行"，先落焦点再取锚点会得到 start==end==row ——
+        // 范围选择退化成"只选当前一行"，而且下面的 clear() 连原有选中
+        // 一起清掉（第39轮审计 #5：Shift+点第 10 行只选中第 10 行）。
+        let anchor = self.tab().focus_row;
         self.set_focus_row(row);
         let tab = self.tab_mut();
         let Some(idx) = tab.visible.get(row).copied() else { return };
         let Some(entry) = tab.entries.get(idx) else { return };
         let k = key_of(entry);
         if range {
-            let start = tab.focus_row.min(row);
-            let end = tab.focus_row.max(row);
+            let start = anchor.min(row);
+            let end = anchor.max(row);
             tab.selected.clear();
             for r in start..=end {
                 if let Some(i) = tab.visible.get(r) {
@@ -2587,8 +2610,14 @@ impl App {
     pub fn select_all(&mut self) {
         let tab = self.tab_mut();
         tab.selected.clear();
-        for e in &tab.entries {
-            tab.selected.insert(key_of(e));
+        // 只选**可见**条目（第39轮审计 #4）：`entries` 是全量，含隐藏项与
+        // 被筛选掉的项。遍历它会出现"状态栏显示选中 500、屏幕只高亮 3 行"，
+        // 此时按 Delete 会把用户根本看不见的 480 个文件一起删掉。
+        // 所有其它选择路径（点击/Shift/方向键）走的都是 visible，这里必须一致。
+        for i in &tab.visible {
+            if let Some(e) = tab.entries.get(*i) {
+                tab.selected.insert(key_of(e));
+            }
         }
     }
 
@@ -2854,7 +2883,7 @@ impl App {
         if items.is_empty() {
             return;
         }
-        if self.cfg.files.operations.confirm_delete && confirm(self.hwnd, &format!(
+        if self.cfg.files.operations.confirm_delete && !confirm(self.hwnd, &format!(
             "确定要{} {} 个项目吗？",
             if permanent { "永久删除" } else { "删除到回收站" },
             items.len()
@@ -4703,7 +4732,9 @@ pub fn confirm(hwnd: HWND, text: &str) -> bool {
             MB_OKCANCEL | MB_ICONWARNING,
         )
     };
-    res != IDOK
+    // 用户点「确定」= 同意 = true。曾经返回 `res != IDOK`，于是清空回收站/
+    // 彻底删除那两处 `if !confirm() { return; }` 变成"点取消才真删"（第39轮）。
+    res == IDOK
 }
 
 pub fn report(hwnd: HWND, text: &str) {

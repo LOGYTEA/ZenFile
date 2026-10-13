@@ -13,6 +13,7 @@
 //!     显式偏移，多线程各写各的区间不会互相干扰）。
 //! 于是"复制一个 20GB 文件"也能吃满多个核。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -117,6 +118,9 @@ struct FTask {
     size: u64,
     /// 还没传完的块数；归零才算"这个文件做完了"
     left: Arc<AtomicUsize>,
+    /// 这个文件有没有失败过。Move 删源必须看它 —— 只看 `left==0` 会把
+    /// 复制失败的源也删掉（失败路径同样 fetch_sub，left 一样归零）。
+    ok: Arc<AtomicBool>,
 }
 
 /// 传输任务句柄：拿着它能看进度、能取消。
@@ -170,6 +174,10 @@ fn run(
     let mut skipped = 0usize;
     let mut fast_bytes = 0u64;
     let mut fast_files = 0usize;
+    // **本批已分配的目标路径**：同批两个 `photo.jpg` 会被 resolve 成同一个
+    // 目标，而磁盘 exists() 查不到这个还没落盘的名字 —— Move 时两份源先
+    // 互相覆盖、再双双删源，两个都没了只剩一份（第39轮审计 #3）。
+    let mut taken: HashSet<PathBuf> = HashSet::new();
     if kind == Kind::Move {
         let mut slow: Vec<PathBuf> = Vec::with_capacity(items.len());
         for src in &items {
@@ -181,7 +189,13 @@ fn run(
                 continue;
             };
             let Some(target) =
-                resolve_conflict(&dest.join(&name), on_conflict, &mut renamed, &mut skipped)
+                resolve_conflict(
+                    &dest.join(&name),
+                    on_conflict,
+                    &mut renamed,
+                    &mut skipped,
+                    &mut taken,
+                )
             else {
                 continue;
             };
@@ -203,7 +217,17 @@ fn run(
     let mut files: Vec<FTask> = Vec::new();
     let mut bytes_total = 0u64;
     for src in &items {
-        collect(src, dest, &mut dirs, &mut files, &mut bytes_total, on_conflict, &mut renamed, &mut skipped);
+        collect(
+            src,
+            dest,
+            &mut dirs,
+            &mut files,
+            &mut bytes_total,
+            on_conflict,
+            &mut renamed,
+            &mut skipped,
+            &mut taken,
+        );
     }
     {
         let mut s = stats.lock().unwrap();
@@ -337,7 +361,7 @@ fn run(
                             }
                             Err(e) => {
                                 failed.fetch_add(1, Ordering::Relaxed);
-                                file_failed(&stats, &f.src, &e, &f.left, &done_files);
+                                file_failed(&stats, &f.src, &e, &f.left, &f.ok, &done_files);
                             }
                         }
                     }
@@ -350,7 +374,7 @@ fn run(
                             }
                             Err(e) => {
                                 failed.fetch_add(1, Ordering::Relaxed);
-                                file_failed(&stats, &f.src, &e, &f.left, &done_files);
+                                file_failed(&stats, &f.src, &e, &f.left, &f.ok, &done_files);
                             }
                         }
                     }
@@ -405,18 +429,24 @@ fn run(
     //    只删**确实搬成功了**的那些：失败的文件留在原处让用户自己判断。
     if kind == Kind::Move && !cancel.load(Ordering::Relaxed) {
         for f in files.iter() {
-            if f.left.load(Ordering::Relaxed) == 0 && f.dst.exists() {
-                if f.src.is_dir() {
-                    let _ = std::fs::remove_dir_all(&f.src);
-                } else if f.src.is_file() {
-                    let _ = std::fs::remove_file(&f.src);
-                }
+            // 三重条件缺一不可：块走完（left==0）**且**没失败过（ok）**且**
+            // 目标真的在。只看 left 的旧版会把复制失败的源删掉 —— 失败路径
+            // 同样 fetch_sub，left 一样归零，源消失、目标是半截文件。
+            if f.left.load(Ordering::Relaxed) == 0
+                && f.ok.load(Ordering::Relaxed)
+                && f.dst.is_file()
+            {
+                let _ = std::fs::remove_file(&f.src);
             }
         }
-        // 顶层目录：文件删完之后把空壳收掉
-        for src in &items {
-            if src.is_dir() && !same_volume(src, dest) {
-                let _ = std::fs::remove_dir_all(src);
+        // 顶层目录：文件删完之后把空壳收掉。但只要有任何一个文件/预建失败，
+        // 源树里就还留着没搬走的东西 —— 这时整棵 remove_dir_all 会把用户
+        // 唯一的数据一起删掉，必须先确认零失败。
+        if failed.load(Ordering::Relaxed) == 0 && failed_pre == 0 {
+            for src in &items {
+                if src.is_dir() && !same_volume(src, dest) {
+                    let _ = std::fs::remove_dir_all(src);
+                }
             }
         }
     }
@@ -469,11 +499,14 @@ fn file_failed(
     src: &Path,
     e: &std::io::Error,
     left: &Arc<AtomicUsize>,
+    ok: &Arc<AtomicBool>,
     done_files: &Arc<AtomicUsize>,
 ) {
     if left.fetch_sub(1, Ordering::Relaxed) == 1 {
         done_files.fetch_add(1, Ordering::Relaxed);
     }
+    // 标记这个文件失败了：Move 的删源阶段只看 left 会把它也当成"搬完了"
+    ok.store(false, Ordering::Relaxed);
     if let Ok(mut s) = stats.lock() {
         if s.error.is_none() {
             s.error = Some(format!("{}: {e}", src.display()));
@@ -531,6 +564,7 @@ fn collect(
     on_conflict: Conflict,
     renamed: &mut usize,
     skipped: &mut usize,
+    taken: &mut HashSet<PathBuf>,
 ) {
     let name = src
         .file_name()
@@ -539,7 +573,7 @@ fn collect(
     if name.is_empty() {
         return;
     }
-    let target = resolve_conflict(&dest.join(&name), on_conflict, renamed, skipped);
+    let target = resolve_conflict(&dest.join(&name), on_conflict, renamed, skipped, taken);
     let Some(target) = target else { return };
 
     let Ok(md) = src.symlink_metadata() else { return };
@@ -547,7 +581,17 @@ fn collect(
         dirs.push(target.clone());
         let Ok(rd) = std::fs::read_dir(src) else { return };
         for e in rd.flatten() {
-            collect(&e.path(), &target, dirs, files, bytes_total, on_conflict, renamed, skipped);
+            collect(
+                &e.path(),
+                &target,
+                dirs,
+                files,
+                bytes_total,
+                on_conflict,
+                renamed,
+                skipped,
+                taken,
+            );
         }
         return;
     }
@@ -561,6 +605,7 @@ fn collect(
         dst: target,
         size,
         left: Arc::new(AtomicUsize::new(0)),
+        ok: Arc::new(AtomicBool::new(true)),
     });
 }
 
@@ -590,23 +635,42 @@ fn subtree_stats(p: &Path) -> (u64, usize) {
 }
 
 /// 目标已存在时怎么办。返回 None = 跳过。
+///
+/// `taken` 是**本批已分配的目标**（第39轮）：它解决的是 `exists()` 查不到的
+/// 那类撞名 —— 同批两个源叫同一个名字时，目标都还没落盘，磁盘检查一路
+/// 绿灯，两个任务最终写同一个路径。
 fn resolve_conflict(
     want: &Path,
     on_conflict: Conflict,
     renamed: &mut usize,
     skipped: &mut usize,
+    taken: &mut HashSet<PathBuf>,
 ) -> Option<PathBuf> {
-    if !want.exists() {
+    let batch = taken.contains(want);
+    if !want.exists() && !batch {
+        taken.insert(want.to_path_buf());
         return Some(want.to_path_buf());
     }
     match on_conflict {
-        Conflict::Replace => Some(want.to_path_buf()),
+        // 批内 Replace 不能照办：两个源写同一目标 = 后写的覆盖先写的，
+        // 然后 Move 把两份源都删掉（净丢一份）。改名保住两份。
+        Conflict::Replace if !batch => {
+            taken.insert(want.to_path_buf());
+            Some(want.to_path_buf())
+        }
+        Conflict::Replace => {
+            let p = unique_copy_name(want, taken);
+            taken.insert(p.clone());
+            *renamed += 1;
+            Some(p)
+        }
         Conflict::Skip => {
             *skipped += 1;
             None
         }
         Conflict::Rename => {
-            let p = unique_copy_name(want);
+            let p = unique_copy_name(want, taken);
+            taken.insert(p.clone());
             *renamed += 1;
             Some(p)
         }
@@ -614,7 +678,10 @@ fn resolve_conflict(
 }
 
 /// 资源管理器中文界面就地粘贴的命名：`X - 副本.ext`、`X - 副本 (2).ext`…
-fn unique_copy_name(want: &Path) -> PathBuf {
+///
+/// 除了磁盘上已有的，还要避开 `taken`（同批已分配但还没写出去的名字）——
+/// 否则批内第 2、3 个同名项会拿到同一个"副本"名，等于没解决（第39轮）。
+fn unique_copy_name(want: &Path, taken: &HashSet<PathBuf>) -> PathBuf {
     let stem = want
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
@@ -625,12 +692,12 @@ fn unique_copy_name(want: &Path) -> PathBuf {
         .unwrap_or_default();
     let parent = want.parent().map(|p| p.to_path_buf()).unwrap_or_default();
     let first = parent.join(format!("{stem} - 副本{ext}"));
-    if !first.exists() {
+    if !first.exists() && !taken.contains(&first) {
         return first;
     }
     for i in 2..1000 {
         let p = parent.join(format!("{stem} - 副本 ({i}){ext}"));
-        if !p.exists() {
+        if !p.exists() && !taken.contains(&p) {
             return p;
         }
     }
@@ -690,4 +757,77 @@ pub fn fmt_eta(ms: f64) -> String {
     }
     let h = m / 60;
     format!("约 {h} 小时 {} 分", m % 60)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 同批两个同名源 + Rename：必须拿到**两个不同**的目标。
+    /// 第39轮审计 #3 的核心用例 —— 旧实现两个都返回 want，
+    /// Move 时互相覆盖后双双删源，净丢一份。
+    #[test]
+    fn batch_rename_two_same_names_distinct() {
+        let want = PathBuf::from(r"C:\__zen_t39\a\photo.jpg");
+        let mut taken = HashSet::new();
+        let (mut rn, mut sk) = (0usize, 0usize);
+        let a = resolve_conflict(&want, Conflict::Rename, &mut rn, &mut sk, &mut taken);
+        let b = resolve_conflict(&want, Conflict::Rename, &mut rn, &mut sk, &mut taken);
+        let (a, b) = (a.expect("first"), b.expect("second"));
+        assert_ne!(a, b, "同批同名必须分成两个目标");
+        assert_eq!(rn, 1, "只有第二个走改名");
+        assert!(taken.contains(&a) && taken.contains(&b));
+    }
+
+    /// Replace 也不能让批内两个源指向同一目标（覆盖 = 丢一份）。
+    #[test]
+    fn batch_replace_never_shares_target() {
+        let want = PathBuf::from(r"C:\__zen_t39\b\data.bin");
+        let mut taken = HashSet::new();
+        let (mut rn, mut sk) = (0usize, 0usize);
+        let a = resolve_conflict(&want, Conflict::Replace, &mut rn, &mut sk, &mut taken)
+            .expect("first");
+        let b = resolve_conflict(&want, Conflict::Replace, &mut rn, &mut sk, &mut taken)
+            .expect("second");
+        assert_ne!(a, b, "批内 Replace 必须改名，否则两份源写同一目标");
+    }
+
+    /// Skip 语义保留：批内第二个照旧跳过。
+    #[test]
+    fn batch_skip_drops_second() {
+        let want = PathBuf::from(r"C:\__zen_t39\c\note.txt");
+        let mut taken = HashSet::new();
+        let (mut rn, mut sk) = (0usize, 0usize);
+        assert!(resolve_conflict(&want, Conflict::Skip, &mut rn, &mut sk, &mut taken).is_some());
+        assert!(resolve_conflict(&want, Conflict::Skip, &mut rn, &mut sk, &mut taken).is_none());
+        assert_eq!(sk, 1);
+    }
+
+    /// 第三个同名项要拿到第三个名字（不能与前两个撞）。
+    #[test]
+    fn third_duplicate_gets_third_name() {
+        let want = PathBuf::from(r"C:\__zen_t39\d\x.txt");
+        let mut taken = HashSet::new();
+        let (mut rn, mut sk) = (0usize, 0usize);
+        let names: Vec<PathBuf> = (0..3)
+            .map(|_| {
+                resolve_conflict(&want, Conflict::Rename, &mut rn, &mut sk, &mut taken)
+                    .expect("name")
+            })
+            .collect();
+        let uniq: HashSet<&PathBuf> = names.iter().collect();
+        assert_eq!(uniq.len(), 3, "三个同名源必须三个不同目标: {names:?}");
+    }
+
+    /// unique_copy_name 不能返回 taken 里已占用的名字（否则改名等于没改）。
+    #[test]
+    fn unique_copy_name_avoids_taken() {
+        let want = PathBuf::from(r"C:\__zen_t39\e\y.txt");
+        let mut taken = HashSet::new();
+        let first = unique_copy_name(&want, &taken);
+        taken.insert(first.clone());
+        let second = unique_copy_name(&want, &taken);
+        assert_ne!(first, second);
+    }
 }

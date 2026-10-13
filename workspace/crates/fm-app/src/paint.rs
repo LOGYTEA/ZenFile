@@ -1669,6 +1669,15 @@ pub(crate) unsafe fn draw_sel_bar(app: &App, hdc: HDC, host: RECT, t: Theme) {
         let _ = SelectObject(hdc, op);
         let _ = DeleteObject(p.into());
     } else {
+        // 实心：只填**竖条本身**（bar_w 宽）。
+        //
+        // 不能直接 FillRgn(clip)：clip = 圆角宿主 ∩ band，而 band 是给
+        // 空心描边留的余量（bar_w+24，第35轮放宽的）—— 实心跟着一起填，
+        // w=1 的竖条会画成 25px 宽的一块蓝砖；半径一大 band 被压成 1px 高，
+        // 又变成一条横线（radius35 回归第39轮抓到，肉眼即错）。
+        let bar = CreateRectRgn(host.left, bar_top, host.left + bar_w, bar_top + bar_h);
+        let _ = CombineRgn(Some(clip), Some(clip), Some(bar), RGN_AND);
+        let _ = DeleteObject(bar.into());
         let br = CreateSolidBrush(t.accent);
         let _ = FillRgn(hdc, clip, br);
         let _ = DeleteObject(br.into());

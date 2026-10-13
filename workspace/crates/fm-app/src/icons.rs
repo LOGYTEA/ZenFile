@@ -511,6 +511,34 @@ impl IconCache {
                 }
             }
         }
+        // **派生表必须一起清**（第39轮审计 #14）：scaled_thumbs 的 key 是
+        // HBITMAP 句柄值，源位图一删 GDI 就会复用句柄 —— 新缩略图拿到刚
+        // 释放的号就命中旧条目，返回上一张图的重采样结果，表现为
+        // "文件 A 显示成文件 B 的图"，且永不自愈（重启才好）。
+        // 上面 thumbs 过界驱逐（clear_thumbs 的唯一其它触发点）同理。
+        self.clear_derived();
+    }
+
+    /// 清两张**按句柄值当 key** 的派生位图表。
+    ///
+    /// 谁销毁了源句柄（HBITMAP/HICON），谁就得来清一次 —— 句柄值会被
+    /// GDI/Shell 高度复用，不清理等于给未来的同名 key 预埋一个错缓存
+    /// （第39轮审计 #14）。
+    fn clear_derived(&mut self) {
+        for (_, b) in self.upscaled.get_mut().drain() {
+            if !b.is_invalid() {
+                unsafe {
+                    let _ = DeleteObject(b.into());
+                }
+            }
+        }
+        for (_, b) in self.scaled_thumbs.get_mut().drain() {
+            if !b.is_invalid() {
+                unsafe {
+                    let _ = DeleteObject(b.into());
+                }
+            }
+        }
     }
 
     /// 文件落地之后把**路径相关**的图标缓存作废。
@@ -547,6 +575,9 @@ impl IconCache {
                 }
             }
         }
+        // dir 里的 HICON 销毁了，按句柄派生的 upscaled 一起作废
+        //（第39轮审计 #14：句柄复用会撞出"错图标"缓存）
+        self.clear_derived();
     }
 
     pub fn draw(&self, hdc: HDC, icon: HICON, x: i32, y: i32, size: i32) {

@@ -331,8 +331,14 @@ impl Index {
             *p += n;
             Some(s)
         };
+        // 腐坏的长度字段（0xFFFF_FFFF）会让 with_capacity 先去要 16GB ——
+        // 分配失败 = 进程直接 abort（panic=abort），用户敲一个搜索字符就闪退
+        // （第39轮审计 #9）。每项至少占 4 字节，先和剩余字节数对账。
         let rd_u32v = |p: &mut usize| -> Option<Vec<u32>> {
             let n = rd_u32(p)? as usize;
+            if n > b.len().saturating_sub(*p) / 4 {
+                return None;
+            }
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
                 v.push(rd_u32(p)?);
@@ -341,6 +347,9 @@ impl Index {
         };
         let rd_u64v = |p: &mut usize| -> Option<Vec<u64>> {
             let n = rd_u32(p)? as usize;
+            if n > b.len().saturating_sub(*p) / 8 {
+                return None;
+            }
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
                 v.push(rd_u64(p)?);
@@ -349,6 +358,9 @@ impl Index {
         };
         let rd_i64v = |p: &mut usize| -> Option<Vec<i64>> {
             let n = rd_u32(p)? as usize;
+            if n > b.len().saturating_sub(*p) / 8 {
+                return None;
+            }
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
                 v.push(rd_i64(p)?);
@@ -369,6 +381,10 @@ impl Index {
         let complete = rd_u8(&mut p)? != 0;
         let n_dirs = rd_u32(&mut p)? as usize;
         let n = rd_u32(&mut p)? as usize;
+        // 同上：每个目录字符串至少 4 字节（长度头），先对账再分配
+        if n_dirs > b.len().saturating_sub(p) / 4 {
+            return None;
+        }
         let root = rd_str(&mut p)?;
         let mut dirs = Vec::with_capacity(n_dirs);
         for _ in 0..n_dirs {
@@ -383,7 +399,29 @@ impl Index {
         let flags = rd_u8v(&mut p)?;
         let blob = rd_str(&mut p)?.into_bytes();
         let lower = rd_str(&mut p)?.into_bytes();
-        if parent.len() != n || off.len() != n + 1 || loff.len() != n + 1 {
+        // 长度校验必须**覆盖全部与 n 相关的数组**：旧版只查 parent/off/loff，
+        // flags/size/mtime 短一截时，搜索结果映射里 `idx.flags[i]`（i < n）
+        // 直接切片越界 → panic → 进程消失（第39轮审计 #9）。
+        if parent.len() != n
+            || off.len() != n + 1
+            || loff.len() != n + 1
+            || size.len() != n
+            || mtime.len() != n
+            || depth.len() != n
+            || flags.len() != n
+        {
+            return None;
+        }
+        // 偏移表必须单调且收口在字符串表之内，否则 name_at 的
+        // `blob[off[i]..off[i+1]]` 会越界 panic
+        if off.windows(2).any(|w| w[0] > w[1])
+            || loff.windows(2).any(|w| w[0] > w[1])
+        {
+            return None;
+        }
+        if off.last().map_or(true, |&o| o as usize > blob.len())
+            || loff.last().map_or(true, |&o| o as usize > lower.len())
+        {
             return None;
         }
         Some(Index {
@@ -1117,5 +1155,103 @@ mod tests {
         assert_eq!(volume_root(Path::new("d:\\")).as_deref(), Some("D:\\"));
         assert_eq!(volume_root(Path::new("\\\\srv\\share")), None);
         assert_eq!(volume_root(Path::new("relative")), None);
+    }
+
+    // ------------------------------------------------- 缓存损坏（第39轮审计 #9）
+
+    /// 手搓一帧结构完整、字段可调的缓存字节（与 `to_bytes` 同格式）。
+    /// blob/lower 固定为 "abc"（3 字节），方便构造偏移越界。
+    fn frame(n: u32, flags: &[u8], off: &[u32], loff: &[u32]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"NFIDX02\0");
+        b.extend_from_slice(&1u64.to_le_bytes()); // built
+        b.push(1); // complete
+        b.extend_from_slice(&0u32.to_le_bytes()); // n_dirs
+        b.extend_from_slice(&n.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes()); // root = ""
+        b.extend_from_slice(&(off.len() as u32).to_le_bytes());
+        for &x in off {
+            b.extend_from_slice(&x.to_le_bytes());
+        }
+        b.extend_from_slice(&(loff.len() as u32).to_le_bytes());
+        for &x in loff {
+            b.extend_from_slice(&x.to_le_bytes());
+        }
+        b.extend_from_slice(&n.to_le_bytes()); // parent
+        for _ in 0..n {
+            b.extend_from_slice(&0u32.to_le_bytes());
+        }
+        b.extend_from_slice(&n.to_le_bytes()); // size
+        for _ in 0..n {
+            b.extend_from_slice(&0u64.to_le_bytes());
+        }
+        b.extend_from_slice(&n.to_le_bytes()); // mtime
+        for _ in 0..n {
+            b.extend_from_slice(&0i64.to_le_bytes());
+        }
+        b.extend_from_slice(&n.to_le_bytes()); // depth
+        b.extend(std::iter::repeat(0u8).take(n as usize));
+        b.extend_from_slice(&(flags.len() as u32).to_le_bytes()); // flags
+        b.extend_from_slice(flags);
+        b.extend_from_slice(&3u32.to_le_bytes()); // blob = "abc"
+        b.extend_from_slice(b"abc");
+        b.extend_from_slice(&3u32.to_le_bytes()); // lower = "abc"
+        b.extend_from_slice(b"abc");
+        b
+    }
+
+    /// flags 短于 n → 必须拒绝（旧版只查 parent/off/loff，
+    /// 这种帧能过校验，随后 idx.flags[i] 越界 panic，进程直接消失）。
+    #[test]
+    fn corrupt_flags_short_rejected() {
+        assert!(Index::from_bytes(&frame(1, &[], &[0, 3], &[0, 3])).is_none());
+    }
+
+    /// 合法帧能过 —— 证明 frame() 与 to_bytes 同格式，下面几条不是靠
+    /// "格式本来就错"蒙对的。
+    #[test]
+    fn frame_ok_parses() {
+        assert!(Index::from_bytes(&frame(1, &[0], &[0, 3], &[0, 3])).is_some());
+    }
+
+    /// 偏移表非单调 → 拒绝（否则 name_at 的 blob[off[i]..off[i+1]] 越界 panic）。
+    #[test]
+    fn corrupt_off_not_monotonic_rejected() {
+        assert!(Index::from_bytes(&frame(1, &[0], &[2, 1], &[0, 3])).is_none());
+    }
+
+    /// 偏移超出字符串表 → 拒绝。
+    #[test]
+    fn corrupt_off_beyond_blob_rejected() {
+        assert!(Index::from_bytes(&frame(1, &[0], &[0, 9], &[0, 3])).is_none());
+    }
+
+    /// 疯狂的 n_dirs（0xFFFF_FFFF）→ 拒绝且**不许真的去分配**。
+    /// 旧版 Vec::with_capacity(4G) 会先要 16GB，分配失败即 abort。
+    #[test]
+    fn corrupt_huge_count_rejected_without_alloc() {
+        let mut b = sample().to_bytes();
+        // n_dirs 位于 magic(8) + built(8) + complete(1) = 17
+        b[17..21].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(Index::from_bytes(&b).is_none());
+    }
+
+    /// 截断的缓存 → 拒绝（读到一半游标越界应返回 None，而不是 panic）。
+    #[test]
+    fn corrupt_truncated_rejected() {
+        let b = sample().to_bytes();
+        for cut in [0usize, 4, 17, 21, b.len() / 2, b.len() - 1] {
+            assert!(
+                Index::from_bytes(&b[..cut]).is_none(),
+                "截断到 {cut} 字节应被拒绝"
+            );
+        }
+    }
+
+    /// 纯垃圾字节 → 拒绝。
+    #[test]
+    fn corrupt_garbage_rejected() {
+        let junk: Vec<u8> = (0..512u32).map(|i| (i * 7 + 13) as u8).collect();
+        assert!(Index::from_bytes(&junk).is_none());
     }
 }
