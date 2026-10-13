@@ -2848,13 +2848,9 @@ fn show_header_filter_menu(hwnd: HWND, app: &mut App, l: &paint::Layout, col: us
     }
 }
 
-/// 表头右键：排序方向 + 按这一列筛选（资源管理器同款）。
-/// 表头右键菜单的**「选择列…」子菜单**（第33轮）。
-///
-/// 结构照资源管理器（用户截图）：
+/// 表头右键菜单（第44轮，照用户给的资源管理器截图）：
 ///   将列调整为合适的大小(S)
-///   ─────────
-///   所有列均调整为合适的大小(A)
+///   将所有列均调整为合适的大小(A)
 ///   ─────────
 ///   ✓名称          ← 名称恒勾且不可点（同 Explorer）
 ///   ✓修改日期
@@ -2862,18 +2858,22 @@ fn show_header_filter_menu(hwnd: HWND, app: &mut App, l: &paint::Layout, col: us
 ///    大小
 ///   ─────────
 ///   其他(M)...
+///
+/// 之前顶上还有"按X递增/递减排序"和"筛选"两节 —— 用户明确不要
+/// （"不要筛选和排序那些乱七八糟的"）。排序仍然点表头就能做。
 fn header_choose_columns_rows(app: &App) -> Vec<menu::MenuEntry> {
     let mut v: Vec<menu::MenuEntry> = Vec::new();
     v.push(menu::MenuEntry::item(
         "将列调整为合适的大小(S)",
         menu::Command::AutofitColumns,
     ));
-    v.push(menu::MenuEntry::sep());
     v.push(menu::MenuEntry::item(
-        "所有列均调整为合适的大小(A)",
+        "将所有列均调整为合适的大小(A)",
         menu::Command::AutofitAllColumns,
     ));
     v.push(menu::MenuEntry::sep());
+    // 搜索态下"选择列"禁用（资源管理器同样：搜索结果的列是固定的）
+    let locked = app.tab().search_root.is_some();
     // 名称恒在、恒勾、不可点 —— 与 Explorer 一致（没有任何列表能没有"名称"）
     for id in fm_core::columns::COL_ALL {
         let on = app.is_col_visible(id);
@@ -2882,8 +2882,8 @@ fn header_choose_columns_rows(app: &App) -> Vec<menu::MenuEntry> {
             menu::Command::ToggleColumn((*id).to_string()),
             on,
         );
-        if *id == fm_core::columns::C_NAME {
-            v.push(e.with_disabled(true).with_checked(true));
+        if *id == fm_core::columns::C_NAME || locked {
+            v.push(e.with_disabled(true).with_checked(on));
         } else {
             v.push(e);
         }
@@ -2894,46 +2894,9 @@ fn header_choose_columns_rows(app: &App) -> Vec<menu::MenuEntry> {
     v
 }
 
-/// 表头右键：排序方向 + 按这一列筛选 + 「选择列…」（资源管理器同款）。
-fn show_header_context_menu(hwnd: HWND, app: &mut App, l: &paint::Layout, col: usize, x: i32, y: i32) {
-    let icon_size = (16.0 * app.metrics.scale) as i32;
-    let boxes = paint::col_boxes(app, l, icon_size);
-    let id = boxes.get(col).map(|b| b.id).unwrap_or(fm_core::columns::C_NAME);
-    let label = fm_core::columns::label_of(id);
-    let desc = app.tab().sort.descending;
-    let on_this = sort_key_of_col(id) == Some(app.tab().sort.key);
-    let mut entries: Vec<menu::MenuEntry> = Vec::new();
-    entries.push(app::pick_row(
-        &format!("按{}递增排序", label),
-        menu::Command::HeaderSort(header_sem_of(id), false),
-        on_this && !desc,
-    ));
-    entries.push(app::pick_row(
-        &format!("按{}递减排序", label),
-        menu::Command::HeaderSort(header_sem_of(id), true),
-        on_this && desc,
-    ));
-    let filters = header_filter_rows(app, header_sem_of(id));
-    if !filters.is_empty() {
-        entries.push(menu::MenuEntry::sep());
-        entries.push(crate::app::submenu_row("筛选", None, filters));
-    }
-    if app.tab().col_filter.is_some() {
-        entries.push(menu::MenuEntry::sep());
-        entries.push(crate::app::pick_row(
-            "清除筛选",
-            menu::Command::ColFilterKind(String::new()),
-            false,
-        ));
-    }
-    // 「选择列…」放最后（与 Explorer 的位置一致：它是"配置"不是"操作"）
-    if app.tab().view_mode == fm_core::ViewMode::Details {
-        entries.push(menu::MenuEntry::sep());
-        let sub = header_choose_columns_rows(app);
-        let mut row = crate::app::submenu_row("选择列(O)...", None, sub);
-        row.disabled = app.tab().search_root.is_some();
-        entries.push(row);
-    }
+/// 表头右键 = 「选择列」菜单本身（第44轮拍平，不再有排序/筛选外层）。
+fn show_header_context_menu(hwnd: HWND, app: &mut App, _l: &paint::Layout, _col: usize, x: i32, y: i32) {
+    let entries = header_choose_columns_rows(app);
     let mut pt = POINT { x, y };
     let _ = unsafe { ClientToScreen(hwnd, &mut pt) };
     let app_ptr = app as *mut App;
