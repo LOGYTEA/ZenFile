@@ -506,6 +506,8 @@ pub struct Geom {
     pub tree_rows: Vec<RECT>,
     /// 与 `tree_rows` 一一对应的圆角项 id
     pub tree_ids: Vec<String>,
+    /// 「交互」页树：与 `tree_rows` 一一对应的可调 action（分组行是 None）
+    pub tree_actions: Vec<Option<u32>>,
     /// 「外观」：右侧实时预览
     pub preview: RECT,
     /// 「外观」：圆角滑杆
@@ -627,6 +629,7 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
         rows: Vec::new(),
         tree_rows: Vec::new(),
         tree_ids: Vec::new(),
+        tree_actions: Vec::new(),
         preview: RECT::default(),
         slider: RECT::default(),
         menu_panel: RECT::default(),
@@ -839,7 +842,58 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
             g.rows = advanced_rows(app, &content);
         }
         crate::app::SETTINGS_TAB_INTERACT => {
-            g.rows = interact_rows(app, &content);
+            // 第34轮：改成与「外观」页**同构**的左树 + 右预览。
+            //
+            // 之前这一页是四行参数平铺在左边、底部一条样例，参数一多就挤成
+            // 一列竖条，用户扫不出"这些参数管的是同一件事"。左边树按语义
+            // 分组（选中样式 / 选中样式续），右边是当前选中项的**大预览**，
+            // 改参数当场看得见。
+            let tree_w = (content.right - content.left) * 44 / 100;
+            let rh = px_of(app, 28.0);
+            let mut y = content.top;
+            for r in interact_tree_rows(app) {
+                if y + rh > content.bottom {
+                    break;
+                }
+                g.tree_rows.push(RECT {
+                    left: content.left,
+                    top: y,
+                    right: content.left + tree_w,
+                    bottom: y + rh,
+                });
+                g.tree_ids.push(r.id.to_string());
+                g.tree_actions.push(r.action);
+                y += rh;
+            }
+            // 右边整块都是预览（上）+ 当前项的参数行（下）
+            let pv_left = content.left + tree_w + px_of(app, 14.0);
+            // 参数行紧贴内容区**底边**（用户要"左边设置项、右边预览"，
+            // 参数行是预览的附属，不该浮在中间留一大片空白）。
+            // 预览占"顶到参数行上方"之间的全部空间。
+            let row_h2 = px_of(app, 34.0);
+            let row_top = content.bottom - row_h2;
+            g.preview = RECT {
+                left: pv_left,
+                top: content.top,
+                right: content.right,
+                bottom: row_top - px_of(app, 12.0),
+            };
+            let rh2 = row_h2;
+            let cur = app.settings_interact_sel;
+            if let Some(a) = cur.and_then(|id| interact_find(id, &interact_tree()).and_then(|n| n.action)) {
+                g.rows.push(row(
+                    RECT {
+                        left: pv_left,
+                        top: row_top,
+                        right: content.right,
+                        bottom: row_top + rh2,
+                    },
+                    interact_param_label(cur.unwrap()),
+                    interact_param_value(app, cur.unwrap()),
+                    a,
+                    None,
+                ));
+            }
         }
         crate::app::SETTINGS_TAB_PLUGIN => {
             g.rows = plugin_rows(app, &content);
@@ -935,7 +989,165 @@ fn row(rect: RECT, label: &str, value: String, action: u32, toggle: Option<bool>
 }
 
 /// 「高级」：沿用原来的开关与多选项，只是搬进新标签。
-/// 「交互」页的四行参数：**选中行首竖线**的形状。
+/// 树的可见行（展开的分组才列孩子）。
+pub struct InteractRow {
+    pub id: &'static str,
+    pub depth: usize,
+    pub name: &'static str,
+    pub has_kids: bool,
+    pub open: bool,
+    /// Some = 这一行可调（点它把右侧参数区切到这一项）
+    pub action: Option<u32>,
+}
+
+pub fn interact_tree_rows(app: &App) -> Vec<InteractRow> {
+    let mut out = Vec::new();
+    fn walk(app: &App, nodes: &[InteractNode], depth: usize, out: &mut Vec<InteractRow>) {
+        for n in nodes {
+            let open = app.settings_interact_open.contains(n.id);
+            out.push(InteractRow {
+                id: n.id,
+                depth,
+                name: n.name,
+                has_kids: !n.kids.is_empty(),
+                open,
+                action: n.action,
+            });
+            if open {
+                walk(app, &n.kids, depth + 1, out);
+            }
+        }
+    }
+    walk(app, &interact_tree(), 0, &mut out);
+    out
+}
+
+/// 缩放后的像素（DIP → px）。局部小工具，避免每处都写 `(v * s).round()`。
+fn px_of(app: &App, v: f32) -> i32 {
+    (v * app.metrics.scale).round() as i32
+}
+
+/// 这个树节点是不是分组（有孩子）。
+pub fn interact_has_kids(id: &str) -> bool {
+    interact_find(id, &interact_tree()).map(|n| !n.kids.is_empty()).unwrap_or(false)
+}
+
+/// 运行期 id（来自 `Geom.tree_ids`，是 `String`）→ 树里的 `&'static str`。
+/// 树里的 id 是编译期常量，这里做一次查表拿回静态串，`settings_interact_sel`
+/// 才能存 `&'static str`（不引入 Rc/泄漏）。
+pub fn interact_id_static(id: &str) -> Option<&'static str> {
+    fn walk(id: &str, nodes: &[InteractNode]) -> Option<&'static str> {
+        for n in nodes {
+            if n.id == id {
+                return Some(n.id);
+            }
+            if let Some(f) = walk(id, &n.kids) {
+                return Some(f);
+            }
+        }
+        None
+    }
+    walk(id, &interact_tree())
+}
+
+/// 当前选中项的参数名（「选中样式 › 竖线宽度」里只显示末级）。
+fn interact_param_label(id: &str) -> &'static str {
+    match id {
+        "selbar.w" => "宽度（厚度）",
+        "selbar.h" => "高度（0 = 跟行高）",
+        "selbar.stroke" => "描边粗细（空心时生效）",
+        "selbar.hollow" => "空心（只描边不填色）",
+        _ => "参数",
+    }
+}
+
+/// 当前选中项的参数值文本。
+fn interact_param_value(app: &App, id: &str) -> String {
+    let sb = &app.cfg.ui.sel_bar;
+    match id {
+        "selbar.w" => format!("{} DIP", sb.w),
+        "selbar.h" => {
+            if sb.h == 0 {
+                "自动（跟行高）".to_string()
+            } else {
+                format!("{} DIP", sb.h)
+            }
+        }
+        "selbar.stroke" => format!("{} DIP", sb.stroke),
+        "selbar.hollow" => if sb.hollow { "开" } else { "关" }.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// 「交互」页的树定义（第34轮：改成与「外观」同构的左树 + 右预览）。
+///
+/// 结构照「外观」页的三级圆角树：一组语义分组，组下是可调项。分组本身
+/// 不可调（点它只是展开/收起）—— 交互设置不像圆角那样有"组级默认值"，
+/// 硬造一个组级滑杆只会让人调了个不存在的东西。
+pub struct InteractNode {
+    pub id: &'static str,
+    pub name: &'static str,
+    /// Some(action) = 可调项；None = 纯分组
+    pub action: Option<u32>,
+    pub kids: Vec<InteractNode>,
+}
+
+fn inode(id: &'static str, name: &'static str, action: Option<u32>, kids: Vec<InteractNode>) -> InteractNode {
+    InteractNode { id, name, action, kids }
+}
+
+pub fn interact_tree() -> Vec<InteractNode> {
+    vec![inode(
+        "selbar",
+        "选中行首竖线",
+        None,
+        vec![
+            inode("selbar.w", "宽度", Some(4000), vec![]),
+            inode("selbar.h", "高度", Some(4003), vec![]),
+            inode("selbar.stroke", "描边粗细", Some(4006), vec![]),
+            inode("selbar.hollow", "空心", Some(4009), vec![]),
+        ],
+    )]
+}
+
+fn interact_find<'a>(id: &str, nodes: &'a [InteractNode]) -> Option<&'a InteractNode> {
+    for n in nodes {
+        if n.id == id {
+            return Some(n);
+        }
+        if let Some(f) = interact_find(id, &n.kids) {
+            return Some(f);
+        }
+    }
+    None
+}
+
+/// 选中项的完整路径，例如 "选中样式 › 竖线宽度"。
+pub fn interact_label(id: &str) -> String {
+    fn walk(id: &str, nodes: &[InteractNode], acc: &mut Vec<&'static str>) -> bool {
+        for n in nodes {
+            let mut a2 = acc.clone();
+            a2.push(n.name);
+            if n.id == id {
+                *acc = a2;
+                return true;
+            }
+            if walk(id, &n.kids, &mut a2) {
+                *acc = a2;
+                return true;
+            }
+        }
+        false
+    }
+    let mut acc = Vec::new();
+    if walk(id, &interact_tree(), &mut acc) {
+        acc.join(" › ")
+    } else {
+        id.to_string()
+    }
+}
+
+/// 「交互」页四行参数：**选中行首竖线**的形状。
 ///
 /// action 编码（避开 1000 插件 / 2000 快捷键 / 3000 系统菜单段）：
 ///   宽 base=4000（−=4001  +=4002）
@@ -2136,7 +2348,106 @@ fn paint_interact(app: &App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
     let px = |v: f32| (v * s).round() as i32;
     let btn_w = (26.0 * s).round() as i32;
 
-    // —— 四行参数（几何来自 interact_rows）——
+    // —— 左侧树（与外观页同一套画法：缩进 + 展开三角 + 行尾当前值）——
+    let rows = interact_tree_rows(app);
+    for (i, r) in g.tree_rows.iter().enumerate() {
+        let info = rows.get(i);
+        let id = g.tree_ids.get(i).map(|s| s.as_str()).unwrap_or("");
+        // 选中判定：树节点 id 与当前选中项相同**或同属一棵子树**
+        let selected = app
+            .settings_interact_sel
+            .map(|sel| sel == id || sel.starts_with(&format!("{id}.")))
+            .unwrap_or(false);
+        let hover = app.settings_hover_tree == Some(i);
+        let bg = if selected {
+            th.selection_bg
+        } else if hover {
+            th.row_hover
+        } else {
+            th.surface
+        };
+        fill_rect(hdc, r, bg);
+        let depth = info.map(|v| v.depth).unwrap_or(0);
+        let indent = px(14.0) * depth as i32 + px(6.0);
+        let mut gr = *r;
+        gr.left += indent;
+        gr.right = gr.left + px(16.0);
+        if info.map(|v| v.has_kids).unwrap_or(false) {
+            let glyph = if info.map(|v| v.open).unwrap_or(false) { "\u{E70D}" } else { "\u{E76C}" };
+            text(hdc, &gr, glyph, th.text_dim, paint::glyph_font(s));
+        }
+        let mut tr = *r;
+        tr.left = gr.right;
+        tr.right = r.right - px(66.0);
+        set_color(hdc, if selected { th.text } else { th.text_dim });
+        paint::draw_text(
+            hdc,
+            info.map(|v| v.name).unwrap_or("?"),
+            tr,
+            DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS,
+        );
+        // 行尾写当前值（可调项才有 —— 分组行右边留空）
+        if info.and_then(|v| v.action).is_some() && !id.is_empty() {
+            let mut vr = *r;
+            vr.left = tr.right;
+            vr.right = r.right - px(6.0);
+            text(hdc, &vr, &interact_param_value(app, id), th.text_dim, paint::ui_font(s));
+        }
+    }
+
+    // —— 右侧：当前选中项的大预览 ——
+    let pv = g.preview;
+    if pv.right > pv.left && pv.bottom > pv.top {
+        // 标题：完整路径（"选中样式 › 竖线宽度"）
+        let mut head = RECT { left: pv.left, top: pv.top, right: pv.right, bottom: pv.top + px(20.0) };
+        set_color(hdc, th.text_dim);
+        paint::draw_text(
+            hdc,
+            &app
+                .settings_interact_sel
+                .map(interact_label)
+                .unwrap_or_else(|| "选一个设置项".to_string()),
+            head,
+            DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS,
+        );
+
+        // 三条样例：未选中 / 悬停 / 选中 —— 选中那条才画竖线，
+        // 这样用户能对照出"竖线只出现在选中态"这件事。
+        // 三条**等分**剩下的高度，但每条有上限（56px）；预览区比三条所需
+        // 高得多时**整体垂直居中** —— 让三条挤在顶部、底下留一大片空白，
+        // 看着像没画完（第一版就是这样：参数行被甩到窗口最底）。
+        let head_h = px(28.0);
+        let avail = (pv.bottom - pv.top - head_h - px(10.0)).max(px(60.0));
+        let gap = px(10.0);
+        let want = ((avail - gap * 2) / 3).min(px(56.0)).max(px(22.0));
+        let block_h = want * 3 + gap * 2;
+        let top = pv.top + head_h + ((avail - block_h) / 2).max(0);
+        let row_h = want;
+        let samples: [(&str, COLORREF, bool); 3] = [
+            ("未选中", th.window_bg, false),
+            ("鼠标悬停", th.row_hover, false),
+            ("已选中", th.selection_bg, true),
+        ];
+        for (k, (label, fill, sel)) in samples.iter().enumerate() {
+            let sr = RECT {
+                left: pv.left,
+                top: top + k as i32 * (row_h + px(10.0)),
+                right: pv.right,
+                bottom: top + k as i32 * (row_h + px(10.0)) + row_h,
+            };
+            rr(hdc, &sr, app.radius_of("content.selected"), *fill, None);
+            if *sel {
+                unsafe { paint::draw_sel_bar(app, hdc, sr, th) };
+            }
+            let mut tr = sr;
+            tr.left += px(16.0);
+            tr.right = sr.right - px(8.0);
+            set_color(hdc, if *sel { th.selection_text } else { th.text_dim });
+            paint::draw_text(hdc, label, tr, DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
+        }
+    }
+
+    // —— 右侧下方：当前选中项的参数行（[−] 值 [+]）——
     for r in &g.rows {
         fill_rect(hdc, &r.rect, th.surface);
         // 标签
@@ -2165,24 +2476,6 @@ fn paint_interact(app: &App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
             paint::draw_text(hdc, glyph, br, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
         }
     }
-
-    // —— 实时样例：一条选中态行 + 当前参数的竖线 ——
-    let base_y = g.rows.last().map(|r| r.rect.bottom).unwrap_or(g.content.top) + px(20.0);
-    let mut head = RECT { left: g.content.left, top: base_y, right: g.content.right, bottom: base_y + px(20.0) };
-    set_color(hdc, th.text_dim);
-    paint::draw_text(hdc, "预览（真窗口的列表行/磁贴就是这个形状）：", head, DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
-    let sr = RECT {
-        left: g.content.left,
-        top: base_y + px(26.0),
-        right: (g.content.left + px(420.0)).min(g.content.right),
-        bottom: base_y + px(26.0) + px(28.0),
-    };
-    rr(hdc, &sr, app.radius_of("content.selected"), th.selection_bg, None);
-    unsafe { paint::draw_sel_bar(app, hdc, sr, th) };
-    let mut tr = sr;
-    tr.left += px(16.0);
-    set_color(hdc, th.selection_text);
-    paint::draw_text(hdc, "选中的条目 —— 竖线实时跟着参数走", tr, DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
 }
 
 /// 圆角矩形：填充 + 可选描边。`RoundRect` 的椭圆宽高是**直径**的两倍关系，

@@ -1469,6 +1469,25 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     }
                     Some(settings::Hit::Tree(i)) => {
                         let g = settings::geom(app, &l);
+                        if app.settings_tab == crate::app::SETTINGS_TAB_INTERACT {
+                            // 「交互」页的树（第34轮）：同一份 Hit::Tree，按页分派。
+                            // 分组行 = 展开/收起；叶子行 = 选中它（右侧参数区跟着换）。
+                            if let Some(id) = g.tree_ids.get(i).cloned() {
+                                if settings::interact_has_kids(&id) {
+                                    // 分组：展开/收起（集合存的是 &'static str，
+                                    // 这里把运行期 String 换回静态串）
+                                    if let Some(sid) = settings::interact_id_static(&id) {
+                                        if !app.settings_interact_open.remove(sid) {
+                                            app.settings_interact_open.insert(sid);
+                                        }
+                                    }
+                                } else if let Some(sid) = settings::interact_id_static(&id) {
+                                    app.settings_interact_sel = Some(sid);
+                                }
+                            }
+                            let _ = InvalidateRect(Some(hwnd), None, true);
+                            return LRESULT(0);
+                        }
                         if let Some(id) = g.tree_ids.get(i).cloned() {
                             // 点父节点 = 展开/收起；点叶子 = 只是选中。
                             // 两种都把滑杆指过去，于是顺手就能调。

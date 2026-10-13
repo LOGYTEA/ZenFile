@@ -634,6 +634,10 @@ pub struct App {
     pub settings_hover_tree: Option<usize>,
     /// 「外观」圆角滑杆正被拖着（按下后不松手连续改值）。
     pub settings_radius_drag: bool,
+    /// 「交互」页：当前选中的树节点（None = 只展开分组，没选具体项）。
+    pub settings_interact_sel: Option<&'static str>,
+    /// 「交互」页：哪些分组是展开的。
+    pub settings_interact_open: std::collections::BTreeSet<&'static str>,
     /// 「快捷键」：正在等一个新按键组合的动作名（`None` = 没在录）。
     pub hotkey_capture: Option<String>,
     /// 设置页「右键菜单」右上那块「打开方式」的真实候选程序（程序名 + 图标）。
@@ -1064,6 +1068,10 @@ impl App {
             settings_tree_open: HashSet::new(),
             settings_hover_tree: None,
             settings_radius_drag: false,
+            // 两个分组默认都展开：这一页一共四项，全展开才 6 行，
+            // 藏着反而让用户多点一次（外观页的三级圆角树默认展开也是这个理由）
+            settings_interact_sel: Some("selbar.w"),
+            settings_interact_open: ["selbar", "selbar2"].into_iter().collect(),
             hotkey_capture: None,
             openwith_preview: None,
             menu_preview_items: None,
