@@ -44,6 +44,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, RegisterHotKey, ReleaseCapture, SetCapture, UnregisterHotKey,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
+
+/// `WM_MOUSELEAVE` 属鼠标消息域，`WindowsAndMessaging::*` 的通配带不到
+/// （编译报 not bound in all patterns），这里自己定义一份。
+const WM_MOUSELEAVE: u32 = 0x02A3;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 
@@ -1308,6 +1312,23 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 app.settings_hover = hover_setting;
                 app.sidebar_hover = hover_sidebar;
                 app.addr_hover = hover_addr;
+            // 三大金刚键的 hover **只**在 WM_NCMOUSEMOVE 里更新（那才是
+            // 非客户区消息）。鼠标从标题栏划进客户区时走的是这条
+            // WM_MOUSEMOVE，而这里原本没清 `hover_caption` ——
+            // 于是底色永远卡住，鼠标移到窗口外也不消失（第36轮用户报）。
+            //
+            // **判据必须是"鼠标不在任何键上"**而不是"收到 WM_MOUSEMOVE"：
+            // 客户区和非客户区是两个消息域，鼠标在两者之间来回时两个
+            // move 消息交替到达，早先一收到就清零，结果从标题栏往里划
+            // 还没划到键上就被清掉了 —— 悬停底色反而全没了（第36轮踩过）。
+            let cap = caption_hit(&paint::layout_for(app), x, y);
+            if app.hover_caption != 0 && cap == 0 {
+                app.hover_caption = 0;
+                app.hovering_close = false;
+                if app.pressed_caption != 0 {
+                    app.pressed_caption = 0;
+                }
+            }
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
             LRESULT(0)
@@ -1323,6 +1344,35 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             if h != app.hover_caption {
                 app.hover_caption = h;
                 app.hovering_close = h == 3;
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            LRESULT(0)
+        }
+        // 鼠标完全离开窗口：三大金刚键的悬停/按下态必须一次清干净。
+        // 非客户区与客户区是两个跟踪域，两条 leave 都要接。
+        WM_MOUSELEAVE | WM_NCMOUSELEAVE | WM_CAPTURECHANGED => {
+            let app = &mut *app_ptr;
+            let dirty = app.hover_caption != 0
+                || app.pressed_caption != 0
+                || app.hovering_close;
+            app.hover_caption = 0;
+            app.pressed_caption = 0;
+            app.hovering_close = false;
+            if dirty {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            LRESULT(0)
+        }
+        // 窗口失活（Alt+Tab、点别的程序、锁屏…）：悬停态必须清。
+        // 这一条才是"鼠标移出窗口外"最可靠的信号 —— 没有 TrackMouseEvent
+        // 时鼠标从非客户区直接划出窗口，可能一条 move 消息都收不到，
+        // 底色就永远卡在最后一个键上（第36轮用户报的就是这个）。
+        WM_ACTIVATE if wparam.0 & 0xFFFF == 0 => {
+            let app = &mut *app_ptr;
+            let dirty = app.hover_caption != 0 || app.hovering_close;
+            app.hover_caption = 0;
+            app.hovering_close = false;
+            if dirty {
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
             LRESULT(0)
