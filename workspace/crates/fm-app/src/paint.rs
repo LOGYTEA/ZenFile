@@ -4534,6 +4534,17 @@ unsafe fn call_old(old: isize, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
 }
 
 unsafe extern "system" fn addr_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // 滚轮转发（第41轮）：WM_MOUSEWHEEL 发给**焦点窗口**，焦点在框里时
+    // 主窗口收不到 → 列表滚不动，看着像卡死。主窗口按屏幕坐标取点，
+    // lparam 原样转发即可。
+    if msg == windows::Win32::UI::WindowsAndMessaging::WM_MOUSEWHEEL {
+        if let Ok(parent) = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd) {
+            if !parent.0.is_null() {
+                let _ = SendMessageW(parent, msg, Some(wparam), Some(lparam));
+                return LRESULT(0);
+            }
+        }
+    }
     if msg == WM_KEYDOWN && wparam.0 as i32 == 0x0D {
         crate::on_address_enter();
         return LRESULT(0);
@@ -4562,6 +4573,17 @@ unsafe extern "system" fn search_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
     // 空态提示要不要显示，都取决于"现在是不是空的"。
     if msg == WM_SETTEXT {
         let _ = InvalidateRect(Some(hwnd), None, true);
+    }
+    // 滚轮转发（第41轮）：WM_MOUSEWHEEL 发给**焦点窗口**，焦点在框里时
+    // 主窗口收不到 → 列表滚不动，看着像卡死。主窗口按屏幕坐标取点，
+    // lparam 原样转发即可。
+    if msg == windows::Win32::UI::WindowsAndMessaging::WM_MOUSEWHEEL {
+        if let Ok(parent) = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd) {
+            if !parent.0.is_null() {
+                let _ = SendMessageW(parent, msg, Some(wparam), Some(lparam));
+                return LRESULT(0);
+            }
+        }
     }
     let r = call_old(SEARCH_OLD, hwnd, msg, wparam, lparam);
     // 放大镜和空态提示必须画在 EDIT **自己画完之后**：画在父窗口上会被 EDIT

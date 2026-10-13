@@ -1444,6 +1444,20 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 paint::end_address_edit(app, true);
                 paint::sync_address(app);
             }
+            // 搜索框同理（第41轮用户报"点搜索栏外的位置关不掉了"）：子 EDIT
+            // 的通病——点父窗口客户区**不会让它失焦**，WM_KILLFOCUS 不来，
+            // 光标永远闪在框里、之后敲的字全进搜索框、快捷键还被 WM_KEYDOWN
+            // 的"焦点在 EDIT"分支吞掉。焦点探针实锤：点列表后 GetFocus 仍是
+            // 搜索框。点在框上（含它那圈边框）不算——那是框自己的地盘。
+            if !inside(&l.search, x, y) {
+                unsafe {
+                    if windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() == app.hwnd_search
+                        && !app.hwnd_search.0.is_null()
+                    {
+                        let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(app.hwnd));
+                    }
+                }
+            }
             // 分栏时"点哪一边哪一边就是当前窗格"。必须在任何命中测试之前做：
             // 下面所有分支读的都是 app.tab()，也就是**焦点窗格**的那个标签。
             if app.split() {
@@ -1997,6 +2011,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             if app.addr_editing && !inside(&l.address, x, y) {
                 paint::end_address_edit(app, true);
                 paint::sync_address(app);
+            }
+            // 搜索框：右键别处同样收焦点（同 WM_LBUTTONDOWN，第41轮）
+            if !inside(&l.search, x, y) {
+                unsafe {
+                    if windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() == app.hwnd_search
+                        && !app.hwnd_search.0.is_null()
+                    {
+                        let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(app.hwnd));
+                    }
+                }
             }
             let header_h = header_height(app);
             let view_top = l.view.top + header_h;
@@ -3335,6 +3359,16 @@ pub(crate) fn on_edit_escape() {
     app.search_ticks = 0;
     app.reload();
     app.invalidate();
+    // Esc 之后焦点别留在空框里闪（第41轮"关不掉"的另一半）：和资源管理器
+    // 一致，交还主窗口。地址栏那条在 end_address_edit(true) 里已交过，
+    // 这里补搜索框 —— 焦点还挂在它身上就说明刚才 Esc 是从搜索框按的。
+    unsafe {
+        if windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() == app.hwnd_search
+            && !app.hwnd_search.0.is_null()
+        {
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(app.hwnd));
+        }
+    }
 }
 
 pub(crate) fn on_rename_commit() {
