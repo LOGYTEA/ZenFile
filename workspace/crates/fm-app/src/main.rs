@@ -3045,23 +3045,19 @@ unsafe fn handle_hit_test(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     // 收不到 WM_LBUTTONDOWN —— 表现是"顶部标签点不动、拖不动，还会把整个
     // 窗口拖跑"（绘制与命中必须共用同一判定）。
     let has_top_tabs = true;
-    // 标题栏上的自有控件（侧栏开关 / 更多菜单 / 新建标签 / 三大金刚键）所在
-    // 的位置一律不算边框 —— 它们本来就压在窗口最外侧那几像素上。
-    let on_caption_ctrl = inside(&l.sidebar_toggle, pt.x, pt.y)
-        || inside(&l.menu_btn, pt.x, pt.y)
-        || inside(&l.min_btn, pt.x, pt.y)
-        || inside(&l.max_btn, pt.x, pt.y)
-        || inside(&l.close_btn, pt.x, pt.y)
-        || (has_top_tabs
-            && (0..app.tab_count()).any(|i| inside(&l.tab_rect(i, app.tab_count(), &app.metrics), pt.x, pt.y)))
-        || (has_top_tabs && plus.right < l.tabs.right && inside(&plus, pt.x, pt.y));
 
     // 四边 + 四角。**必须放在标题栏判定之前**：标题栏占着窗口顶上那一长条，
     // 先判标题栏的话顶边永远拿不到 HTTOP。
     // 之前这一节有三个错叠在一起：左右两边多带了 `pt.y > l.view.top`（顶边那一
     // 截直接漏成 HTCLIENT），上边拿 `l.sidebar.top`（**窗格**的上沿）当窗口上沿，
     // 四角又完全没判 —— 于是四面只有底边那 4px 能拉伸。
-    if !on_caption_ctrl {
+    //
+    // **无条件判**：这一节早先还包在一个 `if !on_caption_ctrl` 里 —— 标题栏自有
+    // 控件（侧栏开关 / 新建标签 / 三大金刚键）压着窗口最外侧那几像素时，整条拉伸
+    // 带被吃掉，表现是"顶边左端、右上角、左边上端这些位置鼠标不变成拖拽指针"。
+    // 拉伸带只有 border(≈4px) 宽，只盖住按钮贴边的最顶端几像素，和原生窗口的
+    // resize 框行为一致 —— 按钮本体（y > border）照常命中 HTMINBUTTON/HTCLOSE。
+    {
         let on_left = pt.x < border;
         let on_right = pt.x >= w - border;
         let on_top = pt.y < border;
