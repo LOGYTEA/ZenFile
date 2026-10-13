@@ -1300,6 +1300,9 @@ fn paint_tab_strip(app: &mut App, hdc: HDC, l: &Layout, pi: usize) {
     if n == 0 {
         return;
     }
+    // 分栏（一个标签内多个窗口）时，顶部这个标签的文字 = 「A丨B丨C」
+    // （用户要求：2 个以上同样）。每窗格单标签，故顶部条就这一个标签。
+    let split_title = app.split_title();
     unsafe {
         let font = ui_font(app.metrics.scale);
         let old = SelectObject(hdc, font.into());
@@ -1374,7 +1377,12 @@ fn paint_tab_strip(app: &mut App, hdc: HDC, l: &Layout, pi: usize) {
             tr.left = icon_x + icon_s + (6.0 * app.metrics.scale).round() as i32;
             // 现在每个标签都有 ×，这块地方无条件留出来，不能按 hover 态变
             tr.right -= (18.0 * app.metrics.scale) as i32;
-            draw_text(hdc, &tab.title, tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+            // 分栏时唯一标签显示「A丨B丨C」，单窗格照旧显示自己的目录名
+            let title = split_title
+                .as_deref()
+                .filter(|_| i == app.panes[pi].active)
+                .unwrap_or(&tab.title);
+            draw_text(hdc, title, tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
             if i == app.panes[pi].active {
                 let accent = CreateSolidBrush(t.accent);
                 let line = RECT { left: r.left, top: r.bottom - 2, right: r.right, bottom: r.bottom };

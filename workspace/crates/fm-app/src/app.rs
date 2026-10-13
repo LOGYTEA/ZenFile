@@ -1447,6 +1447,27 @@ impl App {
         self.panes.len() > 1
     }
 
+    /// 分栏时顶部标签要显示成「A丨B丨C」：把所有窗格当前目录名用 丨 串起来
+    /// （用户要求：一个标签内多个窗口时标签名改成 xx丨xx，2 个以上同样）。
+    ///
+    /// 不分栏（或只剩一个窗格）返回 None，标签照旧用普通单目录名。
+    pub fn split_title(&self) -> Option<String> {
+        if !self.split() {
+            return None;
+        }
+        let names: Vec<String> = self
+            .panes
+            .iter()
+            .filter_map(|p| p.tabs.get(p.active))
+            .map(|t| t.title.clone())
+            .collect();
+        if names.len() >= 2 {
+            Some(names.join("丨"))
+        } else {
+            None
+        }
+    }
+
     /// 把一个标签"贴"进某个窗格区域。
     ///
     /// `zone` 决定新窗格放在哪一侧；已有窗格被压缩到剩下那一侧。
