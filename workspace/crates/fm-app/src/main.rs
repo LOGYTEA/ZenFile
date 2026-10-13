@@ -10,6 +10,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod icon_theme;
 mod icons;
 mod menu;
 mod openwith;
@@ -1707,6 +1708,18 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     // 被 >=3000 拦走当成系统菜单开关。
                     Some(settings::Hit::Row(action)) if (4001..=4099).contains(&action) => {
                         settings::apply_sel_bar_action(app, action);
+                        let _ = InvalidateRect(Some(hwnd), None, true);
+                    }
+                    // 图标主题（第48轮，设置-外观页）：4101/4102 风格，4103/4104 颜色。
+                    // **必须排在下面 >= 3000 的系统菜单分支之前**，否则会被当成
+    // 注册表开关（第35轮同款顺序坑）。
+                    Some(settings::Hit::Row(action)) if (4101..=4104).contains(&action) => {
+                        match action {
+                            4101 => app.set_icon_style("square"),
+                            4102 => app.set_icon_style("round"),
+                            4103 => app.set_icon_tone("mono"),
+                            _ => app.set_icon_tone("color"),
+                        }
                         let _ = InvalidateRect(Some(hwnd), None, true);
                     }
                     Some(settings::Hit::Row(action)) if action >= 3000 => {

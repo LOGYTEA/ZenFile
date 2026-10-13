@@ -1078,6 +1078,12 @@ impl App {
             .filter(|(_, v)| matches!(v.as_str(), "details" | "list" | "medium" | "large"))
             .map(|(k, v)| (k.clone(), parse_view(v)))
             .collect();
+        // 图标主题在第一帧绘制之前就位（直角黑白 = 默认，等价于不接管）。
+        crate::icon_theme::set_theme(
+            &cfg.ui.icon_style,
+            &cfg.ui.icon_tone,
+            cfg.core.theme != "light",
+        );
         Self {
             hwnd,
             hwnd_address: HWND(std::ptr::null_mut()),
@@ -3836,7 +3842,53 @@ impl App {
         let _ = fm_core::config::Config::save_user_patch(&serde_json::json!({
             "core": { "theme": next }
         }));
+        // 黑白图标套按明暗主题换墨色（暗底浅墨 / 亮底深墨），主题一换要重烘。
+        self.apply_icon_theme();
         self.invalidate();
+    }
+
+    /// 图标风格：`square`（直角 = 系统图标）/ `round`（圆角 = 自绘）。
+    pub fn set_icon_style(&mut self, style: &str) {
+        if self.cfg.ui.icon_style == style {
+            return;
+        }
+        self.cfg.ui.icon_style = style.to_string();
+        self.persist_icon_prefs();
+        self.apply_icon_theme();
+        self.invalidate();
+    }
+
+    /// 图标颜色：`mono`（黑白）/ `color`（彩色）。
+    pub fn set_icon_tone(&mut self, tone: &str) {
+        if self.cfg.ui.icon_tone == tone {
+            return;
+        }
+        self.cfg.ui.icon_tone = tone.to_string();
+        self.persist_icon_prefs();
+        self.apply_icon_theme();
+        self.invalidate();
+    }
+
+    fn persist_icon_prefs(&self) {
+        if let Err(e) = fm_core::config::Config::save_user_patch(&serde_json::json!({
+            "ui": {
+                "icon_style": self.cfg.ui.icon_style,
+                "icon_tone": self.cfg.ui.icon_tone,
+            }
+        })) {
+            eprintln!("保存图标偏好失败: {e}");
+        }
+    }
+
+    /// 把当前配置的图标主题落到图标系统上（启动 / 切换 / 换明暗时调）。
+    pub fn apply_icon_theme(&mut self) {
+        let dark = self.cfg.core.theme != "light";
+        crate::icon_theme::set_theme(
+            &self.cfg.ui.icon_style,
+            &self.cfg.ui.icon_tone,
+            dark,
+        );
+        self.icons.on_theme_changed();
     }
 
     pub fn set_default_view(&mut self, idx: usize) {
@@ -3863,6 +3915,8 @@ impl App {
         let _ = fm_core::config::Config::save_user_patch(&serde_json::json!({
             "core": { "theme": next }
         }));
+        // 黑白图标套按明暗换墨色（同 set_theme）。
+        self.apply_icon_theme();
         self.invalidate();
     }
 

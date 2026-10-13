@@ -80,6 +80,23 @@ pub struct UiConfig {
     /// 恢复时也整套走 `SetWindowPlacement`，两边同一套坐标系不打架。
     #[serde(default)]
     pub window: WindowConfig,
+    /// 图标风格：`square`（直角）/ `round`（圆角）。
+    ///
+    /// 默认 square = 现在这套系统 Shell 图标（第48轮：4 套图标 =
+    /// 风格 × 颜色，直角黑白就是"现在这套"，零回归）。
+    #[serde(default = "default_icon_style")]
+    pub icon_style: String,
+    /// 图标颜色：`mono`（黑白）/ `color`（彩色）。默认黑白。
+    #[serde(default = "default_icon_tone")]
+    pub icon_tone: String,
+}
+
+fn default_icon_style() -> String {
+    "square".to_string()
+}
+
+fn default_icon_tone() -> String {
+    "mono".to_string()
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

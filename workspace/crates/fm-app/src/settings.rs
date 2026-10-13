@@ -23,6 +23,7 @@ use windows::Win32::Graphics::Gdi::{
     PS_SOLID, TRANSPARENT,
 };
 use windows::Win32::Foundation::POINT;
+use windows::Win32::UI::WindowsAndMessaging::HICON;
 
 use crate::app::{App, SETTINGS_TABS};
 use crate::paint::{self, Layout};
@@ -539,6 +540,12 @@ pub struct Geom {
     pub preview: RECT,
     /// 「外观」：圆角滑杆
     pub slider: RECT,
+    /// 「外观」：图标主题 4 颗按钮（0直角 1圆角 2黑白 3彩色）。
+    ///
+    /// 点击区与绘制共用；对应 `Hit::Row(4101 + i)`。
+    pub icon_btns: [RECT; 4],
+    /// 「外观」：图标样例条里每枚样例图标的位置（绘制用，不可点）。
+    pub icon_samples: Vec<RECT>,
     /// 「右键菜单」：左侧那块**真实渲染**的菜单面板
     pub menu_panel: RECT,
     /// 菜单面板里每一条（分隔线不占）的矩形与条目下标
@@ -659,6 +666,8 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
         tree_actions: Vec::new(),
         preview: RECT::default(),
         slider: RECT::default(),
+        icon_btns: [RECT::default(); 4],
+        icon_samples: Vec::new(),
         menu_panel: RECT::default(),
         menu_rows: Vec::new(),
         menu_idx: Vec::new(),
@@ -829,7 +838,8 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
             g.dock = RECT::default();
         }
         crate::app::SETTINGS_TAB_LOOK => {
-            // 左 44% 是三级树，右边是**实时预览**（上半）+ 圆角滑杆（下半）。
+            // 左 44% 是三级树，右边是**实时预览**（上半）+ 圆角滑杆（下半）
+            // + 图标主题（第48轮：风格/颜色 + 样例条）。
             // 预览画的是这个软件自己那一套组件的真实样式，改圆角当场看得见。
             let tree_w = (content.right - content.left) * 44 / 100;
             let rh = px(28.0);
@@ -848,7 +858,12 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
                 y += rh;
             }
             let pv_left = content.left + tree_w + px(14.0);
-            let pv_h = (content.bottom - content.top) * 62 / 100;
+            // 右列排布（自上而下）：预览 → 滑杆 → 图标风格/颜色按钮 → 样例条。
+            // 预览按剩余空间算而不是固定比例 —— 下面多了图标区，62% 会挤爆。
+            let icon_h = px(30.0) * 2 + px(8.0) + px(46.0) + px(12.0);
+            let pv_h = ((content.bottom - content.top) * 52 / 100)
+                .min((content.bottom - content.top) - px(12.0) - px(34.0) - icon_h)
+                .max(px(150.0));
             g.preview = RECT {
                 left: pv_left,
                 top: content.top,
@@ -861,6 +876,35 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
                 right: content.right,
                 bottom: content.top + pv_h + px(12.0) + px(34.0),
             };
+            // 图标主题：风格一行 + 颜色一行，每行两颗按钮（左标签 + 右两颗）
+            let iy = g.slider.bottom + px(12.0);
+            let bw = px(72.0);
+            let gap = px(6.0);
+            let label_w = px(52.0);
+            for row in 0..2 {
+                let ry = iy + (px(30.0) + px(8.0)) * row as i32;
+                let x0 = g.slider.right - label_w - bw * 2 - gap * 2;
+                for k in 0..2 {
+                    let bx = x0 + (bw + gap) * k as i32;
+                    g.icon_btns[row * 2 + k] = RECT {
+                        left: bx,
+                        top: ry,
+                        right: bx + bw,
+                        bottom: ry + px(30.0),
+                    };
+                }
+            }
+            // 样例条：两行按钮下方一排 6 枚样例图标（跟随当前主题实时变）
+            let sy = iy + (px(30.0) + px(8.0)) * 2;
+            g.icon_samples = Vec::new();
+            let isz = px(32.0);
+            let istep = px(42.0);
+            for k in 0..6 {
+                let x0 = g.slider.right - label_w - istep * 6 + (istep - isz) / 2 + istep * k as i32;
+                if x0 + isz <= g.slider.right {
+                    g.icon_samples.push(RECT { left: x0, top: sy + px(6.0), right: x0 + isz, bottom: sy + px(6.0) + isz });
+                }
+            }
         }
         crate::app::SETTINGS_TAB_HOTKEY => {
             g.rows = hotkey_rows(app, &content);
@@ -970,6 +1014,13 @@ pub fn hit(app: &App, l: &Layout, x: i32, y: i32) -> Option<Hit> {
     }
     if g.slider.right > g.slider.left && inside(&g.slider, x, y) {
         return Some(Hit::RadiusSlider(x));
+    }
+    // 图标主题 4 颗按钮（第48轮）：动作号 4101..=4104。
+    // 排在圆角树之后、通用行之前 —— 它们在右列，与左侧树不重叠。
+    for (i, r) in g.icon_btns.iter().enumerate() {
+        if r.right > r.left && inside(r, x, y) {
+            return Some(Hit::Row(4101 + i as u32));
+        }
     }
     // 「交互」页：行右端 [−][+] 两颗小按钮，点按钮才动值；点标签区 = 无操作
     //（4099 占位，防它掉进 main.rs 里 3000+ 的系统菜单 Row 分支）。
@@ -2708,6 +2759,96 @@ fn paint_look(app: &mut App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
 
     // —— 滑杆 ——
     draw_slider(app, hdc, &g.slider, th, s);
+
+    // —— 图标主题（第48轮）：风格/颜色两行按钮 + 样例条 ——
+    draw_icon_section(app, hdc, g, th, s);
+}
+
+/// 「外观」页底部的图标主题区块：两行分段按钮 + 一排实时样例。
+///
+/// 样例直接走 `IconCache` —— 主题一切换，样例跟着变，所见即所得。
+fn draw_icon_section(app: &mut App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
+    if g.icon_btns[0].right <= g.icon_btns[0].left {
+        return;
+    }
+    let px = |v: f32| (v * s).round() as i32;
+    let font = paint::ui_font(s);
+
+    // 行标签（左对齐在按钮组左边）
+    let rows: [(&str, [&str; 2]); 2] =
+        [("图标风格", ["直角", "圆角"]), ("图标颜色", ["黑白", "彩色"])];
+    let cur = [
+        if app.cfg.ui.icon_style == "round" { 1 } else { 0 },
+        if app.cfg.ui.icon_tone == "color" { 1 } else { 0 },
+    ];
+    for (ri, (label, names)) in rows.iter().enumerate() {
+        let btn0 = g.icon_btns[ri * 2];
+        // 标签：贴在按钮组左侧
+        let mut lr = RECT {
+            left: btn0.left - px(58.0),
+            top: btn0.top,
+            right: btn0.left - px(6.0),
+            bottom: btn0.bottom,
+        };
+        text(hdc, &lr, label, th.text_dim, font);
+        for k in 0..2 {
+            let r = g.icon_btns[ri * 2 + k];
+            let selected = cur[ri] as i32 == k as i32;
+            let hover = app.settings_hover == Some(4101 + (ri * 2 + k) as u32);
+            let bg = if selected {
+                th.selection_bg
+            } else if hover {
+                th.hover_bg
+            } else {
+                th.surface
+            };
+            // 按钮底：圆角跟「标题栏按钮」那档走（都是 chrome 小控件）
+            unsafe { paint::fill_radius(app, hdc, "title.button", &r, bg, None) };
+            if selected {
+                // 选中态加一条强调下划线，与标签激活态同一套语言
+                fill_rect(
+                    hdc,
+                    &RECT { left: r.left + px(4.0), top: r.bottom - px(3.0), right: r.right - px(4.0), bottom: r.bottom - px(1.0) },
+                    th.accent,
+                );
+            }
+            let mut tr = r;
+            tr.top += px(1.0);
+            text(hdc, &tr, names[k], if selected { th.text } else { th.text_dim }, font);
+        }
+    }
+
+    // —— 样例条：6 枚当前主题的图标（文件夹/文本/图片/压缩包/驱动器/回收站）——
+    if g.icon_samples.is_empty() {
+        return;
+    }
+    let label_r = RECT {
+        left: g.icon_samples[0].left - px(58.0),
+        top: g.icon_samples[0].top,
+        right: g.icon_samples[0].left - px(6.0),
+        bottom: g.icon_samples[0].bottom,
+    };
+    text(hdc, &label_r, "样例", th.text_dim, font);
+    let icons: Vec<HICON> = vec![
+        app.icons.icon(true, "", true),
+        app.icons.icon(false, "txt", true),
+        app.icons.icon(false, "png", true),
+        app.icons.icon(false, "zip", true),
+        crate::icons::stock_icon(windows::Win32::UI::Shell::SIID_DRIVEFIXED.0, true)
+            .unwrap_or_default(),
+        crate::icons::stock_icon(
+            windows::Win32::UI::Shell::SIID_RECYCLER.0,
+            true,
+        )
+        .unwrap_or_default(),
+    ];
+    for (i, r) in g.icon_samples.iter().enumerate() {
+        if let Some(h) = icons.get(i) {
+            if !h.0.is_null() {
+                app.icons.draw(hdc, *h, r.left, r.top, r.right - r.left);
+            }
+        }
+    }
 }
 
 /// 「交互」页：**选中行首竖线**的四个参数 + 实时样例。

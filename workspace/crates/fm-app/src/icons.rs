@@ -145,6 +145,18 @@ impl IconCache {
     /// `desktop.ini` 自定义图标、驱动器图标）必须走 [`Self::dir_icon`]。
     /// 返回的 HICON 由本缓存持有，不要调用方销毁。
     pub fn icon(&mut self, is_dir: bool, extension: &str, large: bool) -> HICON {
+        // 图标主题接管时（第48轮）：按类型/扩展名直接给自绘图标，
+        // 不进系统缓存表 —— 两张表存的是系统图标句柄，混放两套会互相顶掉。
+        if crate::icon_theme::active() {
+            let kind = if is_dir {
+                crate::icon_theme::Kind::Folder
+            } else {
+                crate::icon_theme::ext_kind(extension)
+            };
+            if let Some(h) = crate::icon_theme::get(kind, if large { 32 } else { 16 }) {
+                return h;
+            }
+        }
         let key = if is_dir {
             "dir".to_string()
         } else {
@@ -202,6 +214,14 @@ impl IconCache {
     /// `IconResource` 负资源 ID 也好、`IconFile`+`IconIndex` 也好），返回的正是
     /// 资源管理器里看到的那个图标；驱动器根还会直接给硬盘图标。
     pub fn dir_icon(&mut self, path: &Path, large: bool) -> HICON {
+        // 主题接管：按路径语义给自绘图标（盘符根/已知文件夹/通用文件夹），
+        // 不问 Shell —— desktop.ini 自定义图标只属于"直角黑白=系统"这套。
+        if crate::icon_theme::active() {
+            let kind = crate::icon_theme::dir_kind(path);
+            if let Some(h) = crate::icon_theme::get(kind, if large { 32 } else { 16 }) {
+                return h;
+            }
+        }
         self.path_icon(path, large)
             .unwrap_or_else(|| self.icon(true, "", large))
     }
@@ -212,6 +232,14 @@ impl IconCache {
     /// 其余按扩展名拿通用图标（上千个 .txt 逐个问 Shell 没意义，纯属浪费）。
     pub fn file_icon(&mut self, path: &Path, extension: &str, large: bool) -> HICON {
         let ext = extension.trim_start_matches('.').to_ascii_lowercase();
+        // 主题接管：统一按扩展名归类（exe/lnk 这类"图标只属于它自己"的
+        // 也走主题 —— 一套图标的观感一致性优先于单个程序的原生图标）。
+        if crate::icon_theme::active() {
+            let kind = crate::icon_theme::ext_kind(&ext);
+            if let Some(h) = crate::icon_theme::get(kind, if large { 32 } else { 16 }) {
+                return h;
+            }
+        }
         if !PER_FILE_ICON_EXT.contains(&ext.as_str()) {
             return self.icon(false, &ext, large);
         }
@@ -541,6 +569,34 @@ impl IconCache {
         }
     }
 
+    /// 图标主题切换之后的失效（第48轮）。
+    ///
+    /// 两张按扩展名/路径归并的表（small/large/dir）存的是**上一套主题或系统**
+    /// 的 HICON：主题一换它们就全过期（圆角变直角、彩色变黑白），不清的话
+    /// 列表会一直显示旧主题。派生表（upscaled/scaled_thumbs）的 key 是句柄值，
+    /// 句柄销毁后会被 GDI 复用 —— 一起清（第39轮审计 #14 同款纪律）。
+    ///
+    /// 缩略图（thumbs）不动：真实图片内容与图标主题无关。
+    pub fn on_theme_changed(&mut self) {
+        for (_, h) in self.small.drain() {
+            if !h.0.is_null() {
+                unsafe {
+                    let _ = DestroyIcon(h);
+                }
+            }
+        }
+        for (_, h) in self.large.drain() {
+            if !h.0.is_null() {
+                unsafe {
+                    let _ = DestroyIcon(h);
+                }
+            }
+        }
+        self.clear_path_icons();
+        // 菜单位图是烘好的位图，同样随主题过期。
+        clear_menu_bmp();
+    }
+
     /// 文件落地之后把**路径相关**的图标缓存作废。
     ///
     /// `dir` 缓存存的是 `Option`：一次查询失败会记成 `None`，之后永远不再问。
@@ -747,6 +803,15 @@ fn shell_thumb(path: &Path, size: i32) -> Option<HBITMAP> {
 static mut STOCK: Option<Vec<(i32, bool, HICON)>> = None;
 
 pub fn stock_icon(siid: i32, large: bool) -> Option<HICON> {
+    // 主题接管：认识的库存 id（此电脑/回收站/驱动器/文件夹）给自绘图标，
+    // 不认识的照旧问 Shell。
+    if crate::icon_theme::active() {
+        if let Some(k) = crate::icon_theme::stock_kind(siid) {
+            if let Some(h) = crate::icon_theme::get(k, if large { 32 } else { 16 }) {
+                return Some(h);
+            }
+        }
+    }
     unsafe {
         let cache = STOCK.get_or_insert_with(Vec::new);
         if let Some((_, _, h)) = cache.iter().find(|(s, l, _)| *s == siid && *l == large) {
@@ -798,9 +863,33 @@ pub fn folder_menu_bmp() -> Option<isize> {
     menu_bmp_for("\u{0001}folder")
 }
 
+/// 清菜单位图缓存（图标主题切换后调用：位图是按旧主题烘的）。
+fn clear_menu_bmp() {
+    unsafe {
+        if let Some(cache) = MENU_BMP.as_mut() {
+            for (_, b) in cache.drain(..) {
+                if !b.is_invalid() {
+                    let _ = DeleteObject(b.into());
+                }
+            }
+        }
+    }
+}
+
 /// 菜单位图要的 HICON：这里**不能**走 IconCache（它是 &mut 且属于 App，
 /// 菜单行是在 &App 下构建的），所以单独用 SHGetFileInfo 取一次并缓存住。
 fn icon_for_menu(key: &str) -> HICON {
+    // 主题接管：菜单里的类型图标与列表同一套（否则列表圆角、菜单直角割裂）。
+    if crate::icon_theme::active() {
+        let kind = if key.starts_with('\u{0001}') {
+            crate::icon_theme::Kind::Folder
+        } else {
+            crate::icon_theme::ext_kind(key)
+        };
+        if let Some(h) = crate::icon_theme::get(kind, 16) {
+            return h;
+        }
+    }
     let probe = if key.starts_with('\u{0001}') {
         "probe_folder".to_string()
     } else if key.is_empty() {
