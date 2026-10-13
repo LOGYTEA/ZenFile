@@ -549,6 +549,13 @@ pub struct App {
     /// 用条目下标而不是行号：滚动/排序之后行号会变，而"鼠标指着这个东西"不会变。
     /// 列表行和首页磁贴共用这一个字段。
     pub hover_row: Option<usize>,
+    /// `hover_row` 属于第几个窗格（分栏时才有意义）。
+    ///
+    /// `hover_row` 是**条目下标**，两个窗格各自的 entries 下标互不相干 ——
+    /// 只记下标的话，指着右窗格第 3 行，左窗格的第 3 条也会跟着亮。
+    /// 绘制端（paint_panes 逐个窗格切 focus_pane 画）用它把悬停高亮
+    /// 限制在光标真正指着的那个窗格里。
+    pub hover_pane: Option<usize>,
     /// 鼠标是不是悬在导航窗格右上角的折叠按钮上。
     pub hover_sidebar_collapse: bool,
     /// 工具栏左上三个导航按钮的悬停位：0=无，1=返回，2=前进，3=向上。
@@ -608,6 +615,12 @@ pub struct App {
     /// 回收站枚举的世代号。切走又切回来时，上一趟的迟到结果要丢掉，
     /// 否则会把别的视图的显示数据顶掉。
     pub recycle_gen: u64,
+    /// 目录枚举世代号的**全局**发号器（所有标签共用一条计数）。
+    ///
+    /// 不能按 tab 各自 `generation += 1`：两个标签都从 0 起数就会撞号，
+    /// `find_tab_mut` 按 generation 找 tab 时把 A 标签的枚举批次塞进 B 标签
+    /// —— 实测左右分栏后左窗格显示 a∪b 合并、右窗格永久空白（第45轮）。
+    pub generation_seq: u64,
     /// 回收站的排序：`(列序号, 是否降序)`。列序号同 `recycle_columns`：
     /// 0=名称 1=原位置 2=删除时间 3=大小。点列头就切这一列，再点一次换方向。
     pub recycle_sort: (usize, bool),
@@ -1097,6 +1110,7 @@ impl App {
             sidebar_children: HashMap::new(),
             sidebar_hover: None,
             hover_row: None,
+            hover_pane: None,
             hover_sidebar_collapse: false,
             hover_nav: 0,
             hover_header: None,
@@ -1115,6 +1129,7 @@ impl App {
             recycle_sel: HashSet::new(),
             recycle_rx: None,
             recycle_gen: 0,
+            generation_seq: 0,
             recycle_sort: (2, true),
             hover_recycle: None,
             hover_recycle_btn: 0,
@@ -1900,6 +1915,7 @@ impl App {
         // 换了目录，"鼠标指着哪一项"就不再成立（条目下标指向的是上一页的清单）。
         // 不清的话新页面第一行会莫名顶着一条悬停底色。
         self.hover_row = None;
+        self.hover_pane = None;
         let depth = self.cfg.files.navigation.history_depth;
         // 标签标题也走本地化显示名：资源管理器里 `C:\Users` 的标签写的是"用户"，
         // 直接显示盘上真名会让人对不上号。
@@ -2147,8 +2163,9 @@ impl App {
             self.refresh_drives();
             // 先把两个开关拷出来：下面要取 tab 的可变借用，届时再读 self 会撞借用检查
             let (show_hidden, show_system) = (self.show_hidden, self.show_system);
+            let gen = self.next_generation();
             let tab = self.tab_mut();
-            tab.generation += 1;
+            tab.generation = gen;
             tab.entries = entries;
             tab.loading = false;
             tab.recompute_filter(show_hidden, show_system);
@@ -2164,8 +2181,9 @@ impl App {
             return;
         }
         if self.tab().settings {
+            let gen = self.next_generation();
             let tab = self.tab_mut();
-            tab.generation += 1;
+            tab.generation = gen;
             tab.entries.clear();
             tab.visible.clear();
             tab.loading = false;
@@ -2177,12 +2195,12 @@ impl App {
         let search_limit = self.cfg.files.navigation.search_limit;
         let worker_threads = self.cfg.files.operations.worker_threads;
 
+        let generation = self.next_generation();
         let tab = self.tab_mut();
-        tab.generation += 1;
+        tab.generation = generation;
         tab.loading = true;
         tab.entries.clear();
         tab.visible.clear();
-        let generation = tab.generation;
         let path = tab.path.clone();
         let sort = tab.sort;
 
@@ -2401,8 +2419,9 @@ impl App {
                 hidden: h.hidden,
             })
             .collect();
+        let gen = self.next_generation();
         let tab = self.tab_mut();
-        tab.generation += 1;
+        tab.generation = gen;
         tab.entries.clear();
         tab.entries.append(&mut entries);
         tab.sort.sort(&mut tab.entries);
@@ -2527,6 +2546,12 @@ impl App {
         None
     }
 
+    /// 取下一个目录枚举世代号（**全局唯一**，见 `generation_seq` 的注释）。
+    fn next_generation(&mut self) -> u64 {
+        self.generation_seq += 1;
+        self.generation_seq
+    }
+
     // ------------------------------------------------------------ 选择/视图
 
     pub fn row_hit(&self, y: i32, view_top: i32, view_h: i32) -> Option<usize> {
@@ -2632,6 +2657,36 @@ impl App {
         };
         let max = (content - view_h).max(0);
         let tab = self.tab_mut();
+        tab.scroll = tab.scroll.min(max).max(0);
+    }
+
+    /// 滚轮钳制（分栏）：约束的是**光标所在窗格**的标签，不是焦点窗格的。
+    ///
+    /// `pl` 是那个窗格覆写过的布局（列数/行数按窗格宽算），`l` 是全局布局
+    /// （用来认光标落在哪个窗格）。非分栏时退化成 `clamp_scroll_to(pl)`。
+    pub fn clamp_pane_scroll(&mut self, x: i32, y: i32, l: &crate::paint::Layout, pl: &crate::paint::Layout) {
+        if !self.split() {
+            self.clamp_scroll_to(pl);
+            return;
+        }
+        let pi = crate::paint::pane_index_at(self, l, x, y).unwrap_or(self.focus_pane);
+        let view_h = pl.view.bottom - pl.view.top;
+        let metrics = self.metrics;
+        let pi = pi.min(self.panes.len() - 1);
+        let p = &mut self.panes[pi];
+        if p.tabs.is_empty() {
+            return;
+        }
+        let ai = p.active.min(p.tabs.len() - 1);
+        let tab = &mut p.tabs[ai];
+        let content = match tab.view_mode {
+            fm_core::ViewMode::LargeIcons | fm_core::ViewMode::MediumIcons => {
+                let g = crate::paint::icon_grid(pl, &metrics, tab.view_mode);
+                crate::paint::grid_content_h(&g, tab.visible.len())
+            }
+            _ => tab.visible.len() as i32 * metrics.row_height_for(tab.view_mode),
+        };
+        let max = (content - view_h).max(0);
         tab.scroll = tab.scroll.min(max).max(0);
     }
 
@@ -3182,8 +3237,9 @@ impl App {
     fn spawn_recycle_scan(&mut self) {
         // 上一趟还没回来就不再派新的：连续刷新只会堆线程，不会更快。
         if self.recycle_rx.is_some() {
+            let gen = self.next_generation();
             let tab = self.tab_mut();
-            tab.generation += 1;
+            tab.generation = gen;
             tab.entries.clear();
             tab.visible.clear();
             return;
@@ -3228,8 +3284,9 @@ impl App {
         });
         // 先把视图切成"正在读"：旧的条目不清（避免闪一下空白），
         // 只把 loading 点亮，进度条会动。
+        let gen = self.next_generation();
         let tab = self.tab_mut();
-        tab.generation += 1;
+        tab.generation = gen;
         tab.entries.clear();
         tab.visible.clear();
         tab.loading = true;
@@ -3254,8 +3311,9 @@ impl App {
         if done {
             // 分批到达时每批内部有序、批与批之间没有，最后统一排一次
             self.sort_recycle_items();
+            let gen = self.next_generation();
             let tab = self.tab_mut();
-            tab.generation += 1;
+            tab.generation = gen;
             tab.entries.clear();
             tab.visible.clear();
             tab.loading = false;

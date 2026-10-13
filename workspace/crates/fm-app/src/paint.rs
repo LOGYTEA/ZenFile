@@ -2448,8 +2448,19 @@ pub fn split_hit(app: &App, l: &Layout, x: i32, y: i32) -> Option<crate::app::Sp
         return None;
     }
     let header_h = (26.0 * app.metrics.scale) as i32;
-    if y >= l.view.top && y <= l.view.top + header_h {
-        for (i, sx) in header_splits(app, l) {
+    // 分栏时列分隔线画在**窗格自己的表头**上（paint_panes 逐窗格把 view 覆写成
+    // 窗格矩形 + 26px 局部标签条）。拿全局 l.view 判：y 带偏一条标签条、x 原点
+    // 偏半扇窗格 —— 表头上的列边界要么点不中、要么踩到隔壁窗格的列上。
+    let hl = if app.panes.len() > 1 {
+        match pane_index_at(app, l, x, y) {
+            Some(pi) => pane_layout(app, l, pi),
+            None => *l,
+        }
+    } else {
+        *l
+    };
+    if y >= hl.view.top && y <= hl.view.top + header_h {
+        for (i, sx) in header_splits(app, &hl) {
             if (x - sx).abs() <= 4 {
                 return Some(crate::app::Split::Column(i));
             }
@@ -2752,7 +2763,11 @@ fn paint_home(app: &mut App, hdc: HDC, l: &Layout) {
             // 聚焦同样受 focus_visible 约束，首页一打开第 0 块磁贴不该是亮的。
             // 首页磁贴同样给悬停反馈，强度比选中弱一档（见列表行的注释）
             let focused = app.focus_visible && n == focus_row;
-            if !sel && !focused && app.hover_row == Some(tile.index) {
+            if !sel
+                && !focused
+                && app.hover_row == Some(tile.index)
+                && app.hover_pane == Some(app.focus_pane)
+            {
                 fill_radius(app, hdc, "content.hover", &tile.rect, t.row_hover, None);
             }
             if sel || focused {
@@ -3213,7 +3228,8 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
             // 悬停：和选中同一套语言（一层底色），但**故意弱一档**。
             // 选中 = 底色 + 行首强调竖线；悬停 = 只有一档更淡的底色，没有竖线。
             // 两者一样重就分不清"我已经选了它"和"我只是指在这儿"。
-            let hovered = !selected && !focused && app.hover_row == Some(index);
+            let hovered =
+                !selected && !focused && app.hover_row == Some(index) && app.hover_pane == Some(app.focus_pane);
             if hovered {
                 fill_radius(app, hdc, "content.hover", &r, t.row_hover, None);
             }

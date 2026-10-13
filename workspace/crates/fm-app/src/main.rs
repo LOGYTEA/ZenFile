@@ -1192,11 +1192,28 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let hover_bulk = paint::bulk_rename_available(app) && inside(&l.bulk_btn, x, y);
             // 内容区里鼠标指着的**条目**（条目下标，不是行号）。
             // 行号会随滚动/排序变，用它记 hover 会"指着 A 却高亮了 B"。
-            let hover_row = if x >= l.view.left && y >= l.view.top && y < l.view.bottom {
+            //
+            // 分栏时几何和条目清单都取**光标所在窗格**那一份：绘制端 paint_panes
+            // 逐窗格把 view 覆写成「窗格矩形 + 26px 局部标签条」再画，拿全局
+            // l.view 算悬停 —— y 带偏一条标签条、x 原点偏半扇窗格，高亮就落在
+            // 旁边的行上（用户报的"点击错位"，悬停同根）。做法与绘制端一致：
+            // 临时把 focus_pane 指到光标那个窗格，算完还原（hover 不能抢焦点）。
+            let hover_pane_saved = app.focus_pane;
+            if app.split() {
+                if let Some(pi) = paint::pane_index_at(app, &l, x, y) {
+                    app.focus_pane = pi;
+                }
+            }
+            let hpl = paint::pane_layout(app, &l, app.focus_pane);
+            let hover_row = if x >= hpl.view.left
+                && x < hpl.view.right
+                && y >= hpl.view.top
+                && y < hpl.view.bottom
+            {
                 if app.tab().home {
-                    home_entry_at(app, &l, x, y)
-                } else if y >= l.view.top + header_height(app) {
-                    view_row_at(app, &l, x, y, l.view.top + header_height(app))
+                    home_entry_at(app, &hpl, x, y)
+                } else if y >= hpl.view.top + header_height(app) {
+                    view_row_at(app, &hpl, x, y, hpl.view.top + header_height(app))
                         .and_then(|r| app.tab().visible.get(r).copied())
                 } else {
                     None
@@ -1204,6 +1221,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             } else {
                 None
             };
+            let hover_pane = if hover_row.is_some() { Some(app.focus_pane) } else { None };
             // 状态栏布局切换按钮悬停
             let hover_view = if app.cfg.ui.statusbar_visible {
                 match paint::status_view_hit(&l, &app.metrics, x, y) {
@@ -1223,13 +1241,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     let mut hc = None;
                     let mut hr = None;
                     let mut htree = None;
-                    match settings::hit(app, &l, x, y) {
+                    match settings::hit(app, &hpl, x, y) {
                         Some(settings::Hit::Tab(i)) => ht = Some(i),
                         Some(settings::Hit::Card(i)) => {
-                            hc = settings::geom(app, &l).card_ids.get(i).copied()
+                            hc = settings::geom(app, &hpl).card_ids.get(i).copied()
                         }
                         Some(settings::Hit::Chip(i)) => {
-                            hc = settings::geom(app, &l).chip_ids.get(i).copied()
+                            hc = settings::geom(app, &hpl).chip_ids.get(i).copied()
                         }
                         Some(settings::Hit::Row(a)) => hr = Some(a),
                         Some(settings::Hit::Tree(i)) => {
@@ -1237,7 +1255,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                         }
                         Some(settings::Hit::MenuRow(i)) => {
                             app.settings_hover_menu =
-                                settings::geom(app, &l).menu_idx.get(i).copied();
+                                settings::geom(app, &hpl).menu_idx.get(i).copied();
                         }
                         Some(settings::Hit::OpenWith(_)) => {}
                         Some(settings::Hit::Canvas(_)) => {}
@@ -1268,9 +1286,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             };
             // 表头列的悬停：悬停时才在最右端露出筛选下拉的箭头
             let hover_header = if app.tab().recycle {
-                paint::recycle_header_hit(app, &l, x, y)
+                paint::recycle_header_hit(app, &hpl, x, y)
             } else {
-                paint::header_col_hit(app, &l, x, y)
+                paint::header_col_hit(app, &hpl, x, y)
             };
             // 导航窗格悬停行
             let hover_sidebar = if app.cfg.ui.sidebar_visible {
@@ -1281,12 +1299,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             // 回收站：条目悬停 + 顶部三个按钮的悬停
             let (hover_rec, hover_rec_btn) = if app.tab().recycle {
                 (
-                    if x >= l.view.left && x < l.view.right && y >= l.view.top {
-                        paint::recycle_hit(app, &l, y)
+                    if x >= hpl.view.left && x < hpl.view.right && y >= hpl.view.top {
+                        paint::recycle_hit(app, &hpl, y)
                     } else {
                         None
                     },
-                    paint::recycle_button_hit(app, &l, x, y),
+                    paint::recycle_button_hit(app, &hpl, x, y),
                 )
             } else {
                 (None, 0u8)
@@ -1298,6 +1316,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             } else {
                 None
             };
+            // 上面这一整段悬停计算临时把 focus_pane 指到光标所在窗格（分栏时），
+            // 算完必须还原 —— hover 不能改"当前窗格"，否则鼠标扫过隔壁窗格
+            // 就把焦点抢走了。
+            app.focus_pane = hover_pane_saved;
             if in_close != app.hovering_close
                 || chrome != app.hover_chrome
                 || hover_tab != app.hover_tab
@@ -1308,6 +1330,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 || hover_split != app.hover_split
                 || hover_bulk != app.hover_bulk
                 || hover_row != app.hover_row
+                || hover_pane != app.hover_pane
                 || hover_nav != app.hover_nav
                 || hover_header != app.hover_header
                 || hover_rec != app.hover_recycle
@@ -1323,6 +1346,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 app.hover_recycle_btn = hover_rec_btn;
                 app.hover_bulk = hover_bulk;
                 app.hover_row = hover_row;
+                app.hover_pane = hover_pane;
                 app.hover_split = hover_split;
                 app.hovering_close = in_close;
                 app.hover_chrome = chrome;
@@ -1465,6 +1489,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     app.focus_pane = pi;
                 }
             }
+            // 内容区的几何同样取**焦点窗格**覆写过的那份（view = 窗格矩形 +
+            // 26px 局部标签条）。下面各分支读 app.tab()（焦点窗格的标签）却拿
+            // 全局 l.view 算行/表头/磁贴位置 —— y 带偏一条标签条、x 原点偏
+            // 半扇窗格，于是"点这行选中的是旁边那行"（第45轮分窗点击错位）。
+            // 工具栏/侧边栏/状态栏不在窗格里，pane_layout 原样透传，照用 l。
+            let pl = if app.split() { paint::pane_layout(app, &l, app.focus_pane) } else { l };
             // 重命名编辑框还开着时，点任何地方都是"先收掉它"。
             // 我们的 WM_LBUTTONDOWN 走完就 return，从不交给 DefWindowProc，
             // 于是焦点压根不会从 EDIT 上挪开 —— KILLFOCUS 永远不来，框就一直
@@ -1477,10 +1507,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             }
             // 设置页排布编辑器：按下卡片/收纳项 → 开始拖
             if app.tab().settings {
-                if let Some(h) = settings::hit(app, &l, x, y) {
+                if let Some(h) = settings::hit(app, &pl, x, y) {
                     // 「右键菜单」页那块实时菜单：按住就能拖着改顺序
                     // （卡片排布那套在别的页照旧）
-                    if settings::begin_drag(app, &l, &h, x, y) {
+                    if settings::begin_drag(app, &pl, &h, x, y) {
                         let _ = SetCapture(hwnd);
                         let _ = InvalidateRect(Some(hwnd), None, true);
                         return LRESULT(0);
@@ -1540,7 +1570,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             }
             // 设置页：顶部小标签切换；开关点一下就切；多选项点一下展开下拉
             if app.tab().settings {
-                match settings::hit(app, &l, x, y) {
+                match settings::hit(app, &pl, x, y) {
                     Some(settings::Hit::Tab(i)) => {
                         app.settings_tab = i;
                         app.settings_hover_card = None;
@@ -1552,7 +1582,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                         let _ = InvalidateRect(Some(hwnd), None, true);
                     }
                     Some(settings::Hit::Tree(i)) => {
-                        let g = settings::geom(app, &l);
+                        let g = settings::geom(app, &pl);
                         if app.settings_tab == crate::app::SETTINGS_TAB_INTERACT {
                             // 「交互」页的树（第34轮）：同一份 Hit::Tree，按页分派。
                             // 分组行 = 展开/收起；叶子行 = 选中它（右侧参数区跟着换）。
@@ -1592,7 +1622,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                         // 点不动。与 drag_split / tab_drag 同款做法。
                         SetCapture(hwnd);
                         let id = app.settings_radius_sel.clone();
-                        let g = settings::geom(app, &l);
+                        let g = settings::geom(app, &pl);
                         let max = settings::radius_max(&id).max(1);
                         let w = (g.slider.right - g.slider.left).max(1);
                         let frac = ((sx - g.slider.left) as f32 / w as f32).clamp(0.0, 1.0);
@@ -1647,19 +1677,19 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             // `return LRESULT(0)` 收尾的 —— 那段代码永远到不了，于是"回收站
             // 用表头排序"是个死的。点列头反而落进了"空白处 → 清选中 + 拉框选"。
             if app.tab().recycle {
-                if let Some(col) = paint::recycle_header_hit(app, &l, x, y) {
+                if let Some(col) = paint::recycle_header_hit(app, &pl, x, y) {
                     app.sort_recycle_by(col);
                     let _ = InvalidateRect(Some(hwnd), None, true);
                     return LRESULT(0);
                 }
-                let btns = paint::recycle_buttons(app, &l);
+                let btns = paint::recycle_buttons(app, &pl);
                 if inside(&btns[0], x, y) {
                     app.run_command(menu::Command::RecycleRestore);
                 } else if inside(&btns[1], x, y) {
                     app.run_command(menu::Command::RecycleDelete);
                 } else if inside(&btns[2], x, y) {
                     app.run_command(menu::Command::RecycleEmpty);
-                } else if let Some(idx) = paint::recycle_hit(app, &l, y) {
+                } else if let Some(idx) = paint::recycle_hit(app, &pl, y) {
                     let id = app.recycle_items.get(idx).map(|i| i.id.clone());
                     let ctrl = GetKeyState(0x11) < 0;
                     if let Some(id) = id {
@@ -1739,8 +1769,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 return LRESULT(0);
             }
             // 首页是平铺布局，行列式命中在这里不适用
-            if app.tab().home && y >= l.view.top {
-                let hit = home_select(app, &l, x, y);
+            if app.tab().home && y >= pl.view.top {
+                let hit = home_select(app, &pl, x, y);
                 // 空白处起手同样要能拉框选 —— 首页之前直接 return，于是"长按框选
                 // 在首页不生效"。磁贴布局不是行列式的，框选命中走 home_layout
                 // 的磁贴矩形（见 select_marquee）。
@@ -1760,20 +1790,20 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 return LRESULT(0);
             }
             let header_h = header_height(app);
-            let view_top = l.view.top + header_h;
-            if y >= l.view.top && y < view_top && app.tab().view_mode == fm_core::ViewMode::Details {
+            let view_top = pl.view.top + header_h;
+            if y >= pl.view.top && y < view_top && app.tab().view_mode == fm_core::ViewMode::Details {
                 // 先判列最右端那个「筛选」小三角：它压在列里，先判整列的话
                 // 点三角永远只会变成"再排一次序"。
-                if let Some(col) = paint::header_col_hit(app, &l, x, y) {
-                    if inside(&paint::header_filter_rect(app, &l, col), x, y) {
-                        show_header_filter_menu(hwnd, app, &l, col);
+                if let Some(col) = paint::header_col_hit(app, &pl, x, y) {
+                    if inside(&paint::header_filter_rect(app, &pl, col), x, y) {
+                        show_header_filter_menu(hwnd, app, &pl, col);
                         return LRESULT(0);
                     }
                 }
-                header_click(app, &l, x);
+                header_click(app, &pl, x);
                 return LRESULT(0);
             }
-            if let Some(row) = view_row_at(app, &l, x, y, view_top) {
+            if let Some(row) = view_row_at(app, &pl, x, y, view_top) {
                 // 「再点一下已经选中的名字 = 改名」。
                 // 判据是**间隔**：连着两下（小于双击时限）是打开，隔一会儿再点
                 // 才是改名。不判间隔的话双击打开就永远变成改名了。
@@ -1970,9 +2000,17 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             if app.tab().settings || app.tab().recycle {
                 return LRESULT(0);
             }
+            // 分栏时双击同样要先落到光标所在窗格（单击的 WM_LBUTTONDOWN 也会切，
+            // 但双击的第二下没有独立的 DOWN 消息，光标若先移了就会切晚一步）。
+            if app.split() {
+                if let Some(pi) = paint::pane_index_at(app, &l, x, y) {
+                    app.focus_pane = pi;
+                }
+            }
+            let pl = if app.split() { paint::pane_layout(app, &l, app.focus_pane) } else { l };
             // 首页：双击磁贴进入对应文件夹
             if app.tab().home {
-                if let Some(idx) = home_entry_at(app, &l, x, y) {
+                if let Some(idx) = home_entry_at(app, &pl, x, y) {
                     let path = app.tab().entries.get(idx).map(|e| e.path.clone());
                     if let Some(p) = path {
                         app.navigate(p);
@@ -1982,7 +2020,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 return LRESULT(0);
             }
             let header_h = header_height(app);
-            if let Some(row) = view_row_at(app, &l, x, y, l.view.top + header_h) {
+            if let Some(row) = view_row_at(app, &pl, x, y, pl.view.top + header_h) {
                 app.set_focus_row(row);
                 let tab = app.tab_mut();
                 tab.selected.clear();
@@ -2030,15 +2068,23 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     }
                 }
             }
+            // 分栏时右键同样先落到光标所在窗格 —— 菜单作用在 app.tab()
+            // （焦点窗格的标签）上，不切的话在右窗格右键弹出来的是左窗格的菜单。
+            if app.split() {
+                if let Some(pi) = paint::pane_index_at(app, &l, x, y) {
+                    app.focus_pane = pi;
+                }
+            }
+            let pl = if app.split() { paint::pane_layout(app, &l, app.focus_pane) } else { l };
             let header_h = header_height(app);
-            let view_top = l.view.top + header_h;
+            let view_top = pl.view.top + header_h;
 
             if app.tab().settings {
                 // 设置页没有文件可选，右键不弹菜单
                 app.context_targets = Some(Vec::new());
                 LRESULT(0)
             } else if app.tab().recycle {
-                if let Some(idx) = paint::recycle_hit(app, &l, y) {
+                if let Some(idx) = paint::recycle_hit(app, &pl, y) {
                     let id = app.recycle_items.get(idx).map(|i| i.id.clone());
                     if let Some(id) = id {
                         if !app.recycle_sel.contains(&id) {
@@ -2058,13 +2104,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 // 表头右键 = 排序/筛选菜单，不是文件右键。放在取 target 之前
                 // 拦下来，否则它会落进"清空选中 + 弹目录菜单"那条路。
                 if app.tab().view_mode == fm_core::ViewMode::Details
-                    && y >= l.view.top
+                    && y >= pl.view.top
                     && y < view_top
-                    && x >= l.view.left
-                    && x < l.view.right
+                    && x >= pl.view.left
+                    && x < pl.view.right
                 {
-                    if let Some(col) = paint::header_col_hit(app, &l, x, y) {
-                        show_header_context_menu(hwnd, app, &l, col, x, y);
+                    if let Some(col) = paint::header_col_hit(app, &pl, x, y) {
+                        show_header_context_menu(hwnd, app, &pl, col, x, y);
                         return LRESULT(0);
                     }
                 }
@@ -2072,8 +2118,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 // 菜单里绝不能再调 selected_paths() —— 它在选中为空时会退回焦点行，
                 // 那正是"空白处右键却判定到条目上"的根因。
                 let targets: Vec<PathBuf> = if app.tab().home {
-                    if y >= l.view.top && x >= l.view.left && x < l.view.right {
-                        if home_select(app, &l, x, y) {
+                    if y >= pl.view.top && x >= pl.view.left && x < pl.view.right {
+                        if home_select(app, &pl, x, y) {
                             app.tab().selected_paths()
                         } else {
                             // 主页空白处：必须清掉选中再给空目标。之前不管命中
@@ -2087,8 +2133,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     } else {
                         Vec::new()
                     }
-                } else if x >= l.view.left && y >= view_top && y < l.view.bottom {
-                    match view_row_at(app, &l, x, y, view_top) {
+                } else if x >= pl.view.left && y >= view_top && y < pl.view.bottom {
+                    match view_row_at(app, &pl, x, y, view_top) {
                         Some(row) => {
                             app.context_select_row(row);
                             app.tab().selected_paths()
@@ -2126,12 +2172,32 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 app.scroll_sidebar(delta / 2, &l);
                 return LRESULT(0);
             }
-            {
+            // 分栏时滚轮滚**光标所在窗格**（资源管理器同款）——不是焦点窗格，
+            // 否则鼠标停在右窗格滚滚轮，动的是左边那个。只滚动、不切焦点：
+            // Explorer 滚非活动窗格也不会把它激活。
+            let mut wpl = l;
+            if app.split() {
+                if let Some(pi) = paint::pane_index_at(app, &l, pt.x, pt.y) {
+                    wpl = paint::pane_layout(app, &l, pi);
+                    let d = delta / 2;
+                    let p = &mut app.panes[pi];
+                    if !p.tabs.is_empty() {
+                        let ai = p.active.min(p.tabs.len() - 1);
+                        let tab = &mut p.tabs[ai];
+                        tab.scroll -= d;
+                    }
+                } else {
+                    let tab = app.tab_mut();
+                    tab.scroll -= delta / 2;
+                }
+            } else {
                 let tab = app.tab_mut();
                 tab.scroll -= delta / 2;
             }
-            // 钳制必须知道布局：网格视图的内容高度是"行数 × 行高"，行数取决于列数
-            app.clamp_scroll_to(&l);
+            // 钳制必须知道布局：网格视图的内容高度是"行数 × 行高"，行数取决于列数。
+            // 约束的是"光标那个窗格"的标签，所以布局也必须是它的（行数/高度按
+            // 窗格宽算，网格列数随宽度变）。
+            app.clamp_pane_scroll(pt.x, pt.y, &l, &wpl);
             let _ = InvalidateRect(Some(hwnd), None, true);
             LRESULT(0)
         }
@@ -2421,8 +2487,8 @@ fn drop_target_at(app: &mut App, l: &paint::Layout, x: i32, y: i32) -> Option<ap
     }
     // 3) 内容区里的文件夹行
     let view_top = pl.view.top + header_height(app);
-    if y >= view_top && y < l.view.bottom {
-        if let Some(row) = view_row_at(app, l, x, y, view_top) {
+    if y >= view_top && y < pl.view.bottom {
+        if let Some(row) = view_row_at(app, &pl, x, y, view_top) {
             let idx = app.tab().visible.get(row).copied();
             let entry = idx.and_then(|i| app.tab().entries.get(i).cloned());
             if let Some(e) = entry {
@@ -2562,6 +2628,10 @@ fn select_marquee(app: &mut App, l: &paint::Layout, drag: &app::Drag) {
 }
 
 fn select_marquee_into(app: &mut App, l: &paint::Layout, origin: (i32, i32), cur: (i32, i32)) {
+    // 分栏时框选发生在**焦点窗格**里：条目矩形按窗格几何算（与按下那下
+    // WM_LBUTTONDOWN 用的 pane_layout 同一份），拿全局 view 算会选到错的行。
+    let pl = if app.split() { paint::pane_layout(app, l, app.focus_pane) } else { *l };
+    let l = &pl;
     let r = paint::marquee_rect_from(origin, cur);
     let hits = |a: &RECT, b: &RECT| a.right > b.left && a.left < b.right && a.bottom > b.top && a.top < b.bottom;
 
