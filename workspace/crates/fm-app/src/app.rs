@@ -1948,6 +1948,11 @@ impl App {
         self.focus_visible = false;
         // 主动跳转到一个新目录时，"回退后要选中谁"这件事就作废了
         self.pending_select = None;
+        // 搜索的防抖挂起一并作废（旧目录敲了一半的查询不该在新目录里炸开），
+        // 框里的旧搜索词也立刻清掉 —— 用户报"取消搜索了之前搜索的东西还在"（第40轮）。
+        self.search_dirty = false;
+        self.search_ticks = 0;
+        self.sync_search_edit();
         // 地址栏文本在这里一次更新掉：原来靠每个调用方自己记得调 sync_address，
         // 漏一个就表现为"点了面包屑看着没反应"（其实目录已经切了，只是地址栏
         // 还写着旧路径）。刷新放在导航里，调用方就不可能忘。
@@ -2284,6 +2289,22 @@ impl App {
         self.search_ticks = SEARCH_DEBOUNCE_TICKS;
     }
 
+    /// 把**当前标签**的搜索词同步进搜索框（全窗口唯一的那个子 EDIT）。
+    ///
+    /// 搜索框是全局共享的，而 `filter` 是每个标签各一份：切标签 / 导航 /
+    /// 取消搜索之后，框里还留着上一段查询 —— 用户报"取消搜索了，之前
+    /// 搜索的东西还在"（第40轮）。文本没变时只做一次比较，不写。
+    pub fn sync_search_edit(&mut self) {
+        if self.hwnd_search.0.is_null() {
+            return;
+        }
+        let want = self.tab().filter.clone();
+        if crate::paint::read_window_text(self.hwnd_search) == want {
+            return;
+        }
+        crate::paint::set_window_text_utf16(self.hwnd_search, &want);
+    }
+
     /// 由 100ms 的 TIMER_DRAIN 驱动，返回是否真的跑了一次搜索。
     pub fn tick_search(&mut self) -> bool {
         if !self.search_dirty {
@@ -2434,6 +2455,10 @@ impl App {
     }
 
     pub fn drain(&mut self) {
+        // 搜索框文本跟随当前标签（TIMER_DRAIN 每 100ms 一次；文本没变只是
+        // 一次字符串比较）。放在这里而不是散在各切标签点位：active 的赋值
+        // 分散在十几个地方，漏一个就又出现"旧查询还挂在框上"。
+        self.sync_search_edit();
         let mut changed = self.drain_index();
         // 同 reload()：把开关拷出来，避免循环体内对 self.tabs 的可变借用与 self 字段读取冲突
         let (show_hidden, show_system) = (self.show_hidden, self.show_system);

@@ -1434,6 +1434,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let app = &mut *app_ptr;
             let (x, y) = client_xy(hwnd, lparam);
             let l = paint::layout_for(app);
+            // 地址栏编辑态：点它**以外**的任何地方，先收掉输入框再继续
+            // 处理这次点击（第40轮用户报"无法退出输入模式"）。EDIT 是子
+            // 窗口，点击父窗口客户区并不会让它失去焦点 —— WM_KILLFOCUS
+            // 根本不来，退出只剩 Esc 一条路（像素探针实锤：点列表后仍是
+            // 活动选中态）。收掉之后这次点击照常生效（点行选中行），与
+            // 资源管理器一致。
+            if app.addr_editing && !inside(&l.address, x, y) {
+                paint::end_address_edit(app, true);
+                paint::sync_address(app);
+            }
             // 分栏时"点哪一边哪一边就是当前窗格"。必须在任何命中测试之前做：
             // 下面所有分支读的都是 app.tab()，也就是**焦点窗格**的那个标签。
             if app.split() {
@@ -1982,6 +1992,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             }
             let (x, y) = client_xy(hwnd, lparam);
             let l = paint::layout_for(app);
+            // 地址栏编辑态：右键别处同样先收掉（同 WM_LBUTTONDOWN 的理由：
+            // 子 EDIT 不会因为点了父窗口就失焦，WM_KILLFOCUS 不来）。
+            if app.addr_editing && !inside(&l.address, x, y) {
+                paint::end_address_edit(app, true);
+                paint::sync_address(app);
+            }
             let header_h = header_height(app);
             let view_top = l.view.top + header_h;
 
@@ -3314,6 +3330,9 @@ pub(crate) fn on_edit_escape() {
         tab.search_root = None;
         tab.recompute_filter(sh, ss);
     }
+    // 防抖挂起一并作废：不然取消后 ~200ms，TIMER_DRAIN 还会拿旧状态再跑一次
+    app.search_dirty = false;
+    app.search_ticks = 0;
     app.reload();
     app.invalidate();
 }

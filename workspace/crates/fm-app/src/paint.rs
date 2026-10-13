@@ -9,7 +9,9 @@ use windows::Win32::Graphics::Gdi::{
     BitBlt, CombineRgn, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
     CreateRectRgn, CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse,
     FillRect, FillRgn, GetDC,
-    GetTextExtentPoint32W, IntersectClipRect, InvalidateRect, LineTo, MoveToEx, PS_SOLID, Rectangle,
+    GetTextExtentPoint32W, GetTextMetricsW, IntersectClipRect, InvalidateRect, LineTo, MoveToEx,
+    PS_SOLID, Rectangle,
+    TEXTMETRICW,
     ReleaseDC, RestoreDC, RoundRect, SaveDC, SelectObject, SetBkMode, SetTextColor, DT_CENTER,
     DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DRAW_TEXT_FORMAT,
     FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FONT_QUALITY, GetStockObject, HBITMAP,
@@ -64,6 +66,49 @@ pub fn ui_font(scale: f32) -> HFONT {
             UI_FONT_SCALE = scale;
         }
         UI_FONT
+    }
+}
+
+/// ui_font 的**字体单元格**高度（tmHeight，含内部行距）。
+///
+/// 单行 EDIT 的字形永远画在单元格**顶部**，它自己根本不做垂直居中
+/// （第40轮纯 Win32 探针证实：28px 高的 EDIT 里墨迹落在第 14..19 行）。
+/// YaHei 的内部行距大，于是所有输入框的文字都整体偏上约 5px —— 用户报
+/// "所有的输入框都会有这个问题（文字贴顶）"。要居中文字，只能把 EDIT
+/// 本身的位置按单元格来摆（见 `edit_vcenter`）。
+fn ui_font_cell_h(scale: f32) -> i32 {
+    unsafe {
+        if CELL_H == 0 || (CELL_H_SCALE - scale).abs() > 0.01 {
+            let hdc = GetDC(None);
+            let old = SelectObject(hdc, ui_font(scale).into());
+            let mut tm = TEXTMETRICW::default();
+            let _ = GetTextMetricsW(hdc, &mut tm);
+            SelectObject(hdc, old);
+            let _ = ReleaseDC(None, hdc);
+            CELL_H = tm.tmHeight.max(1);
+            CELL_H_SCALE = scale;
+        }
+        CELL_H
+    }
+}
+static mut CELL_H: i32 = 0;
+static mut CELL_H_SCALE: f32 = -1.0;
+
+/// 把一个"跟内容行等高"的矩形调整成子 EDIT 的实际摆放位置：
+/// **底边不动、顶部下移到字体单元格垂直居中**的位置。
+///
+/// 单行 EDIT 的字形画在单元格顶部（见 `ui_font_cell_h`），所以想让文字
+/// 在工具栏里看起来居中，必须居中的是"单元格"而不是让 EDIT 摆满行高 ——
+/// 摆满的话文字就贴着上沿（地址栏/搜索框实测偏上 4.5px，第40轮）。
+pub fn edit_vcenter(r: &RECT, scale: f32) -> RECT {
+    let cell = ui_font_cell_h(scale);
+    let h = (r.bottom - r.top).max(0);
+    let top = r.top + ((h - cell) / 2).max(0);
+    RECT {
+        left: r.left,
+        top,
+        right: r.right,
+        bottom: r.bottom,
     }
 }
 
@@ -4374,8 +4419,12 @@ pub(crate) fn set_edit_font(hwnd: HWND, scale: f32) {
 fn position_children(app: &App) {
     let l = layout_for(app);
     unsafe {
-        let _ = SetWindowPos(app.hwnd_address, None, l.address.left, l.address.top, l.address.right - l.address.left, l.address.bottom - l.address.top, SWP_NOZORDER | SWP_NOACTIVATE);
-        let _ = SetWindowPos(app.hwnd_search, None, l.search.left, l.search.top, l.search.right - l.search.left, l.search.bottom - l.search.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        // 两个子 EDIT 都要用 edit_vcenter 摆位：单行 EDIT 的字形单元格贴顶，
+        // 摆满行高时文字偏上 ~5px（第40轮"所有输入框文字贴顶"）。
+        let ar = edit_vcenter(&l.address, app.metrics.scale);
+        let _ = SetWindowPos(app.hwnd_address, None, ar.left, ar.top, ar.right - ar.left, ar.bottom - ar.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        let sr = edit_vcenter(&l.search, app.metrics.scale);
+        let _ = SetWindowPos(app.hwnd_search, None, sr.left, sr.top, sr.right - sr.left, sr.bottom - sr.top, SWP_NOZORDER | SWP_NOACTIVATE);
         // 两个子 EDIT 的空态提示（放大镜 + "搜索 X"）画在**它们自己身上**，而
         // 主窗口带 WS_CLIPCHILDREN，父窗口重绘永远不碰那一块 —— 换标签、挪
         // 位置之后必须显式让它们重画。否则提示词停在旧标签的文字上（实测：
