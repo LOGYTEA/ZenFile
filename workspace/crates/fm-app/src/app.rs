@@ -855,6 +855,9 @@ pub struct Crumb {
     pub target: Option<PathBuf>,
     /// 这一节是"折叠起来的中间层级"占位（`…`），点击跳到被折叠的最深一层。
     pub ellipsis: bool,
+    /// 这一节是搜索状态芯片（`搜索“xx”`，学 Pulse）：底色是强调色淡染、
+    /// 白字，**不参与导航**（点击把焦点交还搜索框）。
+    pub chip: bool,
 }
 
 /// 向 Shell 问目录的本地化显示名（见 `App::display_name`）。
@@ -4381,46 +4384,75 @@ impl App {
                 fm_core::paths::strip_verbatim(&t.path).to_path_buf(),
             )
         };
-        if home {
-            return vec![Crumb { label: "此电脑".into(), target: None, ellipsis: false }];
-        }
-        if recycle {
-            return vec![Crumb { label: "回收站".into(), target: None, ellipsis: false }];
-        }
-        if settings {
-            return vec![Crumb { label: "设置".into(), target: None, ellipsis: false }];
-        }
-
-        let segs = path_segments(&path);
-        if segs.is_empty() {
-            return vec![Crumb {
-                label: path.to_string_lossy().to_string(),
+        // 搜索态判定：过滤词非空且确实处于搜索结果视图（边打字边筛的
+        // 过滤态 search_root 还没置上，那一瞬不画芯片，防抖后才出现 ——
+        // 和 Pulse"开始搜了才有芯片"一致）。
+        let search_chip = {
+            let t = self.tab();
+            let q = t.filter.trim().to_string();
+            if t.search_root.is_some() && !q.is_empty() {
+                Some(q)
+            } else {
+                None
+            }
+        };
+        let mut out = if home {
+            vec![Crumb { label: "此电脑".into(), target: None, ellipsis: false, chip: false }]
+        } else if recycle {
+            vec![Crumb { label: "回收站".into(), target: None, ellipsis: false, chip: false }]
+        } else if settings {
+            vec![Crumb { label: "设置".into(), target: None, ellipsis: false, chip: false }]
+        } else {
+            let segs = path_segments(&path);
+            if segs.is_empty() {
+                vec![Crumb {
+                    label: path.to_string_lossy().to_string(),
+                    target: None,
+                    ellipsis: false,
+                    chip: false,
+                }]
+            } else {
+                let mut out = Vec::with_capacity(segs.len() + 1);
+                out.push(Crumb { label: "此电脑".into(), target: None, ellipsis: false, chip: false });
+                for (i, p) in segs.iter().enumerate() {
+                    let label = if i == 0 {
+                        // 盘符：优先卷标（"FurFHT (F:)"），没卷标就退回类型名 + 盘符
+                        let mut root = p.to_string_lossy().to_string();
+                        if !root.ends_with('\\') {
+                            root.push('\\');
+                        }
+                        match drive_of(self, &PathBuf::from(&root)) {
+                            Some(d) => d.display_name(),
+                            None => root.trim_end_matches('\\').to_string(),
+                        }
+                    } else {
+                        let fallback = p
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| p.to_string_lossy().to_string());
+                        self.display_name(p, &fallback)
+                    };
+                    out.push(Crumb { label, target: Some(p.clone()), ellipsis: false, chip: false });
+                }
+                out
+            }
+        };
+        if let Some(q) = search_chip {
+            // 学 Pulse：搜索时末尾挂一枚`搜索“xx”`芯片。超长查询截断，
+            // 免得把整条地址栏吃掉（芯片只是状态展示，完整词在搜索框里）。
+            let short = if q.chars().count() > 16 {
+                let mut s: String = q.chars().take(16).collect();
+                s.push('\u{2026}');
+                s
+            } else {
+                q.clone()
+            };
+            out.push(Crumb {
+                label: format!("搜索\u{201C}{short}\u{201D}"),
                 target: None,
                 ellipsis: false,
-            }];
-        }
-
-        let mut out = Vec::with_capacity(segs.len() + 1);
-        out.push(Crumb { label: "此电脑".into(), target: None, ellipsis: false });
-        for (i, p) in segs.iter().enumerate() {
-            let label = if i == 0 {
-                // 盘符：优先卷标（"FurFHT (F:)"），没卷标就退回类型名 + 盘符
-                let mut root = p.to_string_lossy().to_string();
-                if !root.ends_with('\\') {
-                    root.push('\\');
-                }
-                match drive_of(self, &PathBuf::from(&root)) {
-                    Some(d) => d.display_name(),
-                    None => root.trim_end_matches('\\').to_string(),
-                }
-            } else {
-                let fallback = p
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| p.to_string_lossy().to_string());
-                self.display_name(p, &fallback)
-            };
-            out.push(Crumb { label, target: Some(p.clone()), ellipsis: false });
+                chip: true,
+            });
         }
         out
     }

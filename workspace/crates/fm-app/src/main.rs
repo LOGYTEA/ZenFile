@@ -1699,6 +1699,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 let bar = paint::address_bar(app, &l);
                 match paint::address_hit(&bar, x, y) {
                     Some(i) => {
+                        // 搜索芯片：纯状态展示（Pulse 实测点击无反应），
+                        // 但点了给它一个合理去处 —— 焦点交回搜索框改词。
+                        // 绝不能走下面的 navigate：芯片 target 是 None，
+                        // 会被 unwrap_or 当成"点回主页"。
+                        if bar.crumbs.get(i).map(|c| c.chip).unwrap_or(false) {
+                            paint::focus_edit(app.hwnd_search);
+                            return LRESULT(0);
+                        }
                         // 必须用"命中的那一节自己带的 target"，不能拿下标回完整
                         // 路径列表里取：窗口一窄，中间层级会被折成一个 `…`，
                         // 折叠后的下标和完整列表的下标根本不是一回事（实测点 `…`

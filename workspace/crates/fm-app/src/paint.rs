@@ -1816,6 +1816,7 @@ pub fn address_bar(app: &mut App, l: &Layout) -> AddressBar {
                 label: "\u{2026}".into(),
                 target: ell_target,
                 ellipsis: true,
+                chip: false,
             });
             v.extend_from_slice(&crumbs[start..]);
             crumbs = v;
@@ -1857,9 +1858,28 @@ pub fn address_hit(bar: &AddressBar, x: i32, y: i32) -> Option<usize> {
     None
 }
 
+/// 把矩形上下各收进 `v` 像素（芯片比面包屑条矮一截，学 Pulse 的内边距）。
+fn inset_v(r: &RECT, v: i32) -> RECT {
+    RECT { left: r.left, top: r.top + v, right: r.right, bottom: (r.bottom - v).max(r.top + 1) }
+}
+
+/// 搜索芯片底色：强调色按 `f` 混进 surface（GDI COLORREF 是 0x00BBGGRR）。
+///
+/// Pulse 实测暗色芯片 #263846 ≈ 强调蓝与面板底 18% 混合；亮色主题下同一个
+/// 公式混出淡蓝块，配 `selection_text` 深字，正好是系统选中态的观感。
+fn chip_color(t: &crate::theme::Theme, f: f32) -> COLORREF {
+    let mix = |a: u32, b: u32| -> u32 {
+        (a as f32 * (1.0 - f) + b as f32 * f).round() as u32
+    };
+    let (ar, ag, ab) = (t.accent.0 & 0xFF, (t.accent.0 >> 8) & 0xFF, (t.accent.0 >> 16) & 0xFF);
+    let (br, bg, bb) = (t.surface.0 & 0xFF, (t.surface.0 >> 8) & 0xFF, (t.surface.0 >> 16) & 0xFF);
+    COLORREF((mix(ab, bb) << 16) | (mix(ag, bg) << 8) | mix(ar, br))
+}
+
 /// 画地址栏：平时是面包屑，编辑态时让 EDIT 自己画（它此时才显示出来）。
 fn paint_address(app: &mut App, hdc: HDC, l: &Layout) {
     let t = app.theme;
+    let scale = app.metrics.scale;
     unsafe {
         // 底 + 1px 边框（EDIT 与工具栏同色，没有框就等于看不见）
         fill_radius(app, hdc, "address.edit", &l.address, t.surface, Some(t.border));
@@ -1887,10 +1907,21 @@ fn paint_address(app: &mut App, hdc: HDC, l: &Layout) {
                 None => continue,
             };
             let last = i + 1 == bar.crumbs.len();
-            if app.addr_hover == Some(i) {
-                fill_radius(app, hdc, "address.crumb", &r, t.hover_bg, None);
+            if c.chip {
+                // 搜索状态芯片（学 Pulse）：强调色淡染的圆角块 + 白字。
+                // Pulse 实测底色 #263846 = 强调蓝与面板底 ~18% 混合，这里
+                // 同配方，亮色主题下自然变成淡蓝块 + 深字（selection_text
+                // 两套主题分别配好了）。
+                let base = if app.addr_hover == Some(i) { 0.30 } else { 0.18 };
+                let vin = (2.0 * scale).round() as i32;
+                fill_radius(app, hdc, "address.crumb", &inset_v(&r, vin), chip_color(&t, base), None);
+                SetTextColor(hdc, t.selection_text);
+            } else {
+                if app.addr_hover == Some(i) {
+                    fill_radius(app, hdc, "address.crumb", &r, t.hover_bg, None);
+                }
+                SetTextColor(hdc, if last { t.text } else { t.text_dim });
             }
-            SetTextColor(hdc, if last { t.text } else { t.text_dim });
             let mut w: Vec<u16> = c.label.encode_utf16().collect();
             DrawTextW(
                 hdc,
