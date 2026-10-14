@@ -345,7 +345,7 @@ impl Cv {
 
     /// 实心多边形（点按顺时针）。`round` 时把凸角倒圆（近似：点向重心收再外扩）。
     fn fill_poly(&mut self, pts: &[[f32; 2]], round: bool, col: [u8; 3]) {
-        let r = if round { 1.7 } else { 0.0 };
+        let r = if round { 2.6 } else { 0.0 };
         let n = pts.len();
         let mut cx = 0.0;
         let mut cy = 0.0;
@@ -418,10 +418,10 @@ fn draw_ui(kind: Ui, cv: &mut Cv, round: bool, col: [u8; 3]) {
             cv.fill_poly(&[[12.5, 8.0], [21.5, 16.0], [12.5, 24.0]], round, col);
         }
         Ui::PaneToggle => {
-            let r = if round { 3.0 } else { 0.5 };
+            let r = if round { 4.0 } else { 0.0 };
             cv.ring_rrect(4.0, 8.5, 24.0, 15.0, hw, r, col);
             // 左侧填实的一栏："被收起的那一栏"
-            let r2 = if round { 1.6 } else { 0.3 };
+            let r2 = if round { 2.5 } else { 0.0 };
             cv.fill([6.0, 10.5, 13.5, 21.5], col, move |x, y| sd_rrect(x, y, 6.5, 11.0, 6.0, 10.0, r2));
         }
         Ui::Hamburger => {
@@ -438,12 +438,12 @@ fn draw_ui(kind: Ui, cv: &mut Cv, round: bool, col: [u8; 3]) {
             cv.stroke(9.0, 19.5, 23.0, 19.5, hw, cap, col);
         }
         Ui::Max => {
-            let r = if round { 3.0 } else { 0.5 };
+            let r = if round { 4.0 } else { 0.0 };
             cv.ring_rrect(8.0, 8.0, 16.0, 16.0, hw, r, col);
         }
         Ui::Restore => {
             // 后框只画上边 + 右边（与原 GDI 版同构），前框完整
-            let r = if round { 2.6 } else { 0.5 };
+            let r = if round { 3.5 } else { 0.0 };
             cv.stroke(12.5, 7.0, 26.0, 7.0, hw, cap, col);
             cv.stroke(26.0, 7.0, 26.0, 20.5, hw, cap, col);
             cv.ring_rrect(6.0, 12.0, 14.5, 14.5, hw, r, col);
@@ -454,7 +454,7 @@ fn draw_ui(kind: Ui, cv: &mut Cv, round: bool, col: [u8; 3]) {
         }
         Ui::ViewGrid => {
             // 2×2 空心格（照原 GDI 版：空心比实心更像"图标视图"）
-            let r = if round { 2.2 } else { 0.4 };
+            let r = if round { 3.0 } else { 0.0 };
             let t = hw * 0.85;
             for (gx, gy) in [(5.0f32, 5.0f32), (18.0, 5.0), (5.0, 18.0), (18.0, 18.0)] {
                 cv.ring_rrect(gx, gy, 9.0, 9.0, t, r, col);
@@ -700,9 +700,10 @@ const SS: i32 = 4;
 
 fn draw(kind: Kind, cv: &mut Cv, round: bool, color: bool, dark: bool) {
     let p = pal_for(kind, color, dark);
-    // 直角=几乎不倒角；圆角=大倒角。所有 shape 共用这一个旋钮。
-    let r = if round { 3.2 } else { 0.55 };
-    let r2 = if round { 2.2 } else { 0.4 };
+    // 直角=完全不倒角（r=0，锋利扁平的 metro 风）；圆角=大幅倒角（明显圆润泡泡）。
+    // 两套轮廓语言在此拉开差距，光靠半径量级就足以在小尺寸下区分。
+    let r = if round { 5.0 } else { 0.0 };
+    let r2 = if round { 3.5 } else { 0.0 };
     let (b, b2, ink, line, acc) = (p.body, p.body2, p.ink, p.line, p.acc);
 
     match kind {
@@ -905,6 +906,81 @@ fn draw(kind: Kind, cv: &mut Cv, round: bool, color: bool, dark: bool) {
 
 // ---------------------------------------------------------------- 渲染出口
 
+/// 按亮度选描边色：主体偏暗就向浅色混，偏亮就向深色混 —— 保证描边与图标本体
+/// 形成对比边缘（不管底色深浅都能读出来）。仅圆角风格调用。
+fn outline_col(p: &Pal, color: bool) -> [u8; 3] {
+    if !color {
+        return p.line;
+    }
+    let lum = (p.body[0] as u32 + p.body[1] as u32 + p.body[2] as u32) / 3;
+    if lum < 140 {
+        mix(p.body, [235, 235, 235], 0.55)
+    } else {
+        mix(p.body, [40, 40, 40], 0.5)
+    }
+}
+
+fn mix(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
+    [
+        (a[0] as f32 + (b[0] as f32 - a[0] as f32) * t).round().clamp(0.0, 255.0) as u8,
+        (a[1] as f32 + (b[1] as f32 - a[1] as f32) * t).round().clamp(0.0, 255.0) as u8,
+        (a[2] as f32 + (b[2] as f32 - a[2] as f32) * t).round().clamp(0.0, 255.0) as u8,
+    ]
+}
+
+/// 给已画好的图标加一圈**圆角描边**（仅圆角风格）。做法：把超采样 alpha 做
+/// 圆形膨胀，外环填描边色。直角风格不调用 —— 保持纯扁平填充的 metro 语言。
+fn add_outline(cv: &mut Cv, col: [u8; 3], grow: i32) {
+    let w = cv.w as usize;
+    let h = w; // 正方形画布
+    let mut mask = vec![0u8; w * h];
+    for (i, slot) in mask.iter_mut().enumerate() {
+        *slot = if cv.buf[i * 4 + 3] >= 128 { 1 } else { 0 };
+    }
+    let g2 = grow * grow;
+    let mut dmask = vec![0u8; w * h];
+    for y in 0..h as i32 {
+        for x in 0..w as i32 {
+            let mut hit = 0u8;
+            for dy in -grow..=grow {
+                let yy = y + dy;
+                if yy < 0 || yy >= h as i32 {
+                    continue;
+                }
+                for dx in -grow..=grow {
+                    let xx = x + dx;
+                    if xx < 0 || xx >= w as i32 {
+                        continue;
+                    }
+                    if dx * dx + dy * dy > g2 {
+                        continue;
+                    }
+                    if mask[yy as usize * w + xx as usize] == 1 {
+                        hit = 1;
+                        break;
+                    }
+                }
+                if hit == 1 {
+                    break;
+                }
+            }
+            dmask[y as usize * w + x as usize] = hit;
+        }
+    }
+    for y in 0..h {
+        for x in 0..w {
+            let idx = y * w + x;
+            if dmask[idx] == 1 && mask[idx] == 0 {
+                let o = idx * 4;
+                cv.buf[o] = col[0];
+                cv.buf[o + 1] = col[1];
+                cv.buf[o + 2] = col[2];
+                cv.buf[o + 3] = 255;
+            }
+        }
+    }
+}
+
 /// 渲染一枚图标成 HICON。`size` 是成品边长（16/32…），内部 4× 超采样。
 ///
 /// 返回的 HICON 由调用方负责 `DestroyIcon`（`IconCache` 统一持有）。
@@ -912,6 +988,11 @@ pub fn render(kind: Kind, round: bool, color: bool, dark: bool, size: i32) -> HI
     let size = size.clamp(16, 256);
     let mut cv = Cv::new(size);
     draw(kind, &mut cv, round, color, dark);
+    // 圆角风格：加一圈描边，与"直角=纯扁平"形成明显的两套轮廓语言。
+    if round {
+        let p = pal_for(kind, color, dark);
+        add_outline(&mut cv, outline_col(&p, color), 6);
+    }
     bake(&cv, size)
 }
 
