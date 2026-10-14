@@ -42,8 +42,7 @@
       "max_tabs": 16,
       "open_new_tab_on_double_click": true
     },
-    "icon_style": "square",
-    "icon_tone": "mono"
+    "icon_theme": "default"
   },
   "files": {
     "view": {

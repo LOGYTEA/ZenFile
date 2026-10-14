@@ -1,16 +1,16 @@
-//! 自绘图标主题（第48轮）。
+//! 自绘图标主题（两套）。
 //!
-//! 用户要求设置-外观里可切换 4 套图标 = 风格(直角/圆角) × 颜色(黑白/彩色)：
-//!   - **直角黑白 = 现在这套系统 Shell 图标**（默认，零回归 —— 本模块不接管）；
-//!   - 其余三套（直角彩色 / 圆角黑白 / 圆角彩色）由本模块参数化自绘。
+//! 设置-外观里的图标主题只有两个选项：
+//!   - **default = 系统 Shell 图标**（零回归，本模块不接管）；
+//!   - **optimized = 本模块参数化自绘的"优化"套**（圆角、柔和、和谐配色）。
 //!
 //! 实现：SDF（有符号距离场）软渲染到 4× 超采样缓冲，box 降采样出抗锯齿，
 //! premultiplied BGRA → `CreateIconIndirect` 出 HICON。所有图形定义在 32 单位
-//! 设计网格上，风格只改圆角半径、配色只换调色板 —— 一套几何画出三套。
+//! 设计网格上，统一圆角语言 + 一套和谐配色。
 //!
 //! 纪律：
 //!   - 图标由本模块渲染，调用方（`IconCache`）负责缓存与销毁；
-//!   - 直角黑白组合**绝不能**落到本模块（is_default_combo 的调用方守卫）。
+//!   - default 组合**绝不**落到本模块（active() 的调用方守卫）。
 
 use windows::Win32::Foundation::COLORREF;
 use windows::Win32::Graphics::Gdi::{
@@ -45,20 +45,13 @@ pub enum Kind {
     Generic,
 }
 
-/// 直角黑白 = 现在这套（系统图标），本模块不接管。
-pub fn is_default_combo(style: &str, tone: &str) -> bool {
-    style != "round" && tone != "color"
-}
-
 // ---------------------------------------------------------------- 全局主题状态
 
 struct Spec {
-    round: bool,
-    color: bool,
     dark: bool,
 }
 
-/// 当前生效的主题。`None` = 直角黑白 = 系统图标（默认）。
+/// 当前生效的主题。`None` = default = 系统图标（默认，本模块不接管）。
 ///
 /// 全局而不是 IconCache 字段：`stock_icon` / `menu_bmp_for` 这两个入口是
 /// 自由函数（没有 &mut IconCache，见 icons.rs 里同样原因的 STOCK 静态缓存），
@@ -78,17 +71,16 @@ fn norm_path(p: &str) -> String {
     p.replace('/', "\\").trim_end_matches('\\').to_lowercase()
 }
 
-/// 应用主题。`style`/`tone` 是配置值；combo 为默认（直角黑白）时清空状态，
+/// 应用主题。`theme` 是配置值（`default`/`optimized`）；`default` 清空状态，
 /// 一切回到系统图标。**销毁旧主题的全部 HICON** —— 调用方负责清按句柄值
 /// 当 key 的派生缓存（`IconCache::on_theme_changed`）。
 ///
-/// `dark` 只影响黑白套（暗色主题配浅墨、亮色主题配深墨），彩色套通用。
-pub fn set_theme(style: &str, tone: &str, dark: bool) {
+/// `dark` 记录当前明暗，供优化套里需要随底色切换的细节点使用。
+pub fn set_theme(theme: &str, dark: bool) {
     unsafe {
-        // 已知文件夹表：任何主题都要（系统图标模式下 dir_icon 不走这里，
-        // 但切到主题的第一帧就要用，先解析好）。
-        KNOWN.clear();
-        if !is_default_combo(style, tone) {
+        let next = if theme == "optimized" {
+            // 已知文件夹表：切到主题的第一帧就要用，先解析好。
+            KNOWN.clear();
             use fm_core::paths::known_folder;
             let mut push = |name: &str, kind: Kind| {
                 if let Some(p) = known_folder(name) {
@@ -104,13 +96,14 @@ pub fn set_theme(style: &str, tone: &str, dark: bool) {
             if let Ok(p) = std::env::var("USERPROFILE") {
                 KNOWN.push((norm_path(&p), Kind::Home));
             }
-        }
-
-        let next =
-            if is_default_combo(style, tone) { None } else { Some(Spec { round: style == "round", color: tone == "color", dark }) };
+            Some(Spec { dark })
+        } else {
+            KNOWN.clear();
+            None
+        };
         let unchanged = match (&SPEC, &next) {
             (None, None) => true,
-            (Some(a), Some(b)) => a.round == b.round && a.color == b.color && a.dark == b.dark,
+            (Some(a), Some(b)) => a.dark == b.dark,
             _ => false,
         };
         if unchanged {
@@ -132,7 +125,7 @@ pub fn set_theme(style: &str, tone: &str, dark: bool) {
     }
 }
 
-/// 主题是否接管（非默认 combo）。
+/// 主题是否接管（default 之外）。
 pub fn active() -> bool {
     unsafe { SPEC.is_some() }
 }
@@ -149,7 +142,7 @@ pub fn get(kind: Kind, size: i32) -> Option<HICON> {
                 return Some(*h);
             }
         }
-        let h = render(kind, spec.round, spec.color, spec.dark, size);
+        let h = render(kind, spec.dark, size);
         if h.0.is_null() {
             return None;
         }
@@ -262,13 +255,13 @@ pub fn ui_icon(kind: Ui, size: i32, color: COLORREF) -> Option<HICON> {
                 return Some(*h);
             }
         }
-        let round = SPEC.as_ref().map(|s| s.round).unwrap_or(false);
         let rgb = [
             (ckey & 0xFF) as u8,
             ((ckey >> 8) & 0xFF) as u8,
             ((ckey >> 16) & 0xFF) as u8,
         ];
-        let h = render_ui(kind, round, rgb, size);
+        // 优化套的 UI 字形统一用圆头（圆角语言）。
+        let h = render_ui(kind, rgb, size);
         if h.0.is_null() {
             return None;
         }
@@ -285,9 +278,9 @@ pub fn ui_icon(kind: Ui, size: i32, color: COLORREF) -> Option<HICON> {
     }
 }
 
-fn render_ui(kind: Ui, round: bool, rgb: [u8; 3], size: i32) -> HICON {
+fn render_ui(kind: Ui, rgb: [u8; 3], size: i32) -> HICON {
     let mut cv = Cv::new(size);
-    draw_ui(kind, &mut cv, round, rgb);
+    draw_ui(kind, &mut cv, rgb);
     bake(&cv, size)
 }
 
@@ -383,10 +376,11 @@ impl Cv {
 }
 
 /// 画一枚 UI 字形（32 单位设计网格）。
-fn draw_ui(kind: Ui, cv: &mut Cv, round: bool, col: [u8; 3]) {
-    // 笔宽：圆角套略粗（圆头在细笔下显不出来），直角套略细（锐利）。
-    let hw = if round { 2.0 } else { 1.7 };
-    let cap = round;
+fn draw_ui(kind: Ui, cv: &mut Cv, col: [u8; 3]) {
+    // 优化套 UI 字形统一圆头（圆角语言）。
+    let round = true;
+    let hw = 2.0;
+    let cap = true;
     match kind {
         Ui::Back => {
             cv.stroke(12.0, 16.0, 26.0, 16.0, hw, cap, col);
@@ -526,45 +520,27 @@ struct Pal {
     acc: [u8; 3],
 }
 
-fn pal_for(kind: Kind, color: bool, dark: bool) -> Pal {
-    if !color {
-        // 黑白：暗色主题画浅形深线，亮色主题反之 —— 与系统图标一样自适应底色。
-        return if dark {
-            Pal {
-                body: [235, 235, 235],
-                body2: [150, 150, 150],
-                ink: [40, 40, 40],
-                line: [110, 110, 110],
-                acc: [255, 255, 255],
-            }
-        } else {
-            Pal {
-                body: [88, 88, 88],
-                body2: [148, 148, 148],
-                ink: [245, 245, 245],
-                line: [210, 210, 210],
-                acc: [60, 60, 60],
-            }
-        };
-    }
-    // 彩色（暗亮主题通用的扁平配色）
+fn pal_for(kind: Kind, dark: bool) -> Pal {
+    // 优化套统一彩色和谐配色（暗/亮主题通用的扁平色，靠 body2 做层次）。
+    // `dark` 预留给未来随底色微调的细节点（当前未使用，避免两套调色板漂移）。
+    let _ = dark;
     match kind {
-        Kind::Folder => Pal { body: [247, 200, 67], body2: [217, 164, 40], ink: [146, 106, 20], line: [180, 138, 34], acc: [255, 224, 120] },
-        Kind::Drive => Pal { body: [154, 166, 178], body2: [116, 128, 142], ink: [66, 76, 88], line: [88, 98, 110], acc: [61, 220, 132] },
-        Kind::ThisPc | Kind::Desktop => Pal { body: [46, 58, 71], body2: [107, 119, 133], ink: [30, 40, 52], line: [70, 82, 96], acc: [76, 141, 255] },
-        Kind::RecycleEmpty | Kind::RecycleFull => Pal { body: [143, 176, 201], body2: [108, 140, 167], ink: [58, 82, 102], line: [88, 118, 142], acc: [236, 240, 244] },
-        Kind::Home => Pal { body: [242, 232, 220], body2: [211, 106, 74], ink: [139, 94, 60], line: [176, 150, 124], acc: [255, 255, 255] },
-        Kind::Download => Pal { body: [107, 119, 133], body2: [76, 88, 102], ink: [40, 50, 62], line: [70, 82, 96], acc: [76, 141, 255] },
-        Kind::Documents | Kind::Txt => Pal { body: [245, 245, 247], body2: [214, 214, 218], ink: [140, 150, 164], line: [176, 184, 196], acc: [76, 141, 255] },
-        Kind::Pictures | Kind::ImageFile => Pal { body: [245, 245, 247], body2: [214, 214, 218], ink: [126, 200, 227], line: [176, 184, 196], acc: [76, 175, 125] },
-        Kind::Music => Pal { body: [245, 245, 247], body2: [214, 214, 218], ink: [167, 139, 250], line: [176, 184, 196], acc: [167, 139, 250] },
-        Kind::Videos | Kind::VideoFile => Pal { body: [46, 58, 71], body2: [107, 119, 133], ink: [224, 92, 92], line: [70, 82, 96], acc: [236, 238, 242] },
-        Kind::AudioFile => Pal { body: [245, 245, 247], body2: [214, 214, 218], ink: [244, 143, 177], line: [176, 184, 196], acc: [244, 143, 177] },
-        Kind::Exe => Pal { body: [236, 238, 242], body2: [76, 141, 255], ink: [46, 58, 71], line: [176, 184, 196], acc: [255, 255, 255] },
-        Kind::Pdf => Pal { body: [245, 245, 247], body2: [214, 214, 218], ink: [224, 82, 82], line: [176, 184, 196], acc: [255, 255, 255] },
-        Kind::Archive => Pal { body: [212, 168, 67], body2: [180, 138, 48], ink: [120, 94, 36], line: [150, 118, 44], acc: [255, 236, 170] },
-        Kind::Code => Pal { body: [245, 245, 247], body2: [214, 214, 218], ink: [61, 220, 132], line: [176, 184, 196], acc: [61, 220, 132] },
-        Kind::Generic => Pal { body: [245, 245, 247], body2: [214, 214, 218], ink: [140, 150, 164], line: [176, 184, 196], acc: [140, 150, 164] },
+        Kind::Folder => Pal { body: [255, 196, 84], body2: [244, 173, 54], ink: [255, 255, 255], line: [214, 150, 46], acc: [255, 232, 150] },
+        Kind::Drive => Pal { body: [126, 140, 156], body2: [98, 112, 128], ink: [70, 82, 96], line: [84, 96, 110], acc: [80, 220, 140] },
+        Kind::ThisPc | Kind::Desktop => Pal { body: [78, 90, 106], body2: [98, 112, 130], ink: [255, 255, 255], line: [70, 82, 96], acc: [120, 174, 246] },
+        Kind::RecycleEmpty | Kind::RecycleFull => Pal { body: [150, 178, 202], body2: [120, 150, 175], ink: [60, 84, 104], line: [110, 140, 165], acc: [236, 240, 244] },
+        Kind::Home => Pal { body: [255, 222, 176], body2: [232, 150, 92], ink: [196, 120, 70], line: [210, 170, 130], acc: [255, 255, 255] },
+        Kind::Download => Pal { body: [86, 150, 240], body2: [70, 132, 222], ink: [255, 255, 255], line: [70, 132, 222], acc: [255, 255, 255] },
+        Kind::Documents | Kind::Txt => Pal { body: [255, 255, 255], body2: [231, 234, 239], ink: [150, 158, 170], line: [196, 202, 212], acc: [86, 150, 240] },
+        Kind::Pictures | Kind::ImageFile => Pal { body: [231, 234, 240], body2: [208, 212, 221], ink: [120, 180, 230], line: [196, 202, 212], acc: [90, 196, 140] },
+        Kind::Music => Pal { body: [255, 255, 255], body2: [231, 234, 239], ink: [150, 120, 245], line: [196, 202, 212], acc: [150, 120, 245] },
+        Kind::Videos | Kind::VideoFile => Pal { body: [78, 90, 106], body2: [98, 112, 130], ink: [255, 255, 255], line: [70, 82, 96], acc: [236, 238, 242] },
+        Kind::AudioFile => Pal { body: [255, 255, 255], body2: [231, 234, 239], ink: [240, 130, 175], line: [196, 202, 212], acc: [240, 130, 175] },
+        Kind::Exe => Pal { body: [86, 150, 240], body2: [70, 132, 222], ink: [255, 255, 255], line: [196, 202, 212], acc: [255, 255, 255] },
+        Kind::Pdf => Pal { body: [255, 255, 255], body2: [231, 234, 239], ink: [228, 82, 82], line: [196, 202, 212], acc: [255, 255, 255] },
+        Kind::Archive => Pal { body: [214, 168, 72], body2: [186, 142, 56], ink: [120, 92, 38], line: [158, 120, 50], acc: [255, 236, 170] },
+        Kind::Code => Pal { body: [255, 255, 255], body2: [231, 234, 239], ink: [80, 200, 130], line: [196, 202, 212], acc: [80, 200, 130] },
+        Kind::Generic => Pal { body: [255, 255, 255], body2: [231, 234, 239], ink: [150, 158, 170], line: [196, 202, 212], acc: [150, 158, 170] },
     }
 }
 
@@ -698,90 +674,84 @@ const SS: i32 = 4;
 
 // ---------------------------------------------------------------- 各图标绘制
 
-fn draw(kind: Kind, cv: &mut Cv, round: bool, color: bool, dark: bool) {
-    let p = pal_for(kind, color, dark);
-    // 直角=完全不倒角（r=0，锋利扁平的 metro 风）；圆角=大幅倒角（明显圆润泡泡）。
-    // 两套轮廓语言在此拉开差距，光靠半径量级就足以在小尺寸下区分。
-    let r = if round { 5.0 } else { 0.0 };
-    let r2 = if round { 3.5 } else { 0.0 };
+/// 绘制一枚优化的自绘图标（32 单位设计网格）。
+///
+/// `dark` 预留给未来随底色微调的细节点（当前所有图形对明暗底色都自适应：
+/// 主体用中明度彩色、细节用对比色，不依赖背景）。
+fn draw(kind: Kind, cv: &mut Cv, dark: bool) {
+    let _ = dark;
+    let p = pal_for(kind, dark);
     let (b, b2, ink, line, acc) = (p.body, p.body2, p.ink, p.line, p.acc);
+    let r = 4.0; // 主圆角
+    let r2 = 3.0; // 次级圆角
 
     match kind {
         Kind::Folder => {
-            // 后片（标签）
-            cv.fill([2.0, 5.0, 17.0, 13.0], b2, |x, y| sd_rrect(x, y, 2.5, 5.5, 13.5, 7.5, r2));
-            // 前片
-            cv.fill([2.0, 9.0, 30.0, 27.0], b, |x, y| sd_rrect(x, y, 2.5, 9.5, 27.0, 17.0, r));
+            // 背片（标签）+ 前片主体：经典文件夹剪影
+            cv.fill([3.0, 4.5, 13.5, 11.0], b2, |x, y| sd_rrect(x, y, 4.0, 5.0, 11.0, 6.0, 2.5));
+            cv.fill([2.5, 9.0, 29.5, 28.0], b, |x, y| sd_rrect(x, y, 3.0, 9.5, 26.5, 18.0, r));
         }
         Kind::Drive => {
-            cv.fill([2.0, 10.0, 30.0, 23.0], b, |x, y| sd_rrect(x, y, 2.5, 10.5, 27.0, 12.0, r));
-            cv.fill([3.0, 17.0, 29.0, 19.0], b2, |x, y| sd_seg(x, y, 4.0, 18.0, 28.0, 18.0, 0.7));
-            cv.fill([23.0, 19.0, 27.5, 22.5], acc, |x, y| {
-                sd_ellipse(x, y, 25.2, 20.7, 1.5, 1.5)
-            });
+            // 硬盘：盘体 + 盘片 + 轴心 + LED + 标签
+            cv.fill([2.5, 8.5, 29.5, 23.5], b, |x, y| sd_rrect(x, y, 3.0, 9.0, 26.5, 14.0, r));
+            cv.fill([7.0, 11.5, 25.0, 20.5], b2, |x, y| sd_ellipse(x, y, 16.0, 16.0, 8.5, 4.5));
+            cv.fill([13.5, 14.0, 18.5, 18.0], line, |x, y| sd_ellipse(x, y, 16.0, 16.0, 2.5, 2.5));
+            cv.fill([24.0, 10.5, 27.0, 13.5], acc, |x, y| sd_ellipse(x, y, 25.5, 12.0, 1.4, 1.4));
+            cv.fill([21.0, 18.5, 27.0, 21.0], b2, |x, y| sd_rrect(x, y, 21.5, 19.0, 5.0, 2.0, 0.8));
         }
         Kind::ThisPc => {
-            cv.fill([3.0, 4.0, 29.0, 21.0], b, |x, y| sd_rrect(x, y, 3.5, 4.5, 25.0, 16.0, r2));
-            cv.fill([5.0, 6.0, 27.0, 18.0], acc, |x, y| sd_rrect(x, y, 5.5, 6.5, 21.0, 11.0, r2 * 0.7));
-            cv.fill([10.0, 20.0, 22.0, 27.0], b2, |x, y| {
-                sd_poly(x, y, &[[13.5, 20.5], [18.5, 20.5], [21.0, 25.5], [11.0, 25.5]])
-                    .min(sd_rrect(x, y, 8.5, 25.0, 15.0, 2.6, 1.0))
-            });
+            // 显示器：屏 + 内屏 + 颈 + 底座
+            cv.fill([4.0, 4.0, 28.0, 20.0], b, |x, y| sd_rrect(x, y, 4.5, 4.5, 23.5, 15.0, r));
+            cv.fill([6.5, 6.5, 25.5, 17.5], acc, |x, y| sd_rrect(x, y, 7.0, 7.0, 18.5, 10.0, r2));
+            cv.fill([14.0, 19.5, 18.0, 23.5], b2, |x, y| sd_rrect(x, y, 14.5, 20.0, 3.0, 3.5, 0.8));
+            cv.fill([10.0, 23.5, 22.0, 27.0], b2, |x, y| sd_rrect(x, y, 10.5, 24.0, 11.0, 3.0, 1.6));
         }
         Kind::RecycleEmpty | Kind::RecycleFull => {
             if kind == Kind::RecycleFull {
-                // 溢出的纸团
-                cv.fill([9.0, 2.0, 24.0, 10.0], acc, |x, y| {
-                    sd_ellipse(x, y, 12.8, 6.8, 2.6, 2.4)
-                        .min(sd_ellipse(x, y, 17.0, 5.2, 3.0, 2.8))
-                        .min(sd_ellipse(x, y, 21.0, 7.0, 2.4, 2.2))
+                cv.fill([9.0, 1.5, 24.0, 9.0], acc, |x, y| {
+                    sd_ellipse(x, y, 12.5, 6.5, 2.6, 2.3)
+                        .min(sd_ellipse(x, y, 17.0, 4.8, 3.0, 2.6))
+                        .min(sd_ellipse(x, y, 21.0, 6.6, 2.3, 2.1))
                 });
             }
-            // 提手
-            cv.fill([12.0, 3.5, 20.0, 7.5], b2, |x, y| sd_rrect(x, y, 12.5, 4.0, 7.0, 3.0, 1.2));
-            // 桶盖
-            cv.fill([6.0, 6.0, 26.0, 11.5], b2, |x, y| sd_rrect(x, y, 6.5, 6.5, 19.0, 4.5, r2));
-            // 桶身（上宽下窄）
+            cv.fill([12.0, 3.0, 20.0, 6.5], b2, |x, y| sd_rrect(x, y, 12.5, 3.5, 7.0, 2.8, 1.2));
+            cv.fill([5.5, 6.0, 26.5, 11.0], b2, |x, y| sd_rrect(x, y, 6.0, 6.5, 19.5, 4.2, r2));
             cv.fill([8.0, 10.0, 24.0, 29.0], b, |x, y| {
                 sd_poly(x, y, &[[9.0, 10.5], [23.0, 10.5], [21.0, 28.0], [11.0, 28.0]])
             });
-            // 竖纹
             for gx in [13.0f32, 16.0, 19.0] {
-                cv.fill([gx - 1.2, 12.0, gx + 1.2, 27.0], line, move |x, y| {
-                    sd_seg(x, y, gx, 13.0, gx, 26.0, 0.55)
+                cv.fill([gx - 1.0, 12.5, gx + 1.0, 27.0], line, move |x, y| {
+                    sd_seg(x, y, gx, 13.0, gx, 26.0, 0.5)
                 });
             }
         }
         Kind::Home => {
-            cv.fill([1.0, 3.0, 31.0, 15.0], b2, |x, y| {
-                sd_poly(x, y, &[[16.0, 4.0], [29.0, 14.0], [3.0, 14.0]])
+            cv.fill([2.5, 13.5, 29.5, 28.5], b2, move |x, y| {
+                sd_poly(x, y, &[[16.0, 3.5], [29.5, 14.5], [2.5, 14.5]])
             });
-            cv.fill([5.0, 12.0, 27.0, 29.0], b, |x, y| sd_rrect(x, y, 5.5, 12.5, 21.0, 16.0, r2));
-            cv.fill([12.0, 19.0, 20.0, 29.0], ink, |x, y| sd_rrect(x, y, 12.5, 19.5, 7.0, 9.0, r2));
+            cv.fill([5.0, 12.5, 27.0, 28.5], b, |x, y| sd_rrect(x, y, 5.0, 12.5, 22.0, 16.0, r2));
+            cv.fill([12.0, 17.5, 20.0, 28.5], ink, |x, y| sd_rrect(x, y, 12.5, 18.0, 7.0, 10.0, 1.4));
         }
         Kind::Desktop => {
-            cv.fill([2.0, 5.0, 30.0, 22.0], b, |x, y| sd_rrect(x, y, 2.5, 5.5, 27.0, 16.5, r2));
-            cv.fill([4.0, 7.0, 28.0, 19.0], acc, |x, y| sd_rrect(x, y, 4.5, 7.5, 23.0, 11.0, r2 * 0.7));
-            cv.fill([4.0, 16.0, 28.0, 19.0], b2, |x, y| sd_rrect(x, y, 4.5, 16.2, 23.0, 2.3, 0.6));
-            cv.fill([10.0, 21.0, 22.0, 28.0], b2, |x, y| {
-                sd_poly(x, y, &[[13.5, 21.5], [18.5, 21.5], [21.0, 26.0], [11.0, 26.0]])
-                    .min(sd_rrect(x, y, 8.5, 25.5, 15.0, 2.5, 1.0))
-            });
+            cv.fill([3.5, 5.0, 28.5, 27.0], b, |x, y| sd_rrect(x, y, 4.0, 5.5, 24.5, 21.0, r));
+            cv.fill([4.5, 6.0, 27.5, 11.0], b2, |x, y| sd_rrect(x, y, 5.0, 6.5, 22.5, 4.5, r2));
+            cv.fill([25.0, 8.0, 27.0, 10.0], acc, |x, y| sd_ellipse(x, y, 26.0, 9.0, 1.1, 1.1));
+            cv.fill([8.0, 14.0, 24.0, 16.0], acc, move |x, y| sd_rrect(x, y, 8.5, 14.5, 15.0, 1.4, 0.7));
+            cv.fill([8.0, 19.0, 20.0, 21.0], acc, move |x, y| sd_rrect(x, y, 8.5, 19.5, 11.0, 1.4, 0.7));
         }
         Kind::Download => {
-            cv.fill([8.0, 3.0, 24.0, 21.0], acc, |x, y| {
-                sd_poly(x, y, &[
-                    [16.0, 4.0], [22.0, 12.0], [18.4, 12.0], [18.4, 20.0],
-                    [13.6, 20.0], [13.6, 12.0], [10.0, 12.0],
-                ])
+            // 向下箭头（白）+ 托盘（蓝）
+            cv.fill([9.0, 4.0, 23.0, 13.0], acc, move |x, y| {
+                sd_poly(x, y, &[[16.0, 4.0], [22.0, 12.0], [10.0, 12.0]])
             });
-            cv.fill([4.0, 20.0, 28.0, 28.0], b, |x, y| sd_rrect(x, y, 4.5, 20.5, 23.0, 7.0, r));
+            cv.fill([14.0, 11.0, 18.0, 23.0], acc, move |x, y| sd_seg(x, y, 16.0, 11.0, 16.0, 22.0, 2.2));
+            cv.fill([3.0, 21.0, 29.0, 28.5], b, |x, y| sd_rrect(x, y, 3.5, 21.5, 25.5, 6.5, r));
         }
         Kind::Documents | Kind::Txt | Kind::Generic => {
             let lines_n = if kind == Kind::Txt { 4 } else if kind == Kind::Documents { 3 } else { 0 };
             cv.fill_page(&p, r);
             for i in 0..lines_n {
-                let y = 13.5 + i as f32 * 3.6;
+                let y = 14.0 + i as f32 * 3.6;
                 let x1 = if i == lines_n - 1 { 19.0 } else { 21.5 };
                 cv.fill([10.0, y - 1.0, x1 + 1.0, y + 1.0], ink, move |x, yy| {
                     sd_seg(x, yy, 11.0, y, x1, y, 0.62)
@@ -789,116 +759,97 @@ fn draw(kind: Kind, cv: &mut Cv, round: bool, color: bool, dark: bool) {
             }
         }
         Kind::Pictures | Kind::ImageFile => {
-            // 相框 = 大图；文档页里的小图 = 图片文件。两者共用一套"天+山+太阳"。
             if kind == Kind::Pictures {
-                cv.fill([3.0, 6.0, 29.0, 26.0], b2, |x, y| sd_rrect(x, y, 3.5, 6.5, 25.0, 19.0, r));
+                cv.fill([3.0, 5.0, 29.0, 27.0], b, |x, y| sd_rrect(x, y, 3.5, 5.5, 25.5, 21.0, r));
             } else {
                 cv.fill_page(&p, r);
             }
-            // 画框内区（Pictures）/ 页内小图（ImageFile）
             let (fx, fy, fw, fh) = if kind == Kind::Pictures {
-                (5.5f32, 8.5f32, 21.0f32, 15.0f32)
+                (5.5f32, 7.5, 21.0, 15.0)
             } else {
                 (9.5, 13.0, 13.0, 9.5)
             };
-            // 天
-            let sky = ink;
+            let sky = [150u8, 200, 235];
+            let mount = [90u8, 196, 140];
+            let sun = [255u8, 210, 90];
             let (x0, y0, x1, y1) = (fx, fy, fx + fw, fy + fh);
-            cv.fill([x0, y0, x1, y1], sky, move |x, y| {
-                sd_rrect(x, y, x0, y0, x1 - x0, y1 - y0, if kind == Kind::Pictures { r2 * 0.7 } else { 1.2 })
+            cv.fill([x0, y0, x1, y1], sky, |x, y| {
+                sd_rrect(x, y, x0, y0, x1 - x0, y1 - y0, if kind == Kind::Pictures { 2.5 } else { 1.2 })
             });
-            // 山（双峰）
-            let mount = acc;
             let base = y1 - 0.5;
+            let h = (y1 - y0) * 0.6;
             let midx = (x0 + x1) / 2.0;
             cv.fill([x0, y0, x1, y1], mount, move |x, y| {
-                let h = (y1 - y0) * 0.62;
-                sd_poly(x, y, &[
-                    [x0 + 1.0, base],
-                    [x0 + (x1 - x0) * 0.38, base - h],
-                    [x0 + (x1 - x0) * 0.66, base],
-                ])
-                .min(sd_poly(x, y, &[
-                    [midx + 1.0, base],
-                    [midx + (x1 - x0) * 0.22, base - h * 0.68],
-                    [x1 - 1.0, base],
-                ]))
+                sd_poly(x, y, &[[x0 + 1.0, base], [x0 + (x1 - x0) * 0.4, base - h], [x0 + (x1 - x0) * 0.68, base]])
+                    .min(sd_poly(x, y, &[[midx + 1.0, base], [midx + (x1 - x0) * 0.24, base - h * 0.7], [x1 - 1.0, base]]))
             });
-            // 太阳：彩色 = 暖黄；黑白 = 跟 acc 走（灰阶），别漏出一抹黄破坏整套灰度
-            let sun = if color { [255u8, 206, 92] } else { acc };
             let sx = x1 - (x1 - x0) * 0.22;
-            let sy = y0 + (y1 - y0) * 0.28;
-            let sr = ((x1 - x0) * 0.10).max(1.4);
+            let sy = y0 + (y1 - y0) * 0.26;
+            let sr = ((x1 - x0) * 0.1).max(1.4);
             cv.fill([sx - sr - 0.5, sy - sr - 0.5, sx + sr + 0.5, sy + sr + 0.5], sun, move |x, y| {
                 sd_ellipse(x, y, sx, sy, sr, sr)
             });
         }
         Kind::Music => {
-            cv.fill([8.0, 4.0, 27.0, 27.0], ink, |x, y| {
-                sd_seg(x, y, 15.0, 22.5, 15.0, 7.0, 1.2)
-                    .min(sd_seg(x, y, 23.5, 20.5, 23.5, 5.0, 1.2))
-                    .min(sd_seg(x, y, 15.0, 7.0, 23.5, 5.0, 2.2))
-                    .min(sd_ellipse(x, y, 12.2, 23.0, 3.3, 2.5))
-                    .min(sd_ellipse(x, y, 20.7, 21.0, 3.3, 2.5))
-            });
+            // 双音符（杆 + 横梁 + 两符头）
+            cv.fill([12.5, 5.5, 15.0, 22.0], ink, move |x, y| sd_seg(x, y, 13.8, 6.0, 13.8, 21.5, 1.3));
+            cv.fill([20.5, 3.5, 23.0, 20.0], ink, move |x, y| sd_seg(x, y, 21.8, 4.0, 21.8, 19.5, 1.3));
+            cv.fill([12.5, 4.5, 23.0, 7.0], ink, move |x, y| sd_seg(x, y, 13.8, 5.5, 21.8, 3.5, 1.5));
+            cv.fill([9.5, 20.5, 14.5, 25.5], ink, |x, y| sd_ellipse(x, y, 11.5, 22.5, 3.0, 2.3));
+            cv.fill([18.5, 18.5, 23.5, 23.5], ink, |x, y| sd_ellipse(x, y, 20.5, 20.5, 3.0, 2.3));
         }
         Kind::Videos | Kind::VideoFile => {
             if kind == Kind::Videos {
-                cv.fill([2.0, 7.0, 30.0, 25.0], b, |x, y| sd_rrect(x, y, 2.5, 7.5, 27.0, 17.0, r));
-                for py in [10.5f32, 16.0, 21.5] {
-                    cv.fill([4.0, py - 1.3, 7.5, py + 1.3], acc, move |x, y| {
-                        sd_rrect(x, y, 4.2, py - 1.1, 2.6, 2.2, 0.5)
-                    });
-                }
-                cv.fill([10.0, 11.0, 24.0, 21.0], ink, |x, y| {
-                    sd_poly(x, y, &[[13.0, 12.0], [22.5, 16.0], [13.0, 20.0]])
-                });
+                cv.fill([2.5, 7.0, 29.5, 25.0], b, |x, y| sd_rrect(x, y, 3.0, 7.5, 26.5, 17.0, r));
+                // 三角必须顺时针（正 shoelace），反了整个形状会翻成"外面"（第51轮实测）
+                cv.fill([11.0, 10.5, 23.0, 21.5], acc, move |x, y| sd_poly(x, y, &[[13.0, 20.5], [13.0, 11.5], [22.0, 16.0]]));
             } else {
                 cv.fill_page(&p, r);
-                cv.fill([10.0, 13.0, 23.0, 24.0], ink, |x, y| {
-                    sd_poly(x, y, &[[12.5, 14.5], [21.0, 18.8], [12.5, 23.0]])
-                });
+                cv.fill([9.5, 12.5, 22.5, 24.5], acc, move |x, y| sd_poly(x, y, &[[12.0, 23.0], [12.0, 14.0], [21.0, 18.5]]));
             }
         }
         Kind::AudioFile => {
             cv.fill_page(&p, r);
-            cv.fill([10.0, 11.0, 23.0, 25.0], ink, |x, y| {
-                sd_seg(x, y, 15.2, 21.5, 15.2, 12.5, 1.0)
-                    .min(sd_seg(x, y, 15.2, 12.8, 20.0, 14.6, 1.6))
-                    .min(sd_ellipse(x, y, 13.0, 22.2, 2.4, 1.9))
-            });
+            for (bx, by0, by1) in [(11.0f32, 18.0, 24.0), (15.0, 14.0, 24.0), (19.0, 16.0, 24.0)] {
+                cv.fill([bx - 1.0, by0, bx + 1.0, by1], acc, move |x, y| sd_rrect(x, y, bx - 1.0, by0, 2.0, by1 - by0, 1.0));
+            }
         }
         Kind::Exe => {
-            cv.fill([4.0, 5.0, 28.0, 27.0], b, |x, y| sd_rrect(x, y, 4.5, 5.5, 23.0, 21.0, r));
-            cv.fill([4.0, 5.0, 28.0, 11.0], b2, |x, y| sd_rrect(x, y, 4.5, 5.5, 23.0, 5.0, r));
-            for gx in [9.0f32, 12.0, 15.0] {
-                cv.fill([gx - 1.1, 6.8, gx + 1.1, 9.0], acc, move |x, y| {
-                    sd_ellipse(x, y, gx, 7.9, 0.85, 0.85)
+            cv.fill([4.0, 4.0, 28.0, 28.0], b, |x, y| sd_rrect(x, y, 4.5, 4.5, 23.5, 23.5, r));
+            // 白齿轮
+            cv.fill([5.0, 5.0, 27.0, 27.0], acc, |x, y| {
+                sd_ellipse(x, y, 16.0, 16.0, 9.5, 9.5).max(-sd_ellipse(x, y, 16.0, 16.0, 6.0, 6.0))
+            });
+            for k in 0..8 {
+                let a = (k as f32) * std::f32::consts::PI / 4.0;
+                let (s, c) = a.sin_cos();
+                cv.fill([4.0, 4.0, 28.0, 28.0], acc, move |x, y| {
+                    sd_seg(x, y, 16.0 + 8.5 * c, 16.0 + 8.5 * s, 16.0 + 12.0 * c, 16.0 + 12.0 * s, 1.5)
                 });
             }
-            cv.fill([10.0, 13.0, 22.0, 25.0], b2, |x, y| sd_ellipse(x, y, 16.0, 18.5, 4.6, 4.6));
-            cv.fill([13.5, 16.0, 18.5, 21.0], b, |x, y| sd_ellipse(x, y, 16.0, 18.5, 2.0, 2.0));
+            cv.fill([12.5, 12.5, 19.5, 19.5], b, |x, y| sd_ellipse(x, y, 16.0, 16.0, 3.0, 3.0));
         }
         Kind::Pdf => {
             cv.fill_page(&p, r);
-            cv.fill([9.0, 16.0, 23.0, 23.0], ink, |x, y| sd_rrect(x, y, 9.5, 16.5, 13.0, 6.0, 1.4));
-            cv.fill([11.0, 18.0, 20.5, 19.6], acc, |x, y| sd_rrect(x, y, 11.2, 18.1, 8.6, 1.4, 0.5));
-            cv.fill([11.0, 20.3, 17.5, 21.9], acc, |x, y| sd_rrect(x, y, 11.2, 20.4, 6.0, 1.4, 0.5));
+            cv.fill([8.5, 17.0, 23.5, 23.5], ink, |x, y| sd_rrect(x, y, 9.0, 17.5, 14.0, 5.5, 1.4));
+            cv.fill([11.0, 19.0, 21.0, 20.4], acc, |x, y| sd_rrect(x, y, 11.2, 19.1, 9.6, 1.2, 0.5));
+            cv.fill([11.0, 21.0, 17.5, 22.4], acc, |x, y| sd_rrect(x, y, 11.2, 21.1, 6.0, 1.2, 0.5));
         }
         Kind::Archive => {
-            cv.fill([4.0, 9.0, 28.0, 29.0], b, |x, y| sd_rrect(x, y, 4.5, 9.5, 23.0, 19.0, r));
-            cv.fill([5.0, 14.0, 27.0, 16.0], b2, |x, y| sd_seg(x, y, 5.5, 15.0, 26.5, 15.0, 0.8));
-            cv.fill([14.0, 14.0, 18.0, 29.0], b2, |x, y| sd_seg(x, y, 16.0, 15.0, 16.0, 28.0, 1.3));
-            cv.fill([13.0, 17.0, 19.0, 21.5], acc, |x, y| sd_rrect(x, y, 13.5, 17.5, 5.0, 3.5, 1.0));
+            cv.fill([4.0, 9.0, 28.0, 27.0], b, |x, y| sd_rrect(x, y, 4.5, 9.5, 23.0, 17.0, r));
+            cv.fill([3.0, 6.0, 29.0, 11.5], b2, |x, y| sd_rrect(x, y, 3.5, 6.5, 25.0, 4.5, r2));
+            cv.fill([4.5, 16.0, 27.5, 18.5], line, |x, y| sd_rrect(x, y, 5.0, 16.2, 22.0, 2.0, 0.6));
+            cv.fill([14.0, 9.5, 18.0, 27.0], line, |x, y| sd_rrect(x, y, 14.5, 9.5, 3.0, 17.0, 0.6));
         }
         Kind::Code => {
             cv.fill_page(&p, r);
+            // 绿色 </>
             cv.fill([8.0, 12.0, 24.0, 23.0], ink, |x, y| {
                 sd_seg(x, y, 13.0, 14.5, 10.2, 17.5, 1.0)
                     .min(sd_seg(x, y, 10.2, 17.5, 13.0, 20.5, 1.0))
                     .min(sd_seg(x, y, 19.0, 14.5, 21.8, 17.5, 1.0))
                     .min(sd_seg(x, y, 21.8, 17.5, 19.0, 20.5, 1.0))
-                    .min(sd_seg(x, y, 17.6, 13.6, 15.0, 21.4, 0.9))
+                    .min(sd_seg(x, y, 15.0, 13.6, 17.6, 21.4, 0.9))
             });
         }
     }
@@ -906,93 +857,13 @@ fn draw(kind: Kind, cv: &mut Cv, round: bool, color: bool, dark: bool) {
 
 // ---------------------------------------------------------------- 渲染出口
 
-/// 按亮度选描边色：主体偏暗就向浅色混，偏亮就向深色混 —— 保证描边与图标本体
-/// 形成对比边缘（不管底色深浅都能读出来）。仅圆角风格调用。
-fn outline_col(p: &Pal, color: bool) -> [u8; 3] {
-    if !color {
-        return p.line;
-    }
-    let lum = (p.body[0] as u32 + p.body[1] as u32 + p.body[2] as u32) / 3;
-    if lum < 140 {
-        mix(p.body, [235, 235, 235], 0.55)
-    } else {
-        mix(p.body, [40, 40, 40], 0.5)
-    }
-}
-
-fn mix(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
-    [
-        (a[0] as f32 + (b[0] as f32 - a[0] as f32) * t).round().clamp(0.0, 255.0) as u8,
-        (a[1] as f32 + (b[1] as f32 - a[1] as f32) * t).round().clamp(0.0, 255.0) as u8,
-        (a[2] as f32 + (b[2] as f32 - a[2] as f32) * t).round().clamp(0.0, 255.0) as u8,
-    ]
-}
-
-/// 给已画好的图标加一圈**圆角描边**（仅圆角风格）。做法：把超采样 alpha 做
-/// 圆形膨胀，外环填描边色。直角风格不调用 —— 保持纯扁平填充的 metro 语言。
-fn add_outline(cv: &mut Cv, col: [u8; 3], grow: i32) {
-    let w = cv.w as usize;
-    let h = w; // 正方形画布
-    let mut mask = vec![0u8; w * h];
-    for (i, slot) in mask.iter_mut().enumerate() {
-        *slot = if cv.buf[i * 4 + 3] >= 128 { 1 } else { 0 };
-    }
-    let g2 = grow * grow;
-    let mut dmask = vec![0u8; w * h];
-    for y in 0..h as i32 {
-        for x in 0..w as i32 {
-            let mut hit = 0u8;
-            for dy in -grow..=grow {
-                let yy = y + dy;
-                if yy < 0 || yy >= h as i32 {
-                    continue;
-                }
-                for dx in -grow..=grow {
-                    let xx = x + dx;
-                    if xx < 0 || xx >= w as i32 {
-                        continue;
-                    }
-                    if dx * dx + dy * dy > g2 {
-                        continue;
-                    }
-                    if mask[yy as usize * w + xx as usize] == 1 {
-                        hit = 1;
-                        break;
-                    }
-                }
-                if hit == 1 {
-                    break;
-                }
-            }
-            dmask[y as usize * w + x as usize] = hit;
-        }
-    }
-    for y in 0..h {
-        for x in 0..w {
-            let idx = y * w + x;
-            if dmask[idx] == 1 && mask[idx] == 0 {
-                let o = idx * 4;
-                cv.buf[o] = col[0];
-                cv.buf[o + 1] = col[1];
-                cv.buf[o + 2] = col[2];
-                cv.buf[o + 3] = 255;
-            }
-        }
-    }
-}
-
 /// 渲染一枚图标成 HICON。`size` 是成品边长（16/32…），内部 4× 超采样。
 ///
 /// 返回的 HICON 由调用方负责 `DestroyIcon`（`IconCache` 统一持有）。
-pub fn render(kind: Kind, round: bool, color: bool, dark: bool, size: i32) -> HICON {
+pub fn render(kind: Kind, dark: bool, size: i32) -> HICON {
     let size = size.clamp(16, 256);
     let mut cv = Cv::new(size);
-    draw(kind, &mut cv, round, color, dark);
-    // 圆角风格：加一圈描边，与"直角=纯扁平"形成明显的两套轮廓语言。
-    if round {
-        let p = pal_for(kind, color, dark);
-        add_outline(&mut cv, outline_col(&p, color), 6);
-    }
+    draw(kind, &mut cv, dark);
     bake(&cv, size)
 }
 

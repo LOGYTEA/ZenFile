@@ -1710,15 +1710,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                         settings::apply_sel_bar_action(app, action);
                         let _ = InvalidateRect(Some(hwnd), None, true);
                     }
-                    // 图标主题（第48轮，设置-外观页）：4101/4102 风格，4103/4104 颜色。
+                    // 图标主题（设置-外观页）：4101=默认(系统)，4102=优化。
                     // **必须排在下面 >= 3000 的系统菜单分支之前**，否则会被当成
     // 注册表开关（第35轮同款顺序坑）。
-                    Some(settings::Hit::Row(action)) if (4101..=4104).contains(&action) => {
+                    Some(settings::Hit::Row(action)) if (4101..=4102).contains(&action) => {
                         match action {
-                            4101 => app.set_icon_style("square"),
-                            4102 => app.set_icon_style("round"),
-                            4103 => app.set_icon_tone("mono"),
-                            _ => app.set_icon_tone("color"),
+                            4101 => app.set_icon_theme("default"),
+                            _ => app.set_icon_theme("optimized"),
                         }
                         let _ = InvalidateRect(Some(hwnd), None, true);
                     }
