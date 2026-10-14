@@ -1032,9 +1032,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         WM_MOUSEMOVE => {
             let app = &mut *app_ptr;
             let (x, y) = client_xy(hwnd, lparam);
-            // 重挂一次"鼠标离开"跟踪：不挂就永远收不到 WM_MOUSELEAVE，
-            // 鼠标划出窗口之后悬停态会一直赖在画面上（见 track_mouse_leave）。
-            track_mouse_leave(hwnd);
+            // 重挂"鼠标离开"跟踪：不挂就永远收不到 WM_MOUSELEAVE，鼠标划出
+            // 窗口之后悬停态会一直赖在画面上（见 track_mouse_leave）。
+            // **只在没挂上时挂**（第54轮）：每次移动都重挂的话，光标从窗口边框
+            // （非客户区）划进客户区的那一下，系统会把"离开了客户区"的滞回
+            // 事件补发成一次 WM_MOUSELEAVE —— 刚设好的悬停当场被清掉，鼠标
+            // 停住不动就再也亮不起来（"悬停效果没了"真因）。
+            track_mouse_leave(app, hwnd);
             let l = paint::layout_for(app);
             // 圆角滑杆拖动。**必须排在 settings_drag 判定之前**：按下滑杆时
             // 只置了 radius_drag 标志、并没有设 settings_drag —— 早先这段
@@ -1076,6 +1080,15 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             // 正在拖条目 / 拉框选：更新当前点、重算投放目标并重画。
             // 必须排在别的命中之前 —— 拖拽期间不该改变选中集。
             if app.drag.is_some() {
+                // 兜底（第54轮）：捕获被弹出的菜单/对话框抢走的话，WM_LBUTTONUP
+                // 永远到不了这里，框选矩形就**永远赖在画面上**（用户截到的"半透
+                // 明蓝块"就是它），期间悬停也被这条分支吞掉。左键已经不在按下
+                // 态 = 松手消息丢了，就地收摊，然后继续往下走正常悬停。
+                if GetKeyState(0x01) >= 0 {
+                    finish_drag(app, &l, x, y);
+                    let _ = ReleaseCapture();
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                }
                 let ctrl_now = (wparam.0 & 0x0008) != 0 || GetKeyState(0x11) < 0;
                 let was_active = app.drag.as_ref().map(|d| d.active).unwrap_or(false);
                 app.update_drag(x, y, ctrl_now);
@@ -1092,7 +1105,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                         select_marquee_into(app, &l, origin, cur);
                     }
                 }
-                let target = drop_target_at(app, &l, x, y);
+                // 投放目标（描边/悬停标签自动翻开）只属于**拖文件**。框选不是
+                // 拖放：早先这里不分种类一律算 target，于是拉框选的过程中，
+                // 光标下面那一行被描上一圈 accent 边 —— 细节视图的行是全宽的，
+                // 描边顶边就是一条横贯整个内容区的蓝线（用户截图里那条）。
+                let target = match app.drag.as_ref().map(|d| d.kind) {
+                    Some(app::DragKind::Items) => drop_target_at(app, &l, x, y),
+                    _ => None,
+                };
                 // 拖着文件悬在某个标签上：记下"从第几毫秒开始悬着"，
                 // 满 600ms 由 WM_TIMER 自动把那个标签翻出来（资源管理器同款）。
                 if let Some(t) = &target {
@@ -1419,11 +1439,29 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         // 那条消息是系统在鼠标捕获转移时发的，我们 return 0 就等于
         // 告诉系统"这次捕获变化我处理了" —— 后续的点击/菜单全部失灵
         // （实测：右键菜单弹不出来、快捷键收不到，整个 GUI 输入链断掉）。
-        WM_MOUSELEAVE | WM_NCMOUSELEAVE => {
+        // **这两条必须分开处理**（第54轮"悬停效果没了"真因）：
+        // `WM_NCMOUSELEAVE` 不只在整个窗口失去鼠标时来 —— 光标从窗口边框
+        // （非客户区）**划进客户区**的那一下也会来（离开非客户区=进入客户区）。
+        // 早先把它和 WM_MOUSELEAVE 并成一个分支全清悬停，等于每次从边缘进
+        // 内容区都把悬停清光；鼠标停住不动就再也没有 WM_MOUSEMOVE 来补救，
+        // 画面上就是"悬停哪一行都不亮"。
+        WM_NCMOUSELEAVE => {
             let app = &mut *app_ptr;
-            // **全部**悬停态一次清干净。以前只清标题栏那三个键，于是鼠标划出
-            // 窗口之后内容区那一行还亮着、分隔线还保持高亮、侧栏的行也还反着
-            // 白 —— 回到窗口之前画面一直是旧的（"不自动更新"的另一半）。
+            // 只清**非客户区**自己的悬停态（三大金刚键）。客户区的悬停归
+            // WM_MOUSEMOVE 管：真划出窗口时紧接着还有 WM_MOUSELEAVE 收尾。
+            app.hover_caption = 0;
+            app.pressed_caption = 0;
+            app.hovering_close = false;
+            let _ = InvalidateRect(Some(hwnd), None, false);
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            let app = &mut *app_ptr;
+            // 跟踪已消费：允许下一次 WM_MOUSEMOVE 重新挂上
+            app.mouse_tracked = false;
+            // 鼠标**整个**离开窗口：全部悬停态一次清干净。以前只清标题栏那三个
+            // 键，于是鼠标划出窗口之后内容区那一行还亮着、分隔线还保持高亮、
+            // 侧栏的行也还反着白 —— 回到窗口之前画面一直是旧的。
             // 拖拽状态不清：那是按下之后才有的，鼠标划出去不该打断它。
             app.clear_hover();
             // 光标也跟着复位（离开时还挂着 ↔ 的话，回来之前一直是拉伸图标）
@@ -2993,7 +3031,7 @@ fn show_header_filter_menu(hwnd: HWND, app: &mut App, l: &paint::Layout, col: us
     }
 }
 
-/// 表头右键菜单（第44轮，照用户给的资源管理器截图）：
+/// 表头右键菜单（第44轮，照用户给的资源管理器截图；第54轮改成"前 8 项 + 其他"）：
 ///   将列调整为合适的大小(S)
 ///   将所有列均调整为合适的大小(A)
 ///   ─────────
@@ -3001,11 +3039,23 @@ fn show_header_filter_menu(hwnd: HWND, app: &mut App, l: &paint::Layout, col: us
 ///   ▎修改日期      ← 已显示的列 = 行首橙色竖线（第52轮：
 ///    类型            与右键菜单的选中态同款，不再画 ✓ 勾）
 ///    大小
+///    创建日期
+///    访问日期
+///    属性
+///    文件夹路径
 ///   ─────────
-///   其他(M)...
+///   其他(M)...     ← 打开完整的「选择详细信息」对话框（21 项全列 + 滚动）
+///
+/// 资源管理器也是这套"常用列内联、冷门列收进「更多…」"的折法：菜单里只摆
+/// 最常用的前 N 个，剩下的全塞进「其他(M)...」弹出的对话框里。对话框按
+/// Explorer 样子做成了**可滚动**（不是一次性全摊开），21 项再多也不会把窗口
+/// 撑爆（第54轮 `coldlg.rs` 的动态高度 + WM_MOUSEWHEEL + 裁剪）。
 ///
 /// 之前顶上还有"按X递增/递减排序"和"筛选"两节 —— 用户明确不要
 /// （"不要筛选和排序那些乱七八糟的"）。排序仍然点表头就能做。
+///
+/// 注意：内联的"前 8 项"是 `COL_ALL` 的前 8 个（`take(8)`），顺序与对话框一致；
+/// 调 `COL_ALL` 顺序时这里会跟着变，不用单独同步。
 fn header_choose_columns_rows(app: &App) -> Vec<menu::MenuEntry> {
     let mut v: Vec<menu::MenuEntry> = Vec::new();
     v.push(menu::MenuEntry::item(
@@ -3020,7 +3070,8 @@ fn header_choose_columns_rows(app: &App) -> Vec<menu::MenuEntry> {
     // 搜索态下"选择列"禁用（资源管理器同样：搜索结果的列是固定的）
     let locked = app.tab().search_root.is_some();
     // 名称恒在、恒显、不可点 —— 与 Explorer 一致（没有任何列表能没有"名称"）
-    for id in fm_core::columns::COL_ALL {
+    // 只内联**前 8 个**常用列；其余 13 个走「其他(M)...」对话框（滚动列出）。
+    for id in fm_core::columns::COL_ALL.iter().take(8) {
         let on = app.is_col_visible(id);
         // 选中态 = 右键菜单同款行首橙色竖线（`selected`），悬停时让位给蓝色
         // 悬停条（渲染层的既有规则），与「查看 → 详细信息」一套语言。
@@ -3036,8 +3087,9 @@ fn header_choose_columns_rows(app: &App) -> Vec<menu::MenuEntry> {
         }
     }
     v.push(menu::MenuEntry::sep());
-    // 「其他(M)...」：完整的「选择详细信息」对话框（勾选 + 上移/下移 + 确定/取消）。
-    // 搜索态下列集合是固定的，跟着一起禁用（资源管理器同样）。
+    // 「其他(M)...」：完整的「选择详细信息」对话框（勾选 + 上移/下移 + 确定/取消），
+    // 里面**全部 21 列滚动呈现**（不是一次全摊开）。搜索态下列集合是固定的，
+    // 跟着一起禁用（资源管理器同样）。
     v.push(menu::MenuEntry::item("其他(M)...", menu::Command::ChooseColumns)
         .with_disabled(locked));
     v
@@ -3231,14 +3283,23 @@ fn pack_point(x: i32, y: i32) -> isize {
 ///
 /// 之前这条消息根本不会来（从来没调过 TrackMouseEvent），于是"鼠标都移出窗口
 /// 了，内容区那一行还亮着、分隔线还保持高亮"，只有标题栏三个键靠 WM_ACTIVATE
-/// 那条路勉强清过一次。每次 WM_MOUSEMOVE 重挂一次即可（重复挂是幂等的）。
-fn track_mouse_leave(hwnd: HWND) {
+/// 那条路勉强清过一次。
+///
+/// **挂载语义是"挂一次，收到 leave 后才允许再挂"**（`app.mouse_tracked` 把门）：
+/// TrackMouseEvent 的 TME_LEAVE 跟踪的是**客户区**，光标在非客户区（窗口边框那
+/// 4px）时算"不在客户区"。要是每次 WM_MOUSEMOVE 都重挂，光标从边框划进内容区
+/// 的那一下，系统会把刚才那次"离开客户区"的滞回事件补发成 WM_MOUSELEAVE ——
+/// 悬停刚设好就被清掉，鼠标停住不动就再也亮不起来（第54轮"悬停效果没了"）。
+/// 不带 TME_NONCLIENT：整个窗口离开时客户区必然也被离开，一条 WM_MOUSELEAVE
+/// 就够；WM_NCMOUSELEAVE 的处理分支保留着做兜底。
+fn track_mouse_leave(app: &mut App, hwnd: HWND) {
+    if app.mouse_tracked {
+        return;
+    }
+    app.mouse_tracked = true;
     let mut tme = TRACKMOUSEEVENT {
         cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-        dwFlags: TRACKMOUSEEVENT_FLAGS(
-            windows::Win32::UI::Input::KeyboardAndMouse::TME_LEAVE.0
-                | windows::Win32::UI::Input::KeyboardAndMouse::TME_NONCLIENT.0,
-        ),
+        dwFlags: TRACKMOUSEEVENT_FLAGS(windows::Win32::UI::Input::KeyboardAndMouse::TME_LEAVE.0),
         hwndTrack: hwnd,
         dwHoverTime: 0,
     };

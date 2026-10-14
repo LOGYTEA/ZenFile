@@ -58,12 +58,16 @@ ROW_H = 28
 ORANGE = (61, 163, 232)      # 0xE8A33D（表头菜单选中竖线）
 ACCENT = (206, 117, 67)      # accent = rgb(0x4375CE) → COLORREF 0xCE7543 → 字节序 B,G,R
 
-# 对话框几何（DIP * scale=1）
-DLG_W, DLG_H = 380, 432
+# 对话框几何（DIP * scale=1）。高度按行数动态算：LIST_TOP 80 + 21 行 × 26 + 底部 58
+DLG_W = 380
 LIST_TOP, DLG_ROW_H = 80, 26
+BTN_ZONE = 58
 CB_X0, CB_Y0, CB_SZ = 18, 5, 16     # 勾选框左上角（相对行顶）
 COL_ALL = ["名称", "修改日期", "类型", "大小", "创建日期", "访问日期",
-           "作者", "标记", "标题", "路径", "属性"]
+           "属性", "文件夹路径", "扩展名", "所有者", "文件版本", "文件说明",
+           "产品名称", "公司", "版权", "磁盘占用", "MS-DOS 名称", "尺寸",
+           "作者", "标记", "标题"]
+DLG_H = LIST_TOP + len(COL_ALL) * DLG_ROW_H + BTN_ZONE
 DEFAULT_VISIBLE = 4
 
 
@@ -218,8 +222,10 @@ def main():
             print("FAIL D1: 表头菜单没弹出")
             return 1
         mr = wt.RECT(); u.GetWindowRect(mh, ctypes.byref(mr))
-        print(f"D1 菜单 {mr.right-mr.left}x{mr.bottom-mr.top}，点「其他(M)...」(y=394)")
-        click_client(mh, (mr.right - mr.left) // 2, 394)
+        # 「其他(M)...」是菜单最后一行：按菜单底边定位（列数变了行号会整体平移）
+        my = (mr.bottom - mr.top) - 14
+        print(f"D1 菜单 {mr.right-mr.left}x{mr.bottom-mr.top}，点「其他(M)...」(y={my})")
+        click_client(mh, (mr.right - mr.left) // 2, my)
         time.sleep(1.2)
 
         dh = u.FindWindowW("ZenFileColDlg", None)
@@ -231,7 +237,7 @@ def main():
         print(f"D1 OK 对话框 {dw}x{dhgt} @ {dr.left},{dr.top}")
         topmost(dh)
         if abs(dw - DLG_W) > 24 or abs(dhgt - DLG_H) > 24:
-            fail.append(f"D1 尺寸 {dw}x{dhgt} 偏离 {DLG_W}x{DLG_H}")
+            fail.append(f"D1 尺寸 {dw}x{dhgt} 偏离 {DLG_W}x{DLG_H}（21 列动态高度）")
 
         # ---------- D2 初始勾选态
         raw, stride, w, h = grab(dh)
@@ -269,8 +275,8 @@ def main():
         else:
             print("D4 OK 勾中的那格与下一格互换")
 
-        # ---------- D5 确定 → 关闭
-        click_client(dh, 214, 403)
+        # ---------- D5 确定 → 关闭（按钮贴着动态高度的底边）
+        click_client(dh, 214, DLG_H - 29)
         time.sleep(1.0)
         if u.FindWindowW("ZenFileColDlg", None):
             fail.append("D5 点「确定」后对话框还在")

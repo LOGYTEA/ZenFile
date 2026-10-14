@@ -86,10 +86,11 @@ def row_has_bar(raw, stride, y0, color):
     return False
 
 
-# 菜单行几何：top 从 4 起；前两条命令各 28，一条分隔线 6 → 12 列从 y=66 开始
+# 菜单行几何：top 从 4 起；前两条命令各 28，一条分隔线 6 → 列从 y=66 开始。
+# 第54轮改成"前 8 项内联 + 其他(M)..."：内联的是 COL_ALL 的前 8 个。
 COL_NAMES = ["名称", "修改日期", "类型", "大小", "创建日期", "访问日期",
-             "作者", "标记", "标题", "路径", "属性"]
-# normalize_visible 默认四列
+             "属性", "文件夹路径"]
+# normalize_visible 默认四列（名称/修改日期/类型/大小）
 DEFAULT_VISIBLE = 4
 
 

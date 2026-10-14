@@ -960,8 +960,14 @@ fn paint_drag_overlay(app: &mut App, hdc: HDC, l: &Layout) {
         let brush = CreateSolidBrush(blend);
         let old_brush = SelectObject(hdc, brush.into());
 
-        // 1) 投放目标：描一圈 accent 边（只描边不填充，里面的内容还得看得见）
-        let target_rect = match target_kind {
+        // 1) 投放目标：描一圈 accent 边（只描边不填充，里面的内容还得看得见）。
+        // **只属于拖文件**（第54轮）：拉框选时 target 恒为 None（WM_MOUSEMOVE
+        // 那边已按种类过滤），这里再挡一道 —— 细节视图的行是全宽的，一旦给
+        // 框选描出来，顶边就是一条横贯内容区的蓝线。
+        let target_rect = if kind != crate::app::DragKind::Items {
+            None
+        } else {
+            match target_kind {
             Some(crate::app::DropKind::Row(i)) => {
                 Some(item_rect(app, l, i, l.view.top + header_height_of(app)))
             }
@@ -973,6 +979,7 @@ fn paint_drag_overlay(app: &mut App, hdc: HDC, l: &Layout) {
             // 拖到标签上：把那个标签整块描出来（"文件会落进这个标签的目录"）
             Some(crate::app::DropKind::Tab(i)) => Some(l.tab_rect(i, app.tab_count(), &app.metrics)),
             None => None,
+            }
         };
         if let Some(r) = target_rect {
             let old_b = SelectObject(hdc, brush.into());

@@ -22,6 +22,18 @@ pub const C_TITLE: &str = "title";
 pub const C_PATH: &str = "path";
 pub const C_ATTRIBUTES: &str = "attributes";
 
+// —— 第54轮新增（用户要求"选择详细信息"对齐资源管理器的条目量）——
+pub const C_EXT: &str = "extension";
+pub const C_OWNER: &str = "owner";
+pub const C_FILEVERSION: &str = "fileversion";
+pub const C_FILEDESCRIPTION: &str = "filedescription";
+pub const C_PRODUCTNAME: &str = "productname";
+pub const C_COMPANY: &str = "company";
+pub const C_COPYRIGHT: &str = "copyright";
+pub const C_ALLOC: &str = "allocsize";
+pub const C_DOSNAME: &str = "dosname";
+pub const C_DIMENSIONS: &str = "dimensions";
+
 /// 表头右键菜单里"选择列…"列出的一组（资源管理器那 8 项 + 我们额外的几项）。
 /// 名称列不在可选列表里（不可隐藏），搜索态的"位置"列也不在（那是搜索专用）。
 pub const COL_ALL: &[&str] = &[
@@ -31,11 +43,21 @@ pub const COL_ALL: &[&str] = &[
     C_SIZE,
     C_DATE_CREATED,
     C_DATE_ACCESSED,
+    C_ATTRIBUTES,
+    C_PATH,
+    C_EXT,
+    C_OWNER,
+    C_FILEVERSION,
+    C_FILEDESCRIPTION,
+    C_PRODUCTNAME,
+    C_COMPANY,
+    C_COPYRIGHT,
+    C_ALLOC,
+    C_DOSNAME,
+    C_DIMENSIONS,
     C_AUTHOR,
     C_TAGS,
     C_TITLE,
-    C_PATH,
-    C_ATTRIBUTES,
 ];
 
 /// 各列的显示名（表头文字 / 右键菜单勾选项）。
@@ -52,6 +74,16 @@ pub fn label_of(id: &str) -> &'static str {
         C_TITLE => "标题",
         C_PATH => "文件夹路径",
         C_ATTRIBUTES => "属性",
+        C_EXT => "扩展名",
+        C_OWNER => "所有者",
+        C_FILEVERSION => "文件版本",
+        C_FILEDESCRIPTION => "文件说明",
+        C_PRODUCTNAME => "产品名称",
+        C_COMPANY => "公司",
+        C_COPYRIGHT => "版权",
+        C_ALLOC => "磁盘占用",
+        C_DOSNAME => "MS-DOS 名称",
+        C_DIMENSIONS => "尺寸",
         _ => "",
     }
 }
@@ -72,6 +104,16 @@ pub fn default_width(id: &str) -> u32 {
         C_TITLE => 130,
         C_PATH => 220,
         C_ATTRIBUTES => 90,
+        C_EXT => 70,
+        C_OWNER => 130,
+        C_FILEVERSION => 90,
+        C_FILEDESCRIPTION => 150,
+        C_PRODUCTNAME => 130,
+        C_COMPANY => 120,
+        C_COPYRIGHT => 150,
+        C_ALLOC => 90,
+        C_DOSNAME => 130,
+        C_DIMENSIONS => 100,
         _ => 90,
     }
 }
@@ -139,8 +181,319 @@ pub fn cell(id: &str, e: &crate::types::FileEntry, show_ext: bool) -> Option<Str
                 Some(parts.join(" "))
             }
         }
+        // —— 第54轮新增的列。要开句柄 / 读安全描述符 / 解析版本资源的查询
+        // **全部走 cached()**：cell() 在绘制与自适应列宽里每行每列都会调，
+        // 现查的话一屏几十行就是几十次安全描述符读取，直接把帧率打没。
+        C_EXT => {
+            let ext = e.path.extension().map(|x| x.to_string_lossy().to_string())?;
+            let t = ext.trim().to_string();
+            if t.is_empty() { None } else { Some(t) }
+        }
+        C_OWNER => cached(C_OWNER, &e.path, || owner_of(&e.path)),
+        C_FILEVERSION => {
+            if e.is_dir() { None } else { cached(C_FILEVERSION, &e.path, || version_string(&e.path, "FileVersion")) }
+        }
+        C_FILEDESCRIPTION => {
+            if e.is_dir() { None } else { cached(C_FILEDESCRIPTION, &e.path, || version_string(&e.path, "FileDescription")) }
+        }
+        C_PRODUCTNAME => {
+            if e.is_dir() { None } else { cached(C_PRODUCTNAME, &e.path, || version_string(&e.path, "ProductName")) }
+        }
+        C_COMPANY => {
+            if e.is_dir() { None } else { cached(C_COMPANY, &e.path, || version_string(&e.path, "CompanyName")) }
+        }
+        C_COPYRIGHT => {
+            if e.is_dir() { None } else { cached(C_COPYRIGHT, &e.path, || version_string(&e.path, "LegalCopyright")) }
+        }
+        C_ALLOC => {
+            if e.is_dir() { None } else { cached(C_ALLOC, &e.path, || alloc_of(&e.path)) }
+        }
+        C_DOSNAME => cached(C_DOSNAME, &e.path, || dos_of(&e.path)),
+        C_DIMENSIONS => {
+            if e.is_dir() { None } else { cached(C_DIMENSIONS, &e.path, || dimensions_of(&e.path)) }
+        }
         _ => None,
     }
+}
+
+// ============================================================ 慢查询与缓存（第54轮）
+
+/// cell() 的进程级缓存：键 = (列 id, 路径)。
+///
+/// 所有者/版本信息/磁盘占用这类要开句柄或读安全描述符的查询，一次查询几微秒
+/// 到几毫秒不等，但绘制每帧每行每列都会来问 —— 不缓存的话只要开了"所有者"列，
+/// 一屏 30 行 × 60fps 就是每秒 1800 次安全描述符读取。值的 Option 也一起缓存
+/// （查过没有 = 没有，别每帧重查）。超上限整体清空，防长会话内存泄漏。
+fn cached(
+    col: &str,
+    path: &std::path::Path,
+    f: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<HashMap<(String, String), Option<String>>>> = Mutex::new(None);
+    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    let key = (col.to_string(), path.to_string_lossy().to_string());
+    if let Some(v) = map.get(&key) {
+        return v.clone();
+    }
+    let v = f();
+    if map.len() > 20_000 {
+        map.clear();
+    }
+    map.insert(key, v.clone());
+    v
+}
+
+/// 路径 → 以 NUL 结尾的 UTF-16。
+fn to_wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 文件的所有者（`DOMAIN\用户`）。GetNamedSecurityInfoW 只问 OWNER；
+/// 安全描述符**必须 LocalFree**（哪怕只取 owner，SD 也是整个分配出来的）。
+fn owner_of(path: &std::path::Path) -> Option<String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{GetLastError, LocalFree, HLOCAL, WIN32_ERROR};
+    use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows::Win32::Security::{
+        LookupAccountSidW, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, SID_NAME_USE,
+    };
+    let wide = to_wide(&path.to_string_lossy());
+    unsafe {
+        let mut sid = PSID(std::ptr::null_mut());
+        let mut sd = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+        let err = GetNamedSecurityInfoW(
+            PCWSTR(wide.as_ptr()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut sid),
+            None,
+            None,
+            None,
+            &mut sd,
+        );
+        if err != WIN32_ERROR(0) {
+            return None;
+        }
+        // 两步查询：先拿需要的长度，再取名字（一次给 128 一般够，不够再来一轮）
+        let mut name = vec![0u16; 128];
+        let mut dom = vec![0u16; 128];
+        let (mut cch_name, mut cch_dom) = (128u32, 128u32);
+        let mut use_t = SID_NAME_USE::default();
+        let ok = LookupAccountSidW(
+            PCWSTR::null(),
+            sid,
+            Some(windows::core::PWSTR(name.as_mut_ptr())),
+            &mut cch_name,
+            Some(windows::core::PWSTR(dom.as_mut_ptr())),
+            &mut cch_dom,
+            &mut use_t,
+        );
+        let _ = LocalFree(Some(HLOCAL(sd.0)));
+        if ok.is_err() {
+            let e = GetLastError();
+            // 长度不够：按系统给的长度重试一轮（错误码 122 = ERROR_INSUFFICIENT_BUFFER）
+            if e.0 != 122 {
+                return None;
+            }
+            let mut name = vec![0u16; cch_name as usize];
+            let mut dom = vec![0u16; cch_dom as usize];
+            let (mut cch_name, mut cch_dom) = (cch_name, cch_dom);
+            let mut use_t = SID_NAME_USE::default();
+            let ok2 = LookupAccountSidW(
+                PCWSTR::null(),
+                sid,
+                Some(windows::core::PWSTR(name.as_mut_ptr())),
+                &mut cch_name,
+                Some(windows::core::PWSTR(dom.as_mut_ptr())),
+                &mut cch_dom,
+                &mut use_t,
+            );
+            if ok2.is_err() {
+                return None;
+            }
+            return join_owner(&dom[..cch_dom as usize], &name[..cch_name as usize]);
+        }
+        join_owner(&dom[..cch_dom as usize], &name[..cch_name as usize])
+    }
+}
+
+/// 域\用户 拼装；域为空就只给用户名。
+fn join_owner(dom: &[u16], name: &[u16]) -> Option<String> {
+    let cut = |v: &[u16]| -> String {
+        let end = v.iter().position(|&c| c == 0).unwrap_or(v.len());
+        String::from_utf16_lossy(&v[..end])
+    };
+    let (d, n) = (cut(dom), cut(name));
+    if n.is_empty() {
+        return None;
+    }
+    if d.is_empty() {
+        Some(n)
+    } else {
+        Some(format!("{d}\\{n}"))
+    }
+}
+
+/// VERSIONINFO 里的一个字符串项（FileVersion / ProductName / …）。
+/// 语言代码页先从 \\VarFileInfo\\Translation 拿第一个，再拼子块名查询。
+fn version_string(path: &std::path::Path, key: &str) -> Option<String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
+    };
+    let wide = to_wide(&path.to_string_lossy());
+    unsafe {
+        let mut handle = 0u32;
+        let size = GetFileVersionInfoSizeW(PCWSTR(wide.as_ptr()), Some(&mut handle));
+        if size == 0 || size > (1 << 20) {
+            return None;
+        }
+        let mut buf = vec![0u8; size as usize];
+        GetFileVersionInfoW(PCWSTR(wide.as_ptr()), Some(0), size, buf.as_mut_ptr() as _).ok()?;
+        let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut len = 0u32;
+        if !VerQueryValueW(
+            buf.as_ptr() as _,
+            PCWSTR(to_wide("\\VarFileInfo\\Translation").as_ptr()),
+            &mut p,
+            &mut len,
+        )
+        .as_bool()
+        {
+            return None;
+        }
+        // Translation 是 {u16 语言, u16 代码页} 的数组；len 是字节数
+        let trans = std::slice::from_raw_parts(p as *const u32, (len as usize) / 4);
+        if trans.is_empty() {
+            return None;
+        }
+        let (lang, cp) = (trans[0] & 0xFFFF, trans[0] >> 16);
+        let sub = to_wide(&format!("\\StringFileInfo\\{lang:04x}{cp:04x}\\{key}"));
+        let mut p2: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut len2 = 0u32;
+        if !VerQueryValueW(buf.as_ptr() as _, PCWSTR(sub.as_ptr()), &mut p2, &mut len2).as_bool() {
+            // 有的文件只有 en-US(040904b0) 一套，翻译表对不上就再试标准英文块
+            let sub = to_wide(&format!("\\StringFileInfo\\040904b0\\{key}"));
+            if !VerQueryValueW(buf.as_ptr() as _, PCWSTR(sub.as_ptr()), &mut p2, &mut len2)
+                .as_bool()
+            {
+                return None;
+            }
+        }
+        let ws = std::slice::from_raw_parts(p2 as *const u16, len2 as usize);
+        let end = ws.iter().position(|&c| c == 0).unwrap_or(ws.len());
+        let t = String::from_utf16_lossy(&ws[..end]).trim().to_string();
+        if t.is_empty() { None } else { Some(t) }
+    }
+}
+
+/// 磁盘占用（分配/压缩后的实际字节数）。GetCompressedFileSizeW 不用开句柄。
+fn alloc_of(path: &std::path::Path) -> Option<String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{GetLastError, NO_ERROR};
+    use windows::Win32::Storage::FileSystem::GetCompressedFileSizeW;
+    let wide = to_wide(&path.to_string_lossy());
+    unsafe {
+        let mut high = 0u32;
+        let low = GetCompressedFileSizeW(PCWSTR(wide.as_ptr()), Some(&mut high));
+        let invalid = low == u32::MAX; // INVALID_FILE_SIZE（0.62 没导出常量，值就是 u32::MAX）
+        if invalid && GetLastError() != NO_ERROR {
+            return None;
+        }
+        let bytes = ((high as u64) << 32) | low as u64;
+        if bytes == 0 {
+            return None;
+        }
+        // **只给原始字节数**，单位由 fm-app 的 human_unit 统一格式化
+        Some(bytes.to_string())
+    }
+}
+
+/// MS-DOS 8.3 短名。卷没开 8.3 名时系统原样返回长路径 —— 那就当没有，
+/// 免得这一列和名称长得一模一样。
+fn dos_of(path: &std::path::Path) -> Option<String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::GetShortPathNameW;
+    let long = path.to_string_lossy().to_string();
+    let wide = to_wide(&long);
+    unsafe {
+        // 先探长度（含 NUL），不够再补一轮
+        let need = GetShortPathNameW(PCWSTR(wide.as_ptr()), None);
+        if need == 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; need as usize];
+        let got = GetShortPathNameW(PCWSTR(wide.as_ptr()), Some(&mut buf));
+        if got == 0 {
+            return None;
+        }
+        let s = String::from_utf16_lossy(&buf[..got as usize]);
+        if s == long || s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }
+}
+
+/// 图片尺寸（像素）。只解析常见格式的**文件头**（前 64KB 内），不开解码器：
+///   PNG（IHDR 定长）、GIF（逻辑屏幕描述符）、BMP（DIB 头）、JPEG（扫 SOF 标记）。
+/// 解析不动/不是这些格式 → None（画 `—`，和资源管理器一致）。
+fn dimensions_of(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    let mut head = [0u8; 65_536];
+    let n = {
+        let mut f = std::fs::File::open(path).ok()?;
+        f.read(&mut head).unwrap_or(0)
+    };
+    let b = &head[..n];
+    let (w, h) = if b.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) && n >= 24 {
+        // IHDR：宽高各 4 字节大端，紧跟 8 字节签名 + 4 长度 + "IHDR"
+        let w = u32::from_be_bytes([b[16], b[17], b[18], b[19]]);
+        let h = u32::from_be_bytes([b[20], b[21], b[22], b[23]]);
+        (w, h)
+    } else if b.starts_with(b"GIF8") && n >= 10 {
+        let w = u16::from_le_bytes([b[6], b[7]]) as u32;
+        let h = u16::from_le_bytes([b[8], b[9]]) as u32;
+        (w, h)
+    } else if b.starts_with(b"BM") && n >= 26 {
+        let w = i32::from_le_bytes([b[18], b[19], b[20], b[21]]);
+        let h = i32::from_le_bytes([b[22], b[23], b[24], b[25]]);
+        (w.unsigned_abs(), h.unsigned_abs())
+    } else if b.starts_with(&[0xFF, 0xD8]) {
+        // JPEG：跳过 0xFFxx 标记段找 SOF0..SOF15（DHT=C4、JPG=C8、DAC=CC 除外）
+        let mut i = 2usize;
+        let mut hw = None;
+        while i + 9 <= n {
+            if b[i] != 0xFF {
+                break;
+            }
+            let marker = b[i + 1];
+            if (0xC0..=0xCF).contains(&marker) && marker != 0xC4 && marker != 0xC8 && marker != 0xCC
+            {
+                let h = u16::from_be_bytes([b[i + 5], b[i + 6]]) as u32;
+                let w = u16::from_be_bytes([b[i + 7], b[i + 8]]) as u32;
+                hw = Some((w, h));
+                break;
+            }
+            let seg = u16::from_be_bytes([b[i + 2], b[i + 3]]) as usize;
+            if seg < 2 {
+                break;
+            }
+            i += 2 + seg;
+        }
+        hw?
+    } else {
+        return None;
+    };
+    if w == 0 || h == 0 || w > 1_000_000 || h > 1_000_000 {
+        return None;
+    }
+    Some(format!("{w} × {h}"))
 }
 
 /// FILETIME（100ns since 1601-01-01）→ `YYYY/MM/DD HH:MM` 本地时间。
@@ -302,6 +655,93 @@ pub fn default_visible() -> Vec<String> {
         C_TYPE.to_string(),
         C_SIZE.to_string(),
     ]
+}
+
+#[cfg(test)]
+mod slow_query_tests {
+    use super::*;
+
+    #[test]
+    fn dimensions_of_png_header() {
+        let mut b: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13];
+        b.extend_from_slice(b"IHDR");
+        b.extend_from_slice(&137u32.to_be_bytes());
+        b.extend_from_slice(&50u32.to_be_bytes());
+        b.extend_from_slice(&[8, 6, 0, 0, 0]);
+        let p = std::env::temp_dir().join("zenfile_dim_test.png");
+        std::fs::write(&p, &b).unwrap();
+        assert_eq!(dimensions_of(&p).as_deref(), Some("137 × 50"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn dimensions_of_gif_bmp_jpeg() {
+        let dir = std::env::temp_dir();
+        // GIF：逻辑屏幕描述符在 6..10，小端
+        let gif = [b'G', b'I', b'F', b'8', b'9', b'a', 0x89, 0x00, 0x32, 0x00];
+        let pg = dir.join("zenfile_dim_test.gif");
+        std::fs::write(&pg, gif).unwrap();
+        assert_eq!(dimensions_of(&pg).as_deref(), Some("137 × 50"));
+        // BMP：DIB 头宽高在 18..26，小端 i32
+        let mut bmp = vec![b'B', b'M'];
+        bmp.extend_from_slice(&[0u8; 16]);
+        bmp.extend_from_slice(&137i32.to_le_bytes());
+        bmp.extend_from_slice(&50i32.to_le_bytes());
+        let pb = dir.join("zenfile_dim_test.bmp");
+        std::fs::write(&pb, &bmp).unwrap();
+        assert_eq!(dimensions_of(&pb).as_deref(), Some("137 × 50"));
+        // JPEG：SOF0 段里高前宽后（FF C0 len prec 高2 宽2）
+        let jpg = [0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x11, 0x08, 0x00, 0x32, 0x00, 0x89, 0x03];
+        let pj = dir.join("zenfile_dim_test.jpg");
+        std::fs::write(&pj, jpg).unwrap();
+        assert_eq!(dimensions_of(&pj).as_deref(), Some("137 × 50"));
+        let _ = (std::fs::remove_file(&pg), std::fs::remove_file(&pb), std::fs::remove_file(&pj));
+    }
+
+    #[test]
+    fn dimensions_of_txt_is_none() {
+        let p = std::env::temp_dir().join("zenfile_dim_test.txt");
+        std::fs::write(&p, b"hello").unwrap();
+        assert_eq!(dimensions_of(&p), None);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 测试进程自己的可执行文件是一个真实存在的文件：所有者必查得到，
+    /// 磁盘占用必 ≥ 文件大小（簇对齐只会变大）。
+    #[test]
+    fn owner_and_alloc_of_real_file() {
+        let exe = std::env::current_exe().unwrap();
+        let owner = owner_of(&exe);
+        assert!(owner.is_some(), "连自己的 exe 都查不到所有者");
+        assert!(!owner.unwrap().is_empty());
+        let alloc = alloc_of(&exe).map(|s| s.parse::<u64>().unwrap()).unwrap();
+        let size = std::fs::metadata(&exe).unwrap().len();
+        assert!(alloc >= size, "磁盘占用 {alloc} 小于文件大小 {size}");
+    }
+
+    /// C: 盘 8.3 名通常开着 → 短名应查得到且不等于长名；查不到也不能崩。
+    #[test]
+    fn dos_of_real_file() {
+        let exe = std::env::current_exe().unwrap();
+        if let Some(s) = dos_of(&exe) {
+            assert_ne!(s, exe.to_string_lossy().to_string());
+            assert!(s.to_lowercase().ends_with(".exe"));
+        }
+    }
+
+    #[test]
+    fn new_columns_in_col_all_and_labels() {
+        for id in [
+            C_EXT, C_OWNER, C_FILEVERSION, C_FILEDESCRIPTION, C_PRODUCTNAME, C_COMPANY,
+            C_COPYRIGHT, C_ALLOC, C_DOSNAME, C_DIMENSIONS,
+        ] {
+            assert!(COL_ALL.contains(&id), "{id} 不在 COL_ALL");
+            assert!(!label_of(id).is_empty(), "{id} 没有显示名");
+            assert!(default_width(id) >= W_MIN && default_width(id) <= W_MAX);
+        }
+        // 名称仍然恒在 COL_ALL 首位（对话框与 normalize 都依赖这个顺序）
+        assert_eq!(COL_ALL[0], C_NAME);
+    }
 }
 
 #[cfg(test)]

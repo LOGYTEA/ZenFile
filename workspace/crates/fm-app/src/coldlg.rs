@@ -17,8 +17,9 @@ use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreatePen, CreateSolidBrush, DeleteDC,
     DeleteObject, EndPaint, FillRect, InvalidateRect, LineTo, MoveToEx, RoundRect, SelectObject,
-    SetBkMode, SetTextColor, BeginPaint, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
-    DT_SINGLELINE, DT_VCENTER, HDC, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
+    IntersectClipRect, RestoreDC, SaveDC, SetBkMode, SetTextColor, BeginPaint, DT_CENTER,
+    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HDC, PAINTSTRUCT, PS_SOLID,
+    SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -28,12 +29,16 @@ use crate::paint::{draw_text, ui_font};
 const CLASS: &str = "ZenFileColDlg";
 
 /// 窗口尺寸（DIP），按 DPI 缩放。
+///
+/// 高度**按行数动态算**（第54轮）：可选列从 11 涨到 21 后，固定 432 只装得下
+/// 11 行，剩下的得滚。算出来的高度再钳到屏幕内，装不下就出滚动区。
 const W_DIP: f32 = 380.0;
-const H_DIP: f32 = 432.0;
 const TITLE_H: f32 = 34.0;
 const ROW_H: f32 = 26.0;
 const BTN_H: f32 = 28.0;
 const LIST_TOP: f32 = TITLE_H + 46.0;
+/// 底部按钮区（确定/取消 30 + 下边距 14 + 与列表的间隙 14）
+const BTN_ZONE: f32 = 58.0;
 
 struct Row {
     id: String,
@@ -52,6 +57,17 @@ struct Dlg {
     hover_row: i32,
     hover_btn: u8,
     press_btn: u8,
+    /// 列表可视高度（像素）—— 窗口高 - 标题/提示行 - 底部按钮区
+    list_h: i32,
+    /// 滚动偏移（像素），0..=max_scroll
+    scroll: i32,
+}
+
+impl Dlg {
+    fn max_scroll(&self, s: f32) -> i32 {
+        let content = (self.rows.len() as i32) * px(ROW_H, s);
+        (content - self.list_h).max(0)
+    }
 }
 
 static mut DLG: Option<Dlg> = None;
@@ -77,32 +93,6 @@ pub fn open(app: &mut crate::app::App) {
             (GetDpiForWindow(owner) as f32 / 96.0).max(0.5)
         };
         let w = (W_DIP * s).round() as i32;
-        let h = (H_DIP * s).round() as i32;
-        let (cx, cy) = if owner.0.is_null() {
-            (w / 2 + 120, h / 2 + 120)
-        } else {
-            let mut or = RECT::default();
-            let _ = GetWindowRect(owner, &mut or);
-            ((or.left + or.right) / 2, (or.top + or.bottom) / 2)
-        };
-        let hwnd = CreateWindowExW(
-            WS_EX_TOOLWINDOW,
-            PCWSTR(HSTRING::from(CLASS).as_ptr()),
-            PCWSTR(HSTRING::from("选择详细信息").as_ptr()),
-            WS_POPUP | WS_CLIPCHILDREN,
-            cx - w / 2,
-            cy - h / 2,
-            w,
-            h,
-            if owner.0.is_null() { None } else { Some(owner) },
-            None,
-            None,
-            None,
-        );
-        let Ok(hwnd) = hwnd else { return };
-        if hwnd.0.is_null() {
-            return;
-        }
         // 行序：可见的按当前顺序在前，隐藏的按 COL_ALL 顺序在后。
         // 这样"勾掉再勾回来"会回到原来的位置，而不是被塞到末尾。
         let vis = app.visible_cols();
@@ -126,6 +116,37 @@ pub fn open(app: &mut crate::app::App) {
                 });
             }
         }
+        // 高度按行数动态算（第54轮）：21 列 × 26px 早就不是 432 能装下的了。
+        // 装得下多少算多少，钳到屏幕内，剩余的出滚动区（滚轮 + 拖滚动偏移）。
+        let screen_h = GetSystemMetrics(SM_CYSCREEN);
+        let h_want = px(LIST_TOP, s) + (rows.len() as i32) * px(ROW_H, s) + px(BTN_ZONE, s);
+        let h = h_want.min(screen_h - 80).max(px(LIST_TOP, s) + 4 * px(ROW_H, s) + px(BTN_ZONE, s));
+        let list_h = h - px(LIST_TOP, s) - px(BTN_ZONE, s);
+        let (cx, cy) = if owner.0.is_null() {
+            (w / 2 + 120, 240)
+        } else {
+            let mut or = RECT::default();
+            let _ = GetWindowRect(owner, &mut or);
+            ((or.left + or.right) / 2, (or.top + or.bottom) / 2)
+        };
+        let hwnd = CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            PCWSTR(HSTRING::from(CLASS).as_ptr()),
+            PCWSTR(HSTRING::from("选择详细信息").as_ptr()),
+            WS_POPUP | WS_CLIPCHILDREN,
+            cx - w / 2,
+            (cy - h / 2).max(0),
+            w,
+            h,
+            if owner.0.is_null() { None } else { Some(owner) },
+            None,
+            None,
+            None,
+        );
+        let Ok(hwnd) = hwnd else { return };
+        if hwnd.0.is_null() {
+            return;
+        }
         let sel = rows.iter().position(|r| !r.locked).unwrap_or(0);
         DLG = Some(Dlg {
             hwnd,
@@ -135,6 +156,8 @@ pub fn open(app: &mut crate::app::App) {
             hover_row: -1,
             hover_btn: 0,
             press_btn: 0,
+            list_h,
+            scroll: 0,
         });
         let _ = ShowWindow(hwnd, SW_SHOW);
         // windows-rs 0.62 没导出 SetFocus，用 SetForegroundWindow 把键盘（Esc/上下键）
@@ -215,10 +238,16 @@ fn hit_btn(x: i32, y: i32) -> u8 {
 fn hit_row(x: i32, y: i32, s: f32) -> Option<usize> {
     let top = px(LIST_TOP, s);
     let rh = px(ROW_H, s);
-    if y < top {
+    let (list_h, scroll) = unsafe {
+        DLG.as_ref()
+            .map(|d| (d.list_h, d.scroll))
+            .unwrap_or((0, 0))
+    };
+    // 只认滚动可视区里的行
+    if y < top || y >= top + list_h {
         return None;
     }
-    let i = (y - top) / rh.max(1);
+    let i = (y - top + scroll) / rh.max(1);
     let n = unsafe { DLG.as_ref().map(|d| d.rows.len()).unwrap_or(0) };
     // 行的可点宽度到"上移/下移"按钮左沿为止
     let right = px(W_DIP - 116.0, s);
@@ -378,11 +407,32 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
                     } else if vk == 0x28 && d.sel + 1 < n {
                         d.sel += 1;
                     }
+                    // 选中行滚出可视区时把滚动跟着挪过去
+                    let s = scale_of(hwnd);
+                    let rh = px(ROW_H, s);
+                    let row_top = (d.sel as i32) * rh;
+                    if row_top < d.scroll {
+                        d.scroll = row_top;
+                    } else if row_top + rh > d.scroll + d.list_h {
+                        d.scroll = row_top + rh - d.list_h;
+                    }
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 return LRESULT(0);
             }
+            // 滚轮在独立的 WM_MOUSEWHEEL 分支里处理（见下）
             DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        // 滚轮：列表比可视区高时滚动（第54轮起 21 列基本必然超出）
+        WM_MOUSEWHEEL => {
+            let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+            let s = scale_of(hwnd);
+            if let Some(d) = DLG.as_mut() {
+                let step = px(ROW_H, s) * 3;
+                d.scroll = (d.scroll - (delta / 120) * step).clamp(0, d.max_scroll(s));
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            LRESULT(0)
         }
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
@@ -512,13 +562,21 @@ fn paint(hwnd: HWND, hdc: HDC) {
         let rh = px(ROW_H, s);
         let top = px(LIST_TOP, s);
         let row_right = px(W_DIP - 116.0, s);
+        // 行可能比可视区多（21 列 > 列表高度）：**先裁剪再画**，否则超出的行
+        // 会漫过底部按钮区。裁剪链要用 SaveDC/RestoreDC 包住 —— 记忆 DC 是
+        // 整窗口共用的，裸 IntersectClipRect 会把后面画的按钮一起裁掉。
+        let saved_clip = SaveDC(mem);
+        let _ = IntersectClipRect(mem, 0, top, w, top + d.list_h);
         for (i, row) in d.rows.iter().enumerate() {
             let rt = RECT {
                 left: px(12.0, s),
-                top: top + (i as i32) * rh,
+                top: top + (i as i32) * rh - d.scroll,
                 right: row_right,
-                bottom: top + (i as i32 + 1) * rh,
+                bottom: top + (i as i32 + 1) * rh - d.scroll,
             };
+            if rt.bottom <= top || rt.top >= top + d.list_h {
+                continue;
+            }
             let selected = i == d.sel;
             let hot = d.hover_row == i as i32;
             if selected || hot {
@@ -547,6 +605,8 @@ fn paint(hwnd: HWND, hdc: HDC) {
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
             );
         }
+        // 裁剪到此为止：上移/下移/确定/取消都在裁剪区外，必须正常画
+        RestoreDC(mem, saved_clip);
 
         // ---- 上移 / 下移
         let bw = px(92.0, s);

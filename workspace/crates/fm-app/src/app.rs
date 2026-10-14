@@ -695,6 +695,9 @@ pub struct App {
     pub hover_caption: u8,
     /// 按下未抬起的那一个（0=无，1/2/3 同上）。
     pub pressed_caption: u8,
+    /// TrackMouseEvent 是否已挂上（挂一次，收到 WM_MOUSELEAVE 才允许重挂；
+    /// 每次移动都重挂会吃到非客户区→客户区切换的滞回 leave，悬停全灭）。
+    pub mouse_tracked: bool,
     /// 地址栏是否处于"文本编辑"态。
     ///
     /// Win11 的地址栏平时是**面包屑**（一节一节可点的路径），只有点空白处或
@@ -1171,6 +1174,7 @@ impl App {
             ui_settings: crate::settings::Settings::load(),
             hover_caption: 0,
             pressed_caption: 0,
+            mouse_tracked: false,
             addr_editing: false,
             addr_hover: None,
             index: None,
