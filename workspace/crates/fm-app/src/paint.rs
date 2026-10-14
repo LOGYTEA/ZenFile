@@ -717,6 +717,12 @@ pub fn paint(app: &mut App, hdc: HDC, width: i32, height: i32) {
         let _ = InvalidateRect(Some(app.hwnd_search), None, true);
         let _ = InvalidateRect(Some(app.hwnd_address), None, true);
     }
+    // 每帧末尾统一校准动画定时器：本帧 paint 已经把各动画目标（`icon_zoom_tgt`
+    // 等）按"当前悬停/选中"重写完了，这里看一眼"还有没有没跑完的"——
+    // 比如刚取消选中的条目，放大目标被 `begin_anim_frame` 清成了 0、但 `icon_zoom`
+    // 还停在 0.10，必须由定时器把它缓动回 0。只在该开/该关时才动定时器
+    // （`sync_anim_timer` 内部有去重），所以无动画时空跑是零成本。
+    app.sync_anim_timer();
 }
 
 /// 拖拽覆盖层：框选矩形 + 投放目标高亮 + 跟着光标的"移动到…"提示。

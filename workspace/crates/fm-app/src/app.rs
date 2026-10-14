@@ -580,6 +580,9 @@ pub struct App {
     /// 动画定时器是不是还挂着。只用它避免重复 SetTimer 把周期重置
     /// （每帧 InvalidateRect 都去 Set 一次的话，定时器永远等不到 16ms 期满）。
     anim_timer_on: std::cell::Cell<bool>,
+    /// 上一帧动画推进的时刻（ms）。用来算每帧间隔 dt，把缓动做成
+    /// **与帧率无关**：掉帧时不拖慢、不抢跑，动画在墙上时钟里匀速。
+    anim_last: std::cell::Cell<u64>,
     /// 地址栏的进 / 出场动画。`kind`: 0=进入（从右滑入 + 回弹），1=退出（向右滑出）。
     pub addr_anim: Option<AddrAnim>,
     /// 导航窗格"当前位置"指示条**此刻画在哪个 y**（每帧向 target 缓动）。
@@ -1235,6 +1238,7 @@ impl App {
             cut_set: HashSet::new(),
             sidebar_scroll: 0,
             anim_timer_on: std::cell::Cell::new(false),
+            anim_last: std::cell::Cell::new(0),
             addr_anim: None,
             sb_active_y: None,
             sb_active_target: None,
@@ -2048,9 +2052,26 @@ impl App {
         false
     }
 
+    /// 把"每帧靠近 p%"换算成**与帧率无关**的缓动系数。
+    ///
+    /// `rate` 是 60Hz 下每帧靠近的比例（如 0.28）。真实每帧间隔 `dt_ms` 可能
+    /// 因为掉帧而变大，直接用固定比例会让动画在掉帧时变慢。改成指数衰减
+    /// `f = 1 - e^(-k·dt)`，其中 `k = -ln(1-rate)/0.0167`，于是无论跑在 30Hz
+    /// 还是 120Hz，动画在墙上时钟里都走同样长、同样顺。
+    fn anim_ease(rate: f32, dt_ms: f32) -> f32 {
+        // 60Hz 下与旧"每帧靠近 rate"等价的速率常数
+        let k = (-(1.0 - rate as f64).ln() / 0.0167) as f32;
+        let dt = (dt_ms / 1000.0).clamp(0.0, 0.05); // 钳到 50ms：极端掉帧也不瞬移
+        1.0 - (-k * dt).exp()
+    }
+
     /// 推进一帧动画。返回 true = 画面变了，调用方该重画。
     pub fn tick_anim(&mut self) -> bool {
         let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
+        // 帧间隔：首帧（anim_last 还没初始化）按 16ms 算，避免突跳。
+        let last = self.anim_last.get();
+        let dt = if last == 0 { 16.0 } else { (now - last) as f32 };
+        self.anim_last.set(now);
         let mut dirty = false;
 
         // —— 地址栏：跑完就撤 ——
@@ -2077,8 +2098,8 @@ impl App {
                 self.sidebar_scroll = t;
                 self.sb_scroll_target = None;
             } else {
-                // 指数缓动：与帧率无关的"每帧靠近 24%"，60Hz 下约 150ms 到位
-                self.sidebar_scroll = (cur + d * 0.24).round() as i32;
+                // 与帧率无关的缓动：60Hz 下每帧靠近 24%，约 150ms 到位
+                self.sidebar_scroll = (cur + d * Self::anim_ease(0.24, dt)).round() as i32;
             }
             dirty = true;
         }
@@ -2092,7 +2113,7 @@ impl App {
                 if d.abs() <= 0.5 {
                     self.sb_active_y = Some(t);
                 } else {
-                    self.sb_active_y = Some(c + d * 0.28);
+                    self.sb_active_y = Some(c + d * Self::anim_ease(0.28, dt));
                     dirty = true;
                 }
             }
@@ -2105,7 +2126,7 @@ impl App {
                 if d.abs() <= 0.5 {
                     self.sb_hover_y = Some(t);
                 } else {
-                    self.sb_hover_y = Some(c + d * 0.4);
+                    self.sb_hover_y = Some(c + d * Self::anim_ease(0.4, dt));
                     dirty = true;
                 }
             }
@@ -2119,6 +2140,7 @@ impl App {
                     keys.push(k.clone());
                 }
             }
+            let f = Self::anim_ease(0.28, dt);
             for k in keys {
                 let cur = self.icon_zoom.get(&k).copied().unwrap_or(0.0);
                 let tgt = self.icon_zoom_tgt.get(&k).copied().unwrap_or(0.0);
@@ -2129,7 +2151,7 @@ impl App {
                         self.icon_zoom.insert(k, tgt);
                     }
                 } else {
-                    self.icon_zoom.insert(k, cur + (tgt - cur) * 0.28);
+                    self.icon_zoom.insert(k, cur + (tgt - cur) * f);
                     dirty = true;
                 }
             }
@@ -2154,6 +2176,10 @@ impl App {
         unsafe {
             use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
             if on {
+                // 刚挂上：把"上一帧时刻"对齐到此刻，首拍 dt 才不会是
+                // 一段很长的空闲间隔（否则第一帧会瞬间跳一大步）。
+                self.anim_last
+                    .set(windows::Win32::System::SystemInformation::GetTickCount64());
                 let _ = SetTimer(Some(self.hwnd), crate::TIMER_ANIM, 16, None);
             } else {
                 let _ = KillTimer(Some(self.hwnd), crate::TIMER_ANIM);
