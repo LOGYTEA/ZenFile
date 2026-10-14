@@ -26,7 +26,7 @@ use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush, DeleteDC,
     DeleteObject, DrawTextW, EndPaint, FillRect, SelectObject, SetBkMode, SetTextColor, DT_CENTER,
     DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DRAW_TEXT_FORMAT, HDC, HFONT,
-    InvalidateRect, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
+    InvalidateRect, IntersectClipRect, RestoreDC, SaveDC, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::Registry::{
     RegGetValueW, HKEY, HKEY_CLASSES_ROOT, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, REG_SZ,
@@ -39,7 +39,8 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DrawIconEx, GetWindowLongPtrW, RegisterClassExW,
     SetWindowLongPtrW, ShowWindow, GWLP_USERDATA, HICON, SW_SHOW, DI_NORMAL, WM_CLOSE, WM_DESTROY,
-    WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WNDCLASSEXW, WS_POPUP,
+    WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT, WNDCLASSEXW,
+    WS_POPUP,
 };
 
 use crate::app::App;
@@ -68,6 +69,12 @@ struct OpenWith {
     sel: usize,
     hover: Hit,
     always: bool,
+    /// File = 对文件；Dir = 对文件夹 / 目录背景 / 驱动器
+    kind: TargetKind,
+    /// 已经做过一次全量"查找可用的打开软件"
+    found: bool,
+    /// 列表滚动到了第几条
+    scroll: i32,
     scale: f32,
     theme: Theme,
     bold: HFONT,
@@ -82,6 +89,8 @@ enum Hit {
     Row(usize),
     Always,
     Browse,
+    /// 「查找可用的打开软件」：把本机装着的程序全部补进列表
+    Find,
     Ok,
     Cancel,
 }
@@ -91,7 +100,7 @@ impl OpenWith {
         (v as f32 * self.scale).round() as i32
     }
     fn row_rect(&self, i: usize) -> RECT {
-        let top = self.s(TITLE_H + 44) + i as i32 * self.s(ROW_H);
+        let top = self.s(TITLE_H + 44) + (i as i32 - self.scroll) * self.s(ROW_H);
         RECT { left: self.s(12), top, right: self.w - self.s(12), bottom: top + self.s(ROW_H) - self.s(2) }
     }
     fn list_rect(&self) -> RECT {
@@ -108,6 +117,15 @@ impl OpenWith {
     fn browse_rect(&self) -> RECT {
         let top = self.h - self.s(62);
         RECT { left: self.s(14), top, right: self.s(14) + self.s(120), bottom: top + self.s(28) }
+    }
+    fn find_rect(&self) -> RECT {
+        let top = self.h - self.s(62);
+        RECT {
+            left: self.s(14) + self.s(128),
+            top,
+            right: self.s(14) + self.s(128) + self.s(186),
+            bottom: top + self.s(28),
+        }
     }
     fn ok_rect(&self) -> RECT {
         let top = self.h - self.s(44);
@@ -136,8 +154,17 @@ pub fn register_class() {
     }
 }
 
-/// 打开「打开方式」对话框。
+/// 打开「打开方式」对话框（文件）。
 pub fn open(app_ptr: *mut App, path: PathBuf) {
+    open_for(app_ptr, path, TargetKind::File)
+}
+
+/// 打开「打开方式」对话框（文件夹 / 目录背景 / 驱动器）。
+pub fn open_dir(app_ptr: *mut App, path: PathBuf) {
+    open_for(app_ptr, path, TargetKind::Dir)
+}
+
+pub fn open_for(app_ptr: *mut App, path: PathBuf, kind: TargetKind) {
     if app_ptr.is_null() {
         return;
     }
@@ -148,12 +175,26 @@ pub fn open(app_ptr: *mut App, path: PathBuf) {
         .extension()
         .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
         .unwrap_or_default();
-    let cands = candidates(&ext);
-    if cands.is_empty() {
-        // 一个候选都没有：直接给系统的"打开方式"，别弹个空框
-        let _ = open_with_system(&path);
-        return;
-    }
+    let cands = match kind {
+        TargetKind::Dir => {
+            let v = candidates_dir();
+            if v.is_empty() {
+                // 一个候选都没有：退化成"用资源管理器打开这里"，别弹个空框
+                let _ = open_with_system(&path);
+                return;
+            }
+            v
+        }
+        TargetKind::File => {
+            let v = candidates(&ext);
+            if v.is_empty() {
+                // 一个候选都没有：直接给系统的"打开方式"，别弹个空框
+                let _ = open_with_system(&path);
+                return;
+            }
+            v
+        }
+    };
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -170,6 +211,9 @@ pub fn open(app_ptr: *mut App, path: PathBuf) {
         sel: 0,
         hover: Hit::None,
         always: false,
+        kind,
+        found: false,
+        scroll: 0,
         scale,
         theme,
         bold,
@@ -223,7 +267,7 @@ pub fn open(app_ptr: *mut App, path: PathBuf) {
 
 // ---------------------------------------------------------------- 候选发现
 
-fn reg_sz(root: HKEY, sub: &str, value: &str) -> Option<String> {
+pub(crate) fn reg_sz(root: HKEY, sub: &str, value: &str) -> Option<String> {
     let sub = HSTRING::from(sub);
     let val = HSTRING::from(value);
     let mut buf = vec![0u8; 4096];
@@ -255,7 +299,7 @@ fn reg_sz(root: HKEY, sub: &str, value: &str) -> Option<String> {
 }
 
 /// 从 `"C:\a\b.exe" "%1"` 里抠出 exe 路径。
-fn exe_from_command(cmd: &str) -> Option<PathBuf> {
+pub(crate) fn exe_from_command(cmd: &str) -> Option<PathBuf> {
     let cmd = cmd.trim();
     let (head, _) = if let Some(rest) = cmd.strip_prefix('"') {
         match rest.find('"') {
@@ -285,7 +329,7 @@ fn exe_from_command(cmd: &str) -> Option<PathBuf> {
     }
 }
 
-fn expand_env(s: &str) -> String {
+pub(crate) fn expand_env(s: &str) -> String {
     // 只处理 %SystemRoot% 之类最常见的几个：完整 ExpandEnvironmentStrings
     // 也能做，但这条路径上出现的多半就是它们。
     let mut out = s.to_string();
@@ -300,7 +344,7 @@ fn expand_env(s: &str) -> String {
     out
 }
 
-fn icon_of(exe: &Path) -> HICON {
+pub(crate) fn icon_of(exe: &Path) -> HICON {
     let mut sfi = SHFILEINFOW::default();
     let res = unsafe {
         SHGetFileInfoW(
@@ -318,7 +362,7 @@ fn icon_of(exe: &Path) -> HICON {
 }
 
 /// 显示名：优先 exe 里的 FileDescription，其次 App Paths 的默认值，最后文件名。
-fn friendly_name(exe: &Path) -> String {
+pub(crate) fn friendly_name(exe: &Path) -> String {
     if let Some(desc) = file_description(exe) {
         if !desc.trim().is_empty() {
             return desc.trim().to_string();
@@ -466,6 +510,92 @@ pub fn candidates(ext: &str) -> Vec<AppCandidate> {
             is_default: dflt,
         })
         .collect()
+}
+
+/// 「打开方式」的目标类型。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TargetKind {
+    File,
+    /// 文件夹 / 目录背景 / 驱动器：没有扩展名，只能按"谁能吃目录"找
+    Dir,
+}
+
+/// 目录类目标的候选：① 自己注册过 Directory/Background 动词的（VS Code 的
+/// "Open with Code"、Windows 终端的"在终端中打开"……）；② 常见能吃目录参数的程序。
+///
+/// 之前候选一律按扩展名找，目录没有扩展名 → 一个候选都没有 → 直接弹系统的
+/// UWP 对话框（1 秒以上、还会拉一堆 Shell 扩展）。
+pub fn candidates_dir() -> Vec<AppCandidate> {
+    let mut out: Vec<AppCandidate> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (_label, exe) in crate::appfind::folder_verbs() {
+        if !seen.insert(exe.to_string_lossy().to_lowercase()) {
+            continue;
+        }
+        out.push(AppCandidate {
+            name: friendly_name(&exe),
+            icon: icon_of(&exe),
+            exe,
+            is_default: true,
+        });
+    }
+    for a in crate::appfind::folder_apps() {
+        if !seen.insert(a.exe.to_string_lossy().to_lowercase()) {
+            continue;
+        }
+        out.push(AppCandidate {
+            name: a.name.clone(),
+            icon: a.hicon(),
+            exe: a.exe,
+            is_default: false,
+        });
+    }
+    // 兜底：资源管理器本身（一定存在，"在这里打开"永远说得通）
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    let ex = PathBuf::from(&root).join("explorer.exe");
+    if ex.exists() && !seen.contains(&ex.to_string_lossy().to_lowercase()) {
+        out.push(AppCandidate { name: "文件资源管理器".to_string(), icon: icon_of(&ex), exe: ex, is_default: false });
+    }
+    out
+}
+
+/// 「查找可用的打开软件」：把本机装着的程序全部补进列表。
+///
+/// 关联的那些只占前几条，用户真正想找的（装了但没抢过关联的）藏在后面 —— 这一按
+/// 就是把它们全列出来，让他自己挑。已经列过的按 exe 路径去重，不会重复出现。
+fn find_more(st: &mut OpenWith) {
+    let have: std::collections::HashSet<String> = st
+        .cands
+        .iter()
+        .map(|c| c.exe.to_string_lossy().to_lowercase())
+        .collect();
+    let mut added = 0;
+    for a in crate::appfind::installed() {
+        if have.contains(&a.exe.to_string_lossy().to_lowercase()) {
+            continue;
+        }
+        st.cands.push(AppCandidate {
+            name: a.name.clone(),
+            icon: a.hicon(),
+            exe: a.exe.clone(),
+            is_default: false,
+        });
+        added += 1;
+    }
+    if added > 0 {
+        st.found = true;
+    }
+}
+
+impl OpenWith {
+    /// 滚轮滚几行（一次三行，与系统一致），并按列表长度钳住。
+    fn scroll_by(&self, delta: i32) -> i32 {
+        let list = self.list_rect();
+        let per = ((list.bottom - list.top) / self.s(ROW_H)).max(1);
+        let max = (self.cands.len() as i32 - per + 1).max(0);
+        let d = if delta < 0 { 3 } else { -3 };
+        (self.scroll + d).clamp(0, max)
+    }
 }
 
 // ---------------------------------------------------------------- 打开
@@ -695,6 +825,10 @@ unsafe extern "system" fn ow_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     st.always = !st.always;
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
+                Hit::Find => {
+                    find_more(st);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
                 Hit::Browse => {
                     if let Some(p) = crate::props::pick_file(
                         hwnd,
@@ -715,7 +849,7 @@ unsafe extern "system" fn ow_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 Hit::Ok => {
                     if let Some(c) = st.cands.get(st.sel) {
-                        if st.always {
+                        if st.always && st.kind == TargetKind::File {
                             let ext = st
                                 .path
                                 .extension()
@@ -729,6 +863,13 @@ unsafe extern "system" fn ow_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 Hit::None => {}
             }
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            let delta = (wparam.0 >> 16) as i16 as i32;
+            st.scroll = st.scroll_by(delta);
+            st.hover = Hit::None;
+            let _ = InvalidateRect(Some(hwnd), None, false);
             LRESULT(0)
         }
         WM_CLOSE => {
@@ -770,13 +911,19 @@ fn hit_test(st: &OpenWith, x: i32, y: i32) -> Hit {
     if inside(&st.browse_rect(), x, y) {
         return Hit::Browse;
     }
-    if inside(&st.always_rect(), x, y) {
+    if inside(&st.find_rect(), x, y) {
+        return Hit::Find;
+    }
+    if st.kind == TargetKind::File && inside(&st.always_rect(), x, y) {
         return Hit::Always;
     }
     // 列表行：只认落在列表框内的，超出的（滚出可视区的候选）不算
     let list = st.list_rect();
-    for i in 0..st.cands.len() {
+    for i in st.scroll as usize..st.cands.len() {
         let r = st.row_rect(i);
+        if r.top < list.top {
+            continue;
+        }
         if r.bottom > list.bottom {
             break;
         }
@@ -832,7 +979,11 @@ unsafe fn paint(hdc: HDC, st: &OpenWith) {
     SelectObject(hdc, ob);
     text(
         hdc,
-        "选择要用来打开此文件的程序：",
+        if st.kind == TargetKind::Dir {
+            "选择要用哪个程序打开这个文件夹："
+        } else {
+            "选择要用来打开此文件的程序："
+        },
         RECT { left: st.s(14), top: st.s(TITLE_H + 26), right: st.w - st.s(14), bottom: st.s(TITLE_H + 42) },
         t.text_dim,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE,
@@ -841,8 +992,10 @@ unsafe fn paint(hdc: HDC, st: &OpenWith) {
     // 候选列表
     let list = st.list_rect();
     fill(hdc, &list, t.surface_alt);
-    let visible = ((list.bottom - list.top) / st.s(ROW_H)) as usize;
-    for i in 0..st.cands.len().min(visible) {
+    let _saved = SaveDC(hdc);
+    let _ = IntersectClipRect(hdc, list.left, list.top, list.right, list.bottom);
+    let visible = ((list.bottom - list.top) / st.s(ROW_H)) as usize + 1;
+    for i in st.scroll as usize..st.cands.len().min(st.scroll as usize + visible) {
         let c = &st.cands[i];
         let r = st.row_rect(i);
         if i == st.sel {
@@ -875,7 +1028,12 @@ unsafe fn paint(hdc: HDC, st: &OpenWith) {
         );
     }
 
-    // "始终使用"复选框
+    let _ = RestoreDC(hdc, -1);
+
+    // "始终使用"复选框（目录类目标没有"此类文件"，不画）
+    if st.kind != TargetKind::File {
+        // 目录：占位留空，避免底部控件整体上移
+    } else {
     let ar = st.always_rect();
     if st.hover == Hit::Always {
         fill(hdc, &ar, t.hover_bg);
@@ -904,8 +1062,10 @@ unsafe fn paint(hdc: HDC, st: &OpenWith) {
         t.text,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE,
     );
+    }
 
     for (r, label, hit, accent) in [
+        (st.find_rect(), "查找可用的打开软件", Hit::Find, false),
         (st.browse_rect(), "浏览…", Hit::Browse, false),
         (st.ok_rect(), "确定", Hit::Ok, true),
         (st.cancel_rect(), "取消", Hit::Cancel, false),

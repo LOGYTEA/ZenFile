@@ -635,6 +635,11 @@ pub struct App {
     pub settings_hover: Option<u32>,
     /// 设置页当前停在哪个小标签（见 `SETTINGS_TABS`）。
     pub settings_tab: u8,
+    /// 设置页「右键菜单」正在编辑哪一类（下标见 `MenuKind`）。
+    ///
+    /// 第55轮：照 ContextMenuManager 那样按"右键落在什么上"分类型管理 ——
+    /// 文件 / 文件夹 / 目录背景 / 多选 / 驱动器 各一套排布。
+    pub settings_ctx_kind: u8,
     /// 设置页顶部小标签的悬停下标。
     pub settings_hover_tab: Option<u8>,
     /// 排布编辑器里鼠标悬停的组件/条目 id。
@@ -666,6 +671,10 @@ pub struct App {
     pub menu_preview_items: Option<Vec<PathBuf>>,
     /// 「右键菜单」页里鼠标悬停在第几条菜单项上（下标对应 `own_menu_rows` 的输出）。
     pub settings_hover_menu: Option<usize>,
+    /// 「右键菜单」页右上那颗「查找可用的打开软件」按钮的悬停态。
+    pub settings_hover_find: bool,
+    /// 「右键菜单」页右上已经做过一次全量"查找可用的打开软件"。
+    pub settings_ow_found: bool,
     /// 排布编辑器里正在拖的卡片。
     pub settings_drag: Option<crate::settings::SettingsDrag>,
     /// 「界面 / 右键菜单」的排布（顺序 + 被收进「更多」的那些）。
@@ -1128,6 +1137,8 @@ impl App {
             openwith_preview: None,
             menu_preview_items: None,
             settings_hover_menu: None,
+            settings_hover_find: false,
+            settings_ow_found: false,
             fast_mode: false,
             xfer: None,
             io_tx,
@@ -1168,6 +1179,7 @@ impl App {
             hover_recycle_btn: 0,
             settings_hover: None,
             settings_tab: 0,
+            settings_ctx_kind: 0,
             settings_hover_tab: None,
             settings_hover_card: None,
             settings_drag: None,
@@ -1705,17 +1717,71 @@ impl App {
         if self.openwith_preview.is_some() && self.menu_preview_items.is_some() {
             return;
         }
-        let sample = self.menu_preview_sample();
-        let ext = sample
-            .first()
-            .and_then(|p| p.extension().map(|x| x.to_string_lossy().to_string()))
-            .unwrap_or_else(|| "txt".to_string());
-        let list = crate::openwith::candidates(&ext)
-            .into_iter()
-            .map(|c| (c.name, c.icon.0 as isize))
-            .collect::<Vec<_>>();
+        let kind = MenuKind::from_u8(self.settings_ctx_kind);
+        let sample = self.menu_preview_sample_for(kind);
+        // 目录类（文件夹/背景/多选/驱动器）没有扩展名：候选按"谁能吃目录"找。
+        // 文件类按样本的真实扩展名找。
+        let list = if kind == MenuKind::File {
+            let ext = sample
+                .first()
+                .and_then(|p| p.extension().map(|x| x.to_string_lossy().to_string()))
+                .unwrap_or_else(|| "txt".to_string());
+            crate::openwith::candidates(&ext)
+        } else {
+            crate::openwith::candidates_dir()
+        }
+        .into_iter()
+        .map(|c| (c.name, c.icon.0 as isize))
+        .collect::<Vec<_>>();
         self.openwith_preview = Some(list);
         self.menu_preview_items = Some(sample);
+    }
+
+    /// 给设置页按**正在编辑的那一类**挑样本。
+    ///
+    /// 目录背景要的是"没有选中"（菜单里才有新建/查看/排序），多选要两个样本，
+    /// 驱动器要一个盘符根 —— 照样本渲染出来的菜单才跟真窗口对得上。
+    pub fn menu_preview_sample_for(&self, kind: MenuKind) -> Vec<PathBuf> {
+        let dir = self
+            .panes
+            .iter()
+            .flat_map(|p| p.tabs.iter())
+            .find(|t| !t.settings && !t.recycle && !t.home)
+            .map(|t| t.path.clone());
+        let dir = dir.unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("C:\\"))
+        });
+        match kind {
+            MenuKind::Background => Vec::new(),
+            MenuKind::Multi => {
+                let mut v = self.menu_preview_sample();
+                if v.len() < 2 {
+                    if let Ok(rd) = std::fs::read_dir(&dir) {
+                        v.extend(rd.filter_map(|e| e.ok()).take(2).map(|e| e.path()));
+                    }
+                }
+                v.truncate(2);
+                v
+            }
+            MenuKind::Drive => {
+                let s = dir.to_string_lossy().to_string();
+                let root = if s.len() >= 2 {
+                    format!("{}:\\", s.chars().next().unwrap_or('C'))
+                } else {
+                    "C:\\".to_string()
+                };
+                vec![PathBuf::from(root)]
+            }
+            MenuKind::Folder => {
+                if let Ok(rd) = std::fs::read_dir(&dir) {
+                    if let Some(p) = rd.filter_map(|e| e.ok()).find(|e| e.path().is_dir()) {
+                        return vec![p.path()];
+                    }
+                }
+                vec![dir.clone()]
+            }
+            MenuKind::File => self.menu_preview_sample(),
+        }
     }
 
     /// 给设置页的实时菜单挑一个"右键它"的样本。
@@ -3525,7 +3591,8 @@ impl App {
             menu::build_shell_bridge(self.hwnd, &parent, &items, false)
         };
 
-        let mut entries = own_menu_rows(self, &items);
+        let kind = menu_kind_of(&items);
+        let mut entries = own_menu_rows(self, &items, kind);
         if let Some(bridge) = &self.bridge {
             let mut system = menu::entries_from_bridge(bridge);
             // 去掉与自有条目重名的一级项：Shell 菜单里也有"打开/剪切/复制/重命名/
@@ -3670,12 +3737,26 @@ impl App {
         match cmd {
             Command::Open => self.open_focused(),
             Command::OpenWith => {
-                // 有多个选中就对第一个文件问：资源管理器也是这么做的。
-                // `selected_paths()` 在选中为空时会退回焦点行，正合适。
-                let target = self.tab().selected_paths().into_iter().find(|p| p.is_file());
-                if let Some(p) = target {
-                    let ptr = self as *mut App;
-                    crate::openwith::open(ptr, p);
+                let ptr = self as *mut App;
+                // 选中为空 = 空白处右键 → 目标是**当前目录**；
+                // 有选中就对第一个文件问（资源管理器也是这么做的）；
+                // 全是文件夹/盘符 → 用目录模式（VS Code / 终端 / 资源管理器…）。
+                //
+                // 注意：这里**不能**用 `selected_paths()` —— 它在选中为空时会
+                // 退回焦点行，于是空白处右键会莫名其妙打开某个文件。
+                if self.tab().selected.is_empty() {
+                    let dir = self.tab().path.clone();
+                    if !is_virtual(&dir) {
+                        crate::openwith::open_dir(ptr, dir);
+                    }
+                } else {
+                    let sel = self.tab().selected_paths();
+                    let file = sel.iter().find(|p| p.is_file()).cloned();
+                    if let Some(p) = file {
+                        crate::openwith::open(ptr, p);
+                    } else if let Some(d) = sel.into_iter().next() {
+                        crate::openwith::open_dir(ptr, d);
+                    }
                 }
             }
             Command::Copy => self.clipboard_write(ClipMode::Copy),
@@ -4805,21 +4886,91 @@ pub fn submenu_row(text: &str, glyph: Option<&'static str>, children: Vec<menu::
     }
 }
 
+/// 右键菜单的**类型**：右键落在什么上。
+///
+/// 不同类型的菜单条目集合本来就不一样（文件有"打开"、空白处有"新建/查看/
+/// 排序方式"），所以顺序与显隐也要各记一套 —— 这就是设置页照
+/// ContextMenuManager 分类型的由来。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MenuKind {
+    /// 选中了一个文件
+    File,
+    /// 选中了一个文件夹
+    Folder,
+    /// 空白处（目录背景）
+    Background,
+    /// 选中了多个
+    Multi,
+    /// 选中了盘符（C:\）
+    Drive,
+}
+
+pub const MENU_KIND_NAMES: [&str; 5] = ["文件", "文件夹", "目录背景", "多选", "驱动器"];
+/// 落盘用的键（写进 `ui_settings.json` 的 `menu_sets`）。
+pub const MENU_KIND_KEYS: [&str; 5] = ["file", "folder", "background", "multi", "drive"];
+
+impl MenuKind {
+    pub fn from_u8(i: u8) -> Self {
+        match i {
+            1 => MenuKind::Folder,
+            2 => MenuKind::Background,
+            3 => MenuKind::Multi,
+            4 => MenuKind::Drive,
+            _ => MenuKind::File,
+        }
+    }
+    pub fn index(self) -> u8 {
+        match self {
+            MenuKind::File => 0,
+            MenuKind::Folder => 1,
+            MenuKind::Background => 2,
+            MenuKind::Multi => 3,
+            MenuKind::Drive => 4,
+        }
+    }
+}
+
+/// 按"右键落在什么上"判定菜单类型。
+pub fn menu_kind_of(items: &[PathBuf]) -> MenuKind {
+    if items.is_empty() {
+        return MenuKind::Background;
+    }
+    if items.len() > 1 {
+        return MenuKind::Multi;
+    }
+    let p = &items[0];
+    if p.is_file() {
+        return MenuKind::File;
+    }
+    // 盘符根（C:\）单独一类：资源管理器里它的右键菜单也是另一套
+    let st = p.to_string_lossy();
+    let is_root = st.len() <= 3 && st.chars().nth(1) == Some(':');
+    if is_root {
+        MenuKind::Drive
+    } else {
+        MenuKind::Folder
+    }
+}
+
 /// 自绘菜单的第一屏：图标行 + 常规动作（§7 产品化解法）。
 ///
 /// 第 19 轮：条目的**顺序与显隐由设置页「右键菜单」标签决定**（拖出来的排布存在
 /// `ui_settings.json`）。所以这里先按 id 收进一张表，最后再按排布吐出去 ——
 /// 而不是像以前那样写死一串 push。id 与 `settings::MENU_ITEM_NAMES` 一一对应。
-pub fn own_menu_rows(app: &App, items: &[PathBuf]) -> Vec<menu::MenuEntry> {
+pub fn own_menu_rows(app: &App, items: &[PathBuf], kind: MenuKind) -> Vec<menu::MenuEntry> {
     let mut tagged: Vec<(u16, menu::MenuEntry)> = Vec::new();
     let mut push = |id: u16, e: menu::MenuEntry| tagged.push((id, e));
 
     if !items.is_empty() {
         push(0, shell_row("打开", Some("\u{E8A7}"), Command::Open));
-        // 「打开方式」只对文件有意义：文件夹的"打开方式"在资源管理器里也没有。
-        if items.iter().any(|p| p.is_file()) {
-            push(1, shell_row("打开方式", Some("\u{E7AC}"), Command::OpenWith));
-        }
+        // 「打开方式」**每一类都有**（第55轮）：
+        //   · 文件     → 用它打开这个文件
+        //   · 文件夹   → 用它打开这个文件夹（VS Code / 终端 / 资源管理器…）
+        //   · 多选     → 对选中里的第一个问
+        //   · 驱动器   → 同文件夹
+        // 以前只在"选中里有文件"时才列，于是文件夹右键永远看不到 —— 而装了
+        // VS Code 的人最想要的恰恰是"用 Code 打开这个文件夹"。
+        push(1, shell_row("打开方式", Some("\u{E7AC}"), Command::OpenWith));
         // 「复制」这类"要拿走点什么"的动作，在没有可复制内容时必须是**禁用态**：
         // 资源管理器里它就是淡的、点不动。之前不管有没有选中都照常列出，
         // 点下去静悄悄什么都不发生，看着像菜单坏了。
@@ -4862,6 +5013,9 @@ pub fn own_menu_rows(app: &App, items: &[PathBuf]) -> Vec<menu::MenuEntry> {
         ));
         push(11, submenu_row("查看", Some("\u{E7B3}"), view_children));
         push(12, submenu_row("排序方式", Some("\u{E8CB}"), sort_rows(app)));
+        // 空白处右键的「打开方式」= 用选中的程序打开**当前这个目录**
+        // （等价于 VS Code 在背景菜单上挂的"Open with Code"）。
+        push(1, shell_row("打开方式（此文件夹）", Some("\u{E7AC}"), Command::OpenWith));
     }
     push(
         13,
@@ -4875,10 +5029,18 @@ pub fn own_menu_rows(app: &App, items: &[PathBuf]) -> Vec<menu::MenuEntry> {
     // 的菜单里既不合语义又容易被误点（用户要求）。入口保留在「更多」菜单。
 
     // —— 按排布输出 ——
-    let order = &app.ui_settings.menu_order;
-    let hidden = &app.ui_settings.menu_hidden;
+    let mut order = crate::settings::menu_order_for(app, kind);
+    let hidden = crate::settings::menu_hidden_for(app, kind);
+    if items.is_empty() {
+        // 背景菜单里「打开方式（此文件夹）」排到**属性之前**（也就是最后）：
+        // 它是"拿这个目录去干什么"，跟新建/全选/刷新那一堆摆在一起太冒失，
+        // 按 id 自然序会跑到第一行去。
+        order.retain(|i| *i != 1);
+        let pos = order.iter().position(|i| *i == 13).unwrap_or(order.len());
+        order.insert(pos, 1);
+    }
     let mut out: Vec<menu::MenuEntry> = Vec::new();
-    for id in order {
+    for id in order.iter() {
         if hidden.contains(id) {
             continue;
         }

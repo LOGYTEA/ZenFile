@@ -12,6 +12,7 @@
 //! 几何纪律照旧：绘制与命中测试共用同一个 `geom()`，绝不两边各写一份常量。
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::HDC;
@@ -411,16 +412,31 @@ pub struct Settings {
     /// 从原来那条里挪走。
     #[serde(default = "default_bars")]
     pub bars: Vec<Vec<u16>>,
-    /// 「右键菜单」里可见条目的排列顺序
+    /// 「右键菜单」里可见条目的排列顺序（**默认排布**，也是老配置的兼容字段）
     pub menu_order: Vec<u16>,
-    /// 被拖进「更多」的菜单条目
+    /// 被拖进「更多」的菜单条目（默认排布）
     pub menu_hidden: Vec<u16>,
+    /// 第55轮：**每一类**右键菜单各自的排布。
+    ///
+    /// 键见 `crate::app::MENU_KIND_KEYS`（file / folder / background / multi /
+    /// drive）。照 ContextMenuManager 那样按"右键落在什么上"分类型 —— 文件与
+    /// 空白处的菜单条目集合本来就不一样，却共用一套顺序，怎么拖都别扭。
+    /// 某个类型没有记录时沿用上面那份默认排布（老配置无痛升级）。
+    #[serde(default)]
+    pub menu_sets: BTreeMap<String, MenuSet>,
     /// 预览画布里**已经放下的**组件（id, x, y）。
     ///
     /// round 25 起，预览画布改成"画布"形态：组件拖进预览里就落下到
     /// (x, y) 位置；拖出预览就删；最多装一次。每个 wid 在这里只出现一次。
     #[serde(default)]
     pub canvas_items: Vec<CanvasItem>,
+}
+
+/// 某一类右键菜单的排布。
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct MenuSet {
+    pub order: Vec<u16>,
+    pub hidden: Vec<u16>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -439,6 +455,7 @@ impl Default for Settings {
             bars: default_bars(),
             menu_order: (0..MENU_ITEM_NAMES.len() as u16).collect(),
             menu_hidden: Vec::new(),
+            menu_sets: BTreeMap::new(),
             canvas_items: Vec::new(),
         }
     }
@@ -484,6 +501,22 @@ impl Settings {
             .retain(|i| *i < m && !self.menu_order.contains(i) && !MENU_ITEM_RETIRED.contains(&i));
         self.menu_hidden.sort_unstable();
         self.menu_hidden.dedup();
+        for ms in self.menu_sets.values_mut() {
+            ms.order
+                .retain(|i| *i < m && !ms.hidden.contains(i) && !MENU_ITEM_RETIRED.contains(&i));
+            for i in 0..m {
+                if !ms.order.contains(&i)
+                    && !ms.hidden.contains(&i)
+                    && !MENU_ITEM_RETIRED.contains(&i)
+                {
+                    ms.order.push(i);
+                }
+            }
+            ms.hidden
+                .retain(|i| *i < m && !ms.order.contains(i) && !MENU_ITEM_RETIRED.contains(&i));
+            ms.hidden.sort_unstable();
+            ms.hidden.dedup();
+        }
     }
 
     pub fn path() -> Option<PathBuf> {
@@ -551,8 +584,12 @@ pub struct Geom {
     /// 菜单面板里每一条（分隔线不占）的矩形与条目下标
     pub menu_rows: Vec<RECT>,
     pub menu_idx: Vec<usize>,
+    /// 「右键菜单」：顶部那一排"右键落在什么上"的类型 chip
+    pub kind_chips: Vec<RECT>,
     /// 「右键菜单」：右上「打开方式」面板
     pub ow_panel: RECT,
+    /// 「右键菜单」：右上面板底部那颗「查找可用的打开软件」按钮
+    pub ow_find: RECT,
     /// 界面页：上面那条（小组件）
     pub ui_top: RECT,
     /// 界面页：右边那条（长组件）
@@ -589,6 +626,10 @@ pub enum Hit {
     MenuRow(usize),
     /// 「右键菜单」打开方式列表里第 n 个程序
     OpenWith(usize),
+    /// 「右键菜单」顶部的类型 chip（下标见 `MENU_KIND_NAMES`）
+    CtxKind(u8),
+    /// 「右键菜单」右上面板底部那颗「查找可用的打开软件」按钮
+    OwFind,
     /// 预览画布里第 n 个已放置组件（可拖动改位置 / 拖出预览删除）
     Canvas(usize),
 }
@@ -671,7 +712,9 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
         menu_panel: RECT::default(),
         menu_rows: Vec::new(),
         menu_idx: Vec::new(),
+        kind_chips: Vec::new(),
         ow_panel: RECT::default(),
+        ow_find: RECT::default(),
         ow_rows: Vec::new(),
         sys_panel: RECT::default(),
         ui_top: RECT::default(),
@@ -684,8 +727,37 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
 
     match app.settings_tab {
         crate::app::SETTINGS_TAB_MENU => {
-            // 左边是**按当前排布真实渲染**的右键菜单，右边上半是「打开方式」
-            // 的真实候选程序，右边下半是写回 Windows 的系统右键菜单开关。
+            // 第55轮（照 ContextMenuManager）：最上面一排是"右键落在什么上"的
+            // 类型 chip，切换它 → 下面三块（菜单预览 / 打开方式 / 系统集成）
+            // 全部跟着换。左边是**按该类型的当前排布真实渲染**的菜单，右边上半
+            // 是该类型"能找到的打开软件"，右边下半是写回 Windows 的系统开关。
+            let chip_h = px(28.0);
+            let mut cx = content.left;
+            // 注意：上面量标签用的那个 `hdc` **已经 ReleaseDC 了**（就在这段之前），
+            // 拿它继续量文字，GetTextExtentPoint32W 直接失败返回 0 —— chip 会被压成
+            // 22px（只剩 padding），字全糊在一起。这里必须自己再取一个。
+            let cdc = unsafe { windows::Win32::Graphics::Gdi::GetDC(Some(app.hwnd)) };
+            for name in crate::app::MENU_KIND_NAMES {
+                let cw = if cdc.is_invalid() {
+                    px(64.0)
+                } else {
+                    let w = unsafe { paint::text_width(cdc, hf, name) };
+                    w + px(22.0)
+                };
+                g.kind_chips.push(RECT { left: cx, top: content.top, right: cx + cw, bottom: content.top + chip_h });
+                cx += cw + px(6.0);
+            }
+            if !cdc.is_invalid() {
+                unsafe {
+                    let _ = windows::Win32::Graphics::Gdi::ReleaseDC(Some(app.hwnd), cdc);
+                }
+            }
+            let content = RECT {
+                left: content.left,
+                top: content.top + chip_h + px(10.0),
+                right: content.right,
+                bottom: content.bottom,
+            };
             let mw = px(300.0).min((content.right - content.left) * 42 / 100);
             g.menu_panel = RECT {
                 left: content.left,
@@ -716,11 +788,19 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
             let rh2 = (content.bottom - content.top) * 62 / 100;
             g.ow_panel = RECT { left: rx, top: content.top, right: content.right, bottom: content.top + rh2 };
             g.sys_panel = RECT { left: rx, top: content.top + rh2 + px(10.0), right: content.right, bottom: content.bottom };
+            // 「查找可用的打开软件」按钮贴在右上面板底部
+            let fh = px(30.0);
+            g.ow_find = RECT {
+                left: g.ow_panel.left,
+                top: g.ow_panel.bottom - fh,
+                right: g.ow_panel.right,
+                bottom: g.ow_panel.bottom,
+            };
             let n = app.openwith_preview.as_ref().map(|v| v.len()).unwrap_or(0);
             let orh = px(38.0);
             let mut oy = g.ow_panel.top + px(26.0);
             for _ in 0..n {
-                if oy + orh > g.ow_panel.bottom {
+                if oy + orh > g.ow_find.top - px(4.0) {
                     break;
                 }
                 g.ow_rows.push(RECT { left: g.ow_panel.left, top: oy, right: g.ow_panel.right, bottom: oy + orh });
@@ -1003,6 +1083,14 @@ pub fn hit(app: &App, l: &Layout, x: i32, y: i32) -> Option<Hit> {
     for (i, r) in g.ow_rows.iter().enumerate() {
         if inside(r, x, y) {
             return Some(Hit::OpenWith(i));
+        }
+    }
+    if g.ow_find.right > g.ow_find.left && inside(&g.ow_find, x, y) {
+        return Some(Hit::OwFind);
+    }
+    for (i, r) in g.kind_chips.iter().enumerate() {
+        if inside(r, x, y) {
+            return Some(Hit::CtxKind(i as u8));
         }
     }
     for (i, r) in g.tree_rows.iter().enumerate() {
@@ -3304,8 +3392,43 @@ fn menu_preview_entries(app: &App) -> Vec<crate::menu::MenuEntry> {
     // 样本在切进这一页时算好存起来了（`App::menu_preview_items`）——
     // 设置页自己是虚拟标签，照它渲染只能得到"空白处右键"的 6 行短菜单，
     // 而这里要展示的是"对文件右键"那一整套。
+    let kind = crate::app::MenuKind::from_u8(app.settings_ctx_kind);
     let items: Vec<std::path::PathBuf> = app.menu_preview_items.clone().unwrap_or_default();
-    crate::app::own_menu_rows(app, &items)
+    crate::app::own_menu_rows(app, &items, kind)
+}
+
+/// 某一类菜单当前的排布（没记录就退回默认那份）。
+pub fn menu_order_for(app: &App, kind: crate::app::MenuKind) -> Vec<u16> {
+    let key = crate::app::MENU_KIND_KEYS[kind.index() as usize];
+    match app.ui_settings.menu_sets.get(key) {
+        Some(ms) if !ms.order.is_empty() => ms.order.clone(),
+        _ => app.ui_settings.menu_order.clone(),
+    }
+}
+
+pub fn menu_hidden_for(app: &App, kind: crate::app::MenuKind) -> Vec<u16> {
+    let key = crate::app::MENU_KIND_KEYS[kind.index() as usize];
+    match app.ui_settings.menu_sets.get(key) {
+        Some(ms) => ms.hidden.clone(),
+        None => app.ui_settings.menu_hidden.clone(),
+    }
+}
+
+/// 写回某一类菜单的排布。
+pub fn menu_set_write(app: &mut App, kind: crate::app::MenuKind, order: Vec<u16>, hidden: Vec<u16>) {
+    let key = crate::app::MENU_KIND_KEYS[kind.index() as usize].to_string();
+    app.ui_settings.menu_sets.insert(key, MenuSet { order, hidden });
+}
+
+/// 设置页正在编辑的那一类的排布。
+fn cur_menu_set(app: &App) -> (Vec<u16>, Vec<u16>) {
+    let kind = crate::app::MenuKind::from_u8(app.settings_ctx_kind);
+    (menu_order_for(app, kind), menu_hidden_for(app, kind))
+}
+
+fn commit_menu_set(app: &mut App, order: Vec<u16>, hidden: Vec<u16>) {
+    let kind = crate::app::MenuKind::from_u8(app.settings_ctx_kind);
+    menu_set_write(app, kind, order, hidden);
 }
 
 /// 当前**可见**的菜单条目 id，顺序即渲染顺序。
@@ -3313,11 +3436,13 @@ fn menu_preview_entries(app: &App) -> Vec<crate::menu::MenuEntry> {
 /// 渲染出来的第 n 条（分隔线不算）就对应这里的第 n 个 —— 于是"在实时菜单里
 /// 把第 3 条拖到第 1 条"可以直接换算成排布表里的位置交换。
 pub fn visible_menu_ids(app: &App) -> Vec<u16> {
-    app.ui_settings
-        .menu_order
+    let kind = crate::app::MenuKind::from_u8(app.settings_ctx_kind);
+    let order = menu_order_for(app, kind);
+    let hidden = menu_hidden_for(app, kind);
+    order
         .iter()
         .copied()
-        .filter(|i| !app.ui_settings.menu_hidden.contains(i))
+        .filter(|i| !hidden.contains(i))
         .filter(|i| !MENU_ITEM_RETIRED.contains(&i))
         .collect()
 }
@@ -3358,6 +3483,19 @@ fn system_rows(app: &App, r: &RECT) -> Vec<paint::SettingRow> {
 }
 
 fn paint_menu_tab(app: &App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
+    // —— 顶：类型 chip（右键落在什么上）——
+    for (i, r) in g.kind_chips.iter().enumerate() {
+        let on = app.settings_ctx_kind as usize == i;
+        fill_rect(hdc, r, if on { th.accent } else { th.surface_alt });
+        set_color(hdc, if on { th.selection_text } else { th.text });
+        paint::draw_text(
+            hdc,
+            crate::app::MENU_KIND_NAMES[i],
+            *r,
+            DT_SINGLELINE | DT_NOPREFIX | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS,
+        );
+    }
+
     // —— 左：真实渲染的右键菜单 ——
     let entries = menu_preview_entries(app);
     let row_h = (30.0 * s).round() as i32;
@@ -3422,10 +3560,14 @@ fn paint_menu_tab(app: &App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
         right: g.ow_panel.right,
         bottom: g.ow_panel.top + (26.0 * s).round() as i32,
     };
+    let kn = crate::app::MENU_KIND_NAMES
+        .get(app.settings_ctx_kind as usize)
+        .copied()
+        .unwrap_or("文件");
     set_color(hdc, th.text);
     paint::draw_text(
         hdc,
-        "打开方式（当前目录里那个文件的真实候选）",
+        &format!("查找可用的打开软件 · {kn}"),
         hdr,
         DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS,
     );
@@ -3452,6 +3594,37 @@ fn paint_menu_tab(app: &App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
             DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS,
         );
     }
+
+    // —— 右上底部：「查找可用的打开软件」按钮 ——
+    let fr = g.ow_find;
+    fill_rect(hdc, &fr, if app.settings_hover_find { th.hover_bg } else { th.surface_alt });
+    let (p, op, ob) = unsafe {
+        let p = windows::Win32::Graphics::Gdi::CreatePen(
+            windows::Win32::Graphics::Gdi::PS_SOLID,
+            1,
+            th.border,
+        );
+        let op = SelectObject(hdc, p.into());
+        let ob = SelectObject(hdc, windows::Win32::Graphics::Gdi::GetStockObject(NULL_BRUSH));
+        let _ = windows::Win32::Graphics::Gdi::Rectangle(hdc, fr.left, fr.top, fr.right, fr.bottom);
+        (p, op, ob)
+    };
+    unsafe {
+        SelectObject(hdc, ob);
+        SelectObject(hdc, op);
+        let _ = DeleteObject(p.into());
+    }
+    set_color(hdc, th.text);
+    paint::draw_text(
+        hdc,
+        if app.settings_ow_found {
+            "查找可用的打开软件（已列出本机全部程序）"
+        } else {
+            "查找可用的打开软件…"
+        },
+        fr,
+        DT_SINGLELINE | DT_NOPREFIX | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS,
+    );
 
     // —— 右下：系统集成 ——
     for r in &g.rows {
@@ -3807,10 +3980,12 @@ pub fn hide(app: &mut App, tab: u8, id: u32) {
         }
     } else {
         let i = id as u16;
-        app.ui_settings.menu_order.retain(|v| *v != i);
-        if !app.ui_settings.menu_hidden.contains(&i) {
-            app.ui_settings.menu_hidden.push(i);
+        let (mut o, mut h) = cur_menu_set(app);
+        o.retain(|v| *v != i);
+        if !h.contains(&i) {
+            h.push(i);
         }
+        commit_menu_set(app, o, h);
     }
     after_change(app);
 }
@@ -3825,10 +4000,12 @@ pub fn restore(app: &mut App, tab: u8, id: u32) {
         }
     } else {
         let i = id as u16;
-        app.ui_settings.menu_hidden.retain(|v| *v != i);
-        if !app.ui_settings.menu_order.contains(&i) {
-            app.ui_settings.menu_order.push(i);
+        let (mut o, mut h) = cur_menu_set(app);
+        h.retain(|v| *v != i);
+        if !o.contains(&i) {
+            o.push(i);
         }
+        commit_menu_set(app, o, h);
     }
     after_change(app);
 }
@@ -3847,7 +4024,7 @@ pub fn reorder(app: &mut App, tab: u8, id: u32, target: usize) {
         o.insert(t, i);
     } else {
         let i = id as u16;
-        let o = &mut app.ui_settings.menu_order;
+        let (mut o, h) = cur_menu_set(app);
         let old = match o.iter().position(|v| *v == i) {
             Some(p) => p,
             None => return,
@@ -3855,6 +4032,7 @@ pub fn reorder(app: &mut App, tab: u8, id: u32, target: usize) {
         o.remove(old);
         let t = target.min(o.len());
         o.insert(t, i);
+        commit_menu_set(app, o, h);
     }
     after_change(app);
 }

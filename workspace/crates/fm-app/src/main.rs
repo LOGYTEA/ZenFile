@@ -10,6 +10,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod appfind;
 mod coldlg;
 mod icon_theme;
 mod icons;
@@ -1274,6 +1275,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 if app.settings_drag.is_some() {
                     (app.settings_hover, app.settings_hover_tab, app.settings_hover_card)
                 } else {
+                    app.settings_hover_find = false;
                     let mut ht = None;
                     let mut hc = None;
                     let mut hr = None;
@@ -1295,6 +1297,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                                 settings::geom(app, &hpl).menu_idx.get(i).copied();
                         }
                         Some(settings::Hit::OpenWith(_)) => {}
+                        Some(settings::Hit::OwFind) => {
+                            app.settings_hover_find = true;
+                        }
+                        Some(settings::Hit::CtxKind(_)) => {}
                         Some(settings::Hit::Canvas(_)) => {}
                         None => {
                             app.settings_hover_menu = None;
@@ -1659,6 +1665,38 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                         if i == crate::app::SETTINGS_TAB_MENU {
                             app.ensure_openwith_preview();
                         }
+                        let _ = InvalidateRect(Some(hwnd), None, true);
+                    }
+                    Some(settings::Hit::CtxKind(i)) => {
+                        // 切「右键落在什么上」：样本、候选、菜单全都要跟着换
+                        if app.settings_ctx_kind != i {
+                            app.settings_ctx_kind = i;
+                            app.openwith_preview = None;
+                            app.menu_preview_items = None;
+                            app.settings_ow_found = false;
+                            app.settings_hover_menu = None;
+                            app.ensure_openwith_preview();
+                        }
+                        let _ = InvalidateRect(Some(hwnd), None, true);
+                    }
+                    Some(settings::Hit::OwFind) => {
+                        // 「查找可用的打开软件」：把本机装着的程序全补进这一栏。
+                        // 关联的只有几条，装了却没抢过关联的那些全在后面 —— 这一按
+                        // 就是把它们列出来（按 exe 名去重，已列的不重复出现）。
+                        let have: std::collections::HashSet<String> = app
+                            .openwith_preview
+                            .as_ref()
+                            .map(|v| v.iter().map(|(n, _)| n.to_lowercase()).collect())
+                            .unwrap_or_default();
+                        let mut list = app.openwith_preview.clone().unwrap_or_default();
+                        for a in crate::appfind::installed() {
+                            if have.contains(&a.name.to_lowercase()) {
+                                continue;
+                            }
+                            list.push((a.name.clone(), a.icon));
+                        }
+                        app.openwith_preview = Some(list);
+                        app.settings_ow_found = true;
                         let _ = InvalidateRect(Some(hwnd), None, true);
                     }
                     Some(settings::Hit::Tree(i)) => {
