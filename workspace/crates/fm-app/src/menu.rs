@@ -23,9 +23,6 @@ use windows::Win32::Graphics::Gdi::{
     MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::Graphics::Gdi::{BitBlt, CreateCompatibleDC, DeleteDC};
-use windows::Win32::Graphics::Gdi::{
-    CreatePen, GetStockObject, LineTo, MoveToEx, NULL_BRUSH, PS_SOLID,
-};
 use windows::Win32::Foundation::POINT;
 use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use windows::Win32::Graphics::Gdi::InvalidateRect;
@@ -216,16 +213,12 @@ pub struct MenuEntry {
     pub bmp: Option<isize>,
     pub separator: bool,
     pub disabled: bool,
-    /// "这一项就是当前生效的那个"（查看 → 详细信息、排序方式 → 名称 …）。
+    /// "这一项就是当前生效的那个"（查看 → 详细信息、排序方式 → 名称、
+    /// 表头菜单里已显示的列 …）。
     ///
     /// 渲染成行首一条**橙色**竖线：蓝色竖线已经用来表示"鼠标正悬停在这行"，
     /// 两者撞色就分不清"我指在这儿"和"现在用的是这个"。
     pub selected: bool,
-    /// 勾选态（✓）——「选择列…」里已显示的列就是勾着的（第33轮）。
-    ///
-    /// 与 `selected` 分开：那条橙色竖线表示"当前模式"（查看 → 大图标），
-    /// 勾表示"这一项开着"（列可见性）。两套语义混用会分不清。
-    pub checked: bool,
     pub has_submenu: bool,
     pub submenu: Vec<MenuEntry>,
     pub action: MenuAction,
@@ -242,21 +235,10 @@ impl MenuEntry {
             separator: false,
             disabled: false,
             selected: false,
-            checked: false,
             has_submenu: false,
             submenu: Vec::new(),
             action: MenuAction::Own(cmd),
         }
-    }
-
-    /// 勾选态（✓）版本。
-    pub fn checked_item(text: impl Into<String>, cmd: Command, on: bool) -> Self {
-        Self::item(text, cmd).with_checked(on)
-    }
-
-    pub fn with_checked(mut self, on: bool) -> Self {
-        self.checked = on;
-        self
     }
 
     pub fn with_disabled(mut self, on: bool) -> Self {
@@ -282,7 +264,6 @@ impl MenuEntry {
             separator: true,
             disabled: false,
             selected: false,
-            checked: false,
             has_submenu: false,
             submenu: Vec::new(),
             action: MenuAction::None,
@@ -488,7 +469,6 @@ fn read_entry(hmenu: HMENU, pos: u32, first_id: u32, depth: usize) -> Option<Men
             separator: false,
             disabled,
             selected: (mii.fState & MFS_CHECKED) == MFS_CHECKED,
-            checked: false,
             has_submenu: has_submenu && !submenu.is_empty(),
             submenu,
             action,
@@ -1345,28 +1325,7 @@ unsafe fn paint_menu(hdc: HDC, state: &MenuWindow) {
             if let Some(hbmp) = e.bmp {
                 draw_bmp(hdc, hbmp, icon_pad, top + (state.row_h - 16) / 2, 16);
             }
-            // 勾选标记（✓）：画在图标位那一列（第33轮「选择列」用）。
-            // 与 `selected`（行首橙色竖线）语义不同，不共用位置。
-            //
-            // **自己画两条线段，不用字体字形**：Segoe MDL2 Assets 的 U+E70E
-            // 在这套自绘菜单里渲染出来是个「^」（实测截图），字体没被正确
-            // 加载/映射。矢量对勾在任何机器上都一致，代价只有两条线。
             let icon_left = icon_pad + (28.0 * state.scale) as i32;
-            if e.checked {
-                let g = (3.0 * state.scale).round().max(2.0) as i32;
-                let cx = icon_pad + (14.0 * state.scale) as i32;
-                let cy = top + state.row_h / 2;
-                let pen = CreatePen(PS_SOLID, g, t.text);
-                let op = SelectObject(hdc, pen.into());
-                let ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-                let half = (5.0 * state.scale).round().max(3.0) as i32;
-                let _ = MoveToEx(hdc, cx - half, cy, None);
-                let _ = LineTo(hdc, cx - half / 3, cy + half / 2);
-                let _ = LineTo(hdc, cx + half, cy - half / 2);
-                let _ = SelectObject(hdc, ob);
-                let _ = SelectObject(hdc, op);
-                let _ = DeleteObject(pen.into());
-            }
             let mut text: Vec<u16> = e.text.encode_utf16().collect();
             let tr = RECT {
                 left: icon_left,

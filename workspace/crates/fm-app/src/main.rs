@@ -3016,9 +3016,9 @@ fn show_header_filter_menu(hwnd: HWND, app: &mut App, l: &paint::Layout, col: us
 ///   将列调整为合适的大小(S)
 ///   将所有列均调整为合适的大小(A)
 ///   ─────────
-///   ✓名称          ← 名称恒勾且不可点（同 Explorer）
-///   ✓修改日期
-///    类型
+///   ▎名称          ← 名称恒显且不可点（同 Explorer）
+///   ▎修改日期      ← 已显示的列 = 行首橙色竖线（第52轮：
+///    类型            与右键菜单的选中态同款，不再画 ✓ 勾）
 ///    大小
 ///   ─────────
 ///   其他(M)...
@@ -3038,16 +3038,18 @@ fn header_choose_columns_rows(app: &App) -> Vec<menu::MenuEntry> {
     v.push(menu::MenuEntry::sep());
     // 搜索态下"选择列"禁用（资源管理器同样：搜索结果的列是固定的）
     let locked = app.tab().search_root.is_some();
-    // 名称恒在、恒勾、不可点 —— 与 Explorer 一致（没有任何列表能没有"名称"）
+    // 名称恒在、恒显、不可点 —— 与 Explorer 一致（没有任何列表能没有"名称"）
     for id in fm_core::columns::COL_ALL {
         let on = app.is_col_visible(id);
-        let e = menu::MenuEntry::checked_item(
+        // 选中态 = 右键菜单同款行首橙色竖线（`selected`），悬停时让位给蓝色
+        // 悬停条（渲染层的既有规则），与「查看 → 详细信息」一套语言。
+        let e = menu::MenuEntry::item(
             fm_core::columns::label_of(id),
             menu::Command::ToggleColumn((*id).to_string()),
-            on,
-        );
+        )
+        .with_selected(on);
         if *id == fm_core::columns::C_NAME || locked {
-            v.push(e.with_disabled(true).with_checked(on));
+            v.push(e.with_disabled(true));
         } else {
             v.push(e);
         }
