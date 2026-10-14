@@ -10,6 +10,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod coldlg;
 mod icon_theme;
 mod icons;
 mod menu;
@@ -42,7 +43,8 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::Graphics::Gdi::{ClientToScreen, HBRUSH, HDC, ScreenToClient};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, RegisterHotKey, ReleaseCapture, SetCapture, UnregisterHotKey,
+    GetKeyState, RegisterHotKey, ReleaseCapture, SetCapture, TrackMouseEvent, UnregisterHotKey,
+    TRACKMOUSEEVENT, TRACKMOUSEEVENT_FLAGS,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -931,50 +933,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let _ = InvalidateRect(Some(hwnd), None, true);
             LRESULT(0)
         }
-        // 分隔线上换 ↔ 光标。WM_SETCURSOR 不带坐标（lparam 低位是命中码），
-        // 所以直接复用 WM_MOUSEMOVE 记下的悬停位 —— 反正它也是同一个来源。
-        // 光标一律自己定，不再退回 DefWindowProc。
-        // 之前只有"悬停在分隔线上"才 SetCursor(↔)，其余情况返回 0 让系统去套
-        // 窗口类的 hCursor —— 而 SetCursor 一旦把光标改成 ↔，只要鼠标不跨到别的
-        // 窗口，系统不会主动再设一次，于是拖过一次侧栏之后鼠标在软件里就**永远
-        // 是拉伸图标**。现在每次 WM_SETCURSOR 都显式给出该用的那支光标。
+        // 光标一律自己定，不再退回 DefWindowProc（窗口类的 hCursor 只在
+        // DefWindowProc 里生效，而我们全程自己 SetCursor）。
+        // 具体怎么算见 `apply_cursor`：位置每次现取，不读 hover_* 快照。
         WM_SETCURSOR => {
             let app = &*app_ptr;
-            // lparam 低位是这次命中码（HTLEFT/HTRIGHT/…），由 handle_hit_test 给出
-            let hit = (lparam.0 & 0xFFFF) as u32;
-            let id = match hit {
-                10 | 11 => IDC_SIZEWE,   // HTLEFT / HTRIGHT
-                12 | 15 => IDC_SIZENS,   // HTTOP / HTBOTTOM
-                13 | 17 => IDC_SIZENWSE, // HTTOPLEFT / HTBOTTOMRIGHT
-                14 | 16 => IDC_SIZENESW, // HTTOPRIGHT / HTBOTTOMLEFT
-                _ => {
-                    // 窗格分隔线：竖线 ↔，横线 ↕（拖拽中或悬停都算）
-                    let pane_div = app
-                        .pane_div_drag
-                        .as_ref()
-                        .map(|d| Some(d.vertical))
-                        .unwrap_or(app.hover_pane_div.map(|(v, _, _)| v));
-                    if let Some(vertical) = pane_div {
-                        if vertical {
-                            IDC_SIZEWE
-                        } else {
-                            IDC_SIZENS
-                        }
-                    } else if app.drag_split.is_some() || app.hover_split.is_some() {
-                        IDC_SIZEWE
-                    } else if over_text_input(app, hwnd) {
-                        // 地址栏/搜索框上要出 I 形光标：它们平时是画在父窗口上的
-                        // 面包屑/装饰（真正的 EDIT 只在编辑态才建），没有子窗口来
-                        // 替我们设光标，于是"移到输入框上光标却没变化"。
-                        IDC_IBEAM
-                    } else {
-                        IDC_ARROW
-                    }
-                }
-            };
-            if let Ok(c) = LoadCursorW(None, id) {
-                SetCursor(Some(c));
-            }
+            apply_cursor(hwnd, app);
             LRESULT(1)
         }
         WM_TIMER => {
@@ -1068,6 +1032,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         WM_MOUSEMOVE => {
             let app = &mut *app_ptr;
             let (x, y) = client_xy(hwnd, lparam);
+            // 重挂一次"鼠标离开"跟踪：不挂就永远收不到 WM_MOUSELEAVE，
+            // 鼠标划出窗口之后悬停态会一直赖在画面上（见 track_mouse_leave）。
+            track_mouse_leave(hwnd);
             let l = paint::layout_for(app);
             // 圆角滑杆拖动。**必须排在 settings_drag 判定之前**：按下滑杆时
             // 只置了 radius_drag 标志、并没有设 settings_drag —— 早先这段
@@ -1426,6 +1393,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             }
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
+            // 悬停态刚被改写过：光标按新状态再定一次，别等下一次移动。
+            apply_cursor(hwnd, app);
             LRESULT(0)
         }
         // —— 标题栏三大金刚键 ——
@@ -1452,15 +1421,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         // （实测：右键菜单弹不出来、快捷键收不到，整个 GUI 输入链断掉）。
         WM_MOUSELEAVE | WM_NCMOUSELEAVE => {
             let app = &mut *app_ptr;
-            let dirty = app.hover_caption != 0
-                || app.pressed_caption != 0
-                || app.hovering_close;
-            app.hover_caption = 0;
-            app.pressed_caption = 0;
-            app.hovering_close = false;
-            if dirty {
-                let _ = InvalidateRect(Some(hwnd), None, false);
-            }
+            // **全部**悬停态一次清干净。以前只清标题栏那三个键，于是鼠标划出
+            // 窗口之后内容区那一行还亮着、分隔线还保持高亮、侧栏的行也还反着
+            // 白 —— 回到窗口之前画面一直是旧的（"不自动更新"的另一半）。
+            // 拖拽状态不清：那是按下之后才有的，鼠标划出去不该打断它。
+            app.clear_hover();
+            // 光标也跟着复位（离开时还挂着 ↔ 的话，回来之前一直是拉伸图标）
+            apply_cursor(hwnd, app);
+            let _ = InvalidateRect(Some(hwnd), None, false);
             LRESULT(0)
         }
         WM_NCLBUTTONDOWN => {
@@ -1943,6 +1911,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 if app.settings_radius_drag {
                     app.settings_radius_drag = false;
                     let _ = ReleaseCapture(); // 与按下时的 SetCapture 成对
+                    apply_cursor(hwnd, app); // 松手时光标立刻复位，不等下一次移动
                 }
             }
             // 拖标签：松手就落地（换顺序 / 8 向贴 / 拆成新进程）。
@@ -1952,6 +1921,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 if app.tab_drag.is_some() {
                     end_tab_drag(app, hwnd);
                     let _ = ReleaseCapture();
+                    apply_cursor(hwnd, app);
                     return LRESULT(0);
                 }
             }
@@ -1963,6 +1933,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     let l = paint::layout_for(app);
                     settings::finish_drag(app, &l, x, y);
                     let _ = InvalidateRect(Some(hwnd), None, true);
+                    apply_cursor(hwnd, app);
                     return LRESULT(0);
                 }
             }
@@ -1974,6 +1945,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     let l = paint::layout_for(app);
                     finish_drag(app, &l, x, y);
                     let _ = InvalidateRect(Some(hwnd), None, true);
+                    apply_cursor(hwnd, app);
                     return LRESULT(0);
                 }
             }
@@ -1988,6 +1960,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     }
                     paint::reposition(app);
                     let _ = InvalidateRect(Some(hwnd), None, true);
+                    // 松手那一刻鼠标多半还压在分隔线上（光标仍是 ↔，是对的），
+                    // 但状态已从"拖拽中"变回"悬停"，得按新状态重算一次。
+                    apply_cursor(hwnd, app);
                     return LRESULT(0);
                 }
             }
@@ -1998,6 +1973,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     let _ = ReleaseCapture();
                     app.hover_pane_div = None;
                     let _ = InvalidateRect(Some(hwnd), None, true);
+                    apply_cursor(hwnd, app);
                     return LRESULT(0);
                 }
             }
@@ -2030,6 +2006,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     return LRESULT(0);
                 }
             }
+            // 普通点击也可能改布局（折叠侧栏、切标签…），光标按新布局再定一次
+            apply_cursor(hwnd, &*app_ptr);
             LRESULT(0)
         }
         WM_MBUTTONDOWN => {
@@ -2356,6 +2334,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         }
         WM_CLOSE => {
             let app = &mut *app_ptr;
+            // 「选择详细信息」是挂在**本窗口**上的弹出窗，主窗没了它必须跟着走，
+            // 否则会留一个改不到任何目录的孤儿对话框。
+            coldlg::close_now();
             // 关闭前把位置定格写盘（第29轮）：托盘隐藏走的也是这条路，
             // 之后用户从托盘再开窗口时位置才是对的。
             persist_window_rect(hwnd, true);
@@ -3055,8 +3036,10 @@ fn header_choose_columns_rows(app: &App) -> Vec<menu::MenuEntry> {
         }
     }
     v.push(menu::MenuEntry::sep());
-    v.push(menu::MenuEntry::item("其他(M)...", menu::Command::ToggleColumn(String::new()))
-        .with_disabled(true));
+    // 「其他(M)...」：完整的「选择详细信息」对话框（勾选 + 上移/下移 + 确定/取消）。
+    // 搜索态下列集合是固定的，跟着一起禁用（资源管理器同样）。
+    v.push(menu::MenuEntry::item("其他(M)...", menu::Command::ChooseColumns)
+        .with_disabled(locked));
     v
 }
 
@@ -3145,6 +3128,121 @@ fn over_text_input(app: &App, hwnd: HWND) -> bool {
     let l = paint::layout_for(app);
     // 编辑态下地址栏里已经是一个真 EDIT，父窗口不该再抢它的光标
     (!app.addr_editing && inside(&l.address, pt.x, pt.y)) || inside(&l.search, pt.x, pt.y)
+}
+
+/// 按「当前鼠标位置 + 当前状态」立刻重设光标。
+///
+/// 这是"鼠标指针经常变成死的 / 不自动更新"的根治点，三个坑一起填：
+///   1. **WM_SETCURSOR 比 WM_MOUSEMOVE 先到**。早先它读的是上一次 move 存进
+///      `hover_split / hover_pane_div` 的快照 —— 天然慢一拍；鼠标停在原地不动
+///      （拖完分隔线松手、滚完滚轮、菜单关掉）就再也收不到新的 WM_SETCURSOR，
+///      光标于是**永久卡在旧的那支**。这里一律 GetCursorPos 现取位置现算命中，
+///      不读任何 hover_* 快照，从根上不存在"慢一拍"。
+///   2. 拖拽期间 WM_MOUSEMOVE 走到一半就 return 了，hover_* 根本没更新过，
+///      方向只能由 `drag_*` 状态自己给。
+///   3. 凡是"状态变了但鼠标没动"的收尾处（松手、滚滚轮、菜单关闭、切窗格）
+///      都要主动调一次，不能干等下一次移动。
+unsafe fn apply_cursor(hwnd: HWND, app: &App) {
+    // 菜单开着时光标归菜单窗口管，主窗口别去抢（两边会来回打架）
+    if app.menu_hwnd.is_some() {
+        return;
+    }
+    let mut pt = POINT::default();
+    if GetCursorPos(&mut pt).is_err() {
+        return;
+    }
+    // 光标压在自家子窗口（地址栏/搜索框/重命名框的真 EDIT）上时让子窗口自己
+    // 决定 —— 它们要的是 I 形光标，父窗口在这里插一脚会把它按回箭头。
+    let under = WindowFromPoint(pt);
+    if under.0 != std::ptr::null_mut() && under != hwnd && IsChild(hwnd, under).as_bool() {
+        return;
+    }
+    let mut c = pt;
+    let _ = ScreenToClient(hwnd, &mut c);
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    // 鼠标在窗口外（或被别家窗口盖住）不参与：这时候算出来的"边框命中"是假的，
+    // 会把 ↔ 设到别人家窗口上去。
+    if c.x < rc.left || c.x >= rc.right || c.y < rc.top || c.y >= rc.bottom {
+        set_cursor_id(IDC_ARROW);
+        return;
+    }
+    let hit = handle_hit_test(hwnd, LPARAM(pack_point(pt.x, pt.y))).0 as u32 & 0xFFFF;
+    let id = match hit {
+        10 | 11 => IDC_SIZEWE,   // HTLEFT / HTRIGHT
+        12 | 15 => IDC_SIZENS,   // HTTOP / HTBOTTOM
+        13 | 17 => IDC_SIZENWSE, // HTTOPLEFT / HTBOTTOMRIGHT
+        14 | 16 => IDC_SIZENESW, // HTTOPRIGHT / HTBOTTOMLEFT
+        _ => {
+            // 正在拖窗格分隔线：方向由这次拖拽自己说了算
+            if let Some(vertical) = app.pane_div_drag.as_ref().map(|d| d.vertical) {
+                if vertical {
+                    IDC_SIZEWE
+                } else {
+                    IDC_SIZENS
+                }
+            } else if app.drag_split.is_some() {
+                IDC_SIZEWE
+            } else if app.drag.is_some()
+                || app.tab_drag.is_some()
+                || app.settings_drag.is_some()
+                || app.settings_radius_drag
+            {
+                // 拖文件 / 拖标签 / 拖设置卡片 / 拖圆角滑杆：一律箭头。
+                // 早先这些状态一个都没覆盖，拖完侧栏再随手拖个文件，光标就一直
+                // 挂着 ↔（"指针变死"最常见的那一次）。
+                IDC_ARROW
+            } else {
+                let l = paint::layout_for(app);
+                if let Some((vertical, _, _)) = paint::pane_div_at(app, &l, c.x, c.y) {
+                    if vertical {
+                        IDC_SIZEWE
+                    } else {
+                        IDC_SIZENS
+                    }
+                } else if paint::split_hit(app, &l, c.x, c.y).is_some() {
+                    IDC_SIZEWE
+                } else if over_text_input(app, hwnd) {
+                    // 地址栏/搜索框上要出 I 形光标：它们平时是画在父窗口上的
+                    // 面包屑/装饰（真 EDIT 只在编辑态才建），没有子窗口替我们设，
+                    // 于是"移到输入框上光标却没变化"。
+                    IDC_IBEAM
+                } else {
+                    IDC_ARROW
+                }
+            }
+        }
+    };
+    set_cursor_id(id);
+}
+
+unsafe fn set_cursor_id(id: PCWSTR) {
+    if let Ok(c) = LoadCursorW(None, id) {
+        SetCursor(Some(c));
+    }
+}
+
+/// WM_NCHITTEST 用的是"打包过的屏幕坐标"（低位 x，高位 y）。
+fn pack_point(x: i32, y: i32) -> isize {
+    ((((y as u32) & 0xFFFF) << 16) | ((x as u32) & 0xFFFF)) as isize
+}
+
+/// 让窗口在鼠标离开时真的收到 WM_MOUSELEAVE。
+///
+/// 之前这条消息根本不会来（从来没调过 TrackMouseEvent），于是"鼠标都移出窗口
+/// 了，内容区那一行还亮着、分隔线还保持高亮"，只有标题栏三个键靠 WM_ACTIVATE
+/// 那条路勉强清过一次。每次 WM_MOUSEMOVE 重挂一次即可（重复挂是幂等的）。
+fn track_mouse_leave(hwnd: HWND) {
+    let mut tme = TRACKMOUSEEVENT {
+        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+        dwFlags: TRACKMOUSEEVENT_FLAGS(
+            windows::Win32::UI::Input::KeyboardAndMouse::TME_LEAVE.0
+                | windows::Win32::UI::Input::KeyboardAndMouse::TME_NONCLIENT.0,
+        ),
+        hwndTrack: hwnd,
+        dwHoverTime: 0,
+    };
+    let _ = unsafe { TrackMouseEvent(&mut tme) };
 }
 
 fn client_xy(hwnd: HWND, lparam: LPARAM) -> (i32, i32) {

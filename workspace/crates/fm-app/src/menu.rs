@@ -42,6 +42,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_ERASEBKGND,
     WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
     WM_RBUTTONUP, WNDCLASSEXW, WS_BORDER, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    // 菜单窗口自己要定光标：类光标是 NULL，交给 DefWindowProc 的结果就是"菜单
+    // 里沿用打开菜单那一刻的形状"（比如从分隔线上右键 → 菜单里一直是 ↔）。
+    IDC_ARROW, LoadCursorW, SetCursor, WM_SETCURSOR,
 };
 
 use crate::theme::Theme;
@@ -55,6 +58,12 @@ const WM_MENU_RETURN: u32 = 0x0401;
 const WM_MENU_SUBCLOSED: u32 = 0x0402;
 /// 子菜单里的条目被真正执行，整条菜单链都要关掉（不能只关最里层）
 const WM_MENU_CLOSE_CHAIN: u32 = 0x0403;
+/// 子菜单收到"落点在自己外面"的点击：不自己关链，把点击原样上报父菜单
+/// （lparam 打包屏幕坐标，同 WM_MOUSEMOVE 的打包方式），由父菜单裁决——
+/// 点在父菜单身上→处理（切换/收起子菜单、执行条目）；都不是→关整条链。
+/// 第53轮之前这里直接 activated=true 自爆，把整条链带走了 —— 表现为
+/// "点『排序方式』菜单整个消失"，子菜单永远点不开。
+const WM_MENU_FORWARD_CLICK: u32 = 0x0404;
 
 /// 宿主侧自有的命令（自绘菜单的顶部图标行与常规项）。
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -95,6 +104,8 @@ pub enum Command {
     HeaderSort(u8, bool),
     /// 「选择列…」：弹出子菜单，勾掉/勾上某一列（载荷 = 列 id）
     ToggleColumn(String),
+    /// 「其他(M)...」：打开「选择详细信息」对话框（勾选 + 上移/下移，第53轮）
+    ChooseColumns,
     /// 「将列调整为合适的大小」：按当前内容自动定宽（当前目录生效）
     AutofitColumns,
     /// 「所有列均调整为合适的大小」
@@ -809,6 +820,14 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
     match msg {
         WM_MOUSEACTIVATE => return LRESULT(3), // MA_NOACTIVATE：不抢宿主焦点
         WM_ERASEBKGND => return LRESULT(1),
+        // 菜单窗口的类光标是 NULL，走 DefWindowProc 的结果就是"光标维持打开菜单
+        // 那一刻的形状"（从分隔线上右键，整个菜单里都是 ↔）。一律自己给箭头。
+        WM_SETCURSOR => {
+            if let Ok(c) = LoadCursorW(None, IDC_ARROW) {
+                SetCursor(Some(c));
+            }
+            return LRESULT(1);
+        }
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut ps);
@@ -896,39 +915,35 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                 None
             };
             if idx != state.hover {
-                match idx {
-                    // 悬停到带子菜单的项 → 直接展开（用户要的就是"悬停能展开"）
-                    Some(i)
-                        if state.entries[i].has_submenu && !state.entries[i].submenu.is_empty() =>
-                    {
-                        open_submenu_at(state, hwnd, i);
-                    }
-                    _ => {
-                        if let Some(sub) = state.submenu.take() {
-                            let _ = DestroyWindow(sub);
-                            // 子菜单销毁时自己调了 ReleaseCapture —— 那一次释放掉的
-                            // 正是**本窗口**的 capture。不立刻抢回来的话，本窗口从此
-                            // 收不到任何鼠标消息：悬停不再响应、点击外面也关不掉菜单。
-                            let _ = SetCapture(hwnd);
-                        }
-                        state.open_submenu_for = None;
-                    }
-                }
                 state.hover = idx;
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
+            // 第53轮：子菜单改「单击固定展开」—— 父菜单上的悬停**不再**自动
+            // 开/关子菜单（原两段：悬停到子菜单项就展开、移开就销毁，全删）。
+            // 鼠标从父菜单直接移进已展开的子菜单时，把 capture 交回去让它接管。
+            if idx.is_none() {
+                if let Some(sub) = state.submenu {
+                    if IsWindow(Some(sub)).as_bool() {
+                        let mut sr = RECT::default();
+                        let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(sub, &mut sr);
+                        let mut sp = POINT { x, y };
+                        let _ = ClientToScreen(hwnd, &mut sp);
+                        if sp.x >= sr.left && sp.x <= sr.right && sp.y >= sr.top && sp.y <= sr.bottom {
+                            let _ = SetCapture(sub);
+                        }
+                    }
+                }
+            }
             LRESULT(0)
         }
-        // 子菜单把鼠标交还回来：清掉子菜单句柄，按真实光标位置重算高亮
+        // 子菜单把鼠标交还回来：按真实光标位置重算高亮。
+        // 第53轮：子菜单「单击固定展开」—— 光标回到父菜单**不再**关掉子菜单，
+        // 只把 capture 接回来刷新父菜单高亮；子菜单继续挂在屏幕上。
         WM_MENU_RETURN => {
             let sx = (lparam.0 & 0xFFFF) as i16 as i32;
             let sy = (lparam.0 >> 16) as i16 as i32;
             let mut pt = POINT { x: sx, y: sy };
             let _ = ScreenToClient(hwnd, &mut pt);
-            if let Some(sub) = state.submenu.take() {
-                let _ = DestroyWindow(sub);
-            }
-            state.open_submenu_for = None;
             // 同理：销毁子菜单会连本窗口的 capture 一起释放掉，必须抢回来
             let _ = SetCapture(hwnd);
             let idx = if inside_popup(state, pt.x, pt.y) {
@@ -959,6 +974,35 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
+        // 子菜单上报的点击（落点在子菜单外面）。裁决权在本层：
+        //   落在自己身上 → 当成一次点击处理（切换/收起子菜单、执行条目）
+        //   自己还有父菜单 → 继续往上传
+        //   都不是（点在桌面/别的窗口上）→ 整条链关闭
+        WM_MENU_FORWARD_CLICK => {
+            let sx = (lparam.0 & 0xFFFF) as i16 as i32;
+            let sy = (lparam.0 >> 16) as i16 as i32;
+            let mut pt = POINT { x: sx, y: sy };
+            let _ = ScreenToClient(hwnd, &mut pt);
+            if inside_popup(state, pt.x, pt.y) {
+                // capture 收回来：之后光标在本菜单上移动要由本窗口接管
+                let _ = SetCapture(hwnd);
+                if let Some(idx) = entry_at(state, pt.y) {
+                    let entry = state.entries[idx].clone();
+                    activate_at(state, hwnd, idx, &entry);
+                }
+            } else if let Some(p) = state.parent_menu {
+                if IsWindow(Some(p)).as_bool() {
+                    let _ = PostMessageW(Some(p), WM_MENU_FORWARD_CLICK, WPARAM(0), lparam);
+                    return LRESULT(0);
+                }
+                state.activated = true;
+                let _ = DestroyWindow(hwnd);
+            } else {
+                state.activated = true;
+                let _ = DestroyWindow(hwnd);
+            }
+            LRESULT(0)
+        }
         WM_LBUTTONUP => {
             let y = (lparam.0 >> 16) as i16 as i32;
             let x = (lparam.0 & 0xFFFF) as i16 as i32;
@@ -975,13 +1019,27 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                 return LRESULT(0);
             }
             // 关键：因为有 SetCapture，屏幕任意位置的点击都会投递到这里。
-            // 落在弹出菜单之外时只能关闭菜单，绝不能触发任何条目 ——
-            // 之前缺这个判断，导致每条选项的点击热区在水平方向上等同于整块屏幕。
+            // 落在弹出菜单之外时：
+            //   * 顶层菜单 → 点空白处 = 关掉**整条**菜单链。只销毁自己会让父菜单
+            //     变成一个还挂在屏幕上、却再也收不到鼠标消息的空壳（表现就是
+            //     "菜单关不掉"）。
+            //   * 子菜单（第53轮）→ **不关链**，把点击原样上报给父菜单裁决
+            //     （WM_MENU_FORWARD_CLICK）。之前这里直接 activated=true 自爆，
+            //     父菜单跟着销毁 —— 用户点「排序方式」，整条菜单凭空消失，
+            //     子菜单就永远"打不开"。
             if !inside_popup(state, x, y) {
-                // 点空白处 = 关掉**整条**菜单链。只销毁自己会让父菜单变成
-                // 一个还挂在屏幕上、却再也收不到鼠标消息的空壳（表现就是"菜单关不掉"）。
-                state.activated = true;
-                let _ = DestroyWindow(hwnd);
+                let mut sp = POINT { x, y };
+                let _ = ClientToScreen(hwnd, &mut sp);
+                let packed = LPARAM(((sp.y as isize) << 16) | (sp.x as isize & 0xFFFF));
+                match state.parent_menu {
+                    Some(p) if IsWindow(Some(p)).as_bool() => {
+                        let _ = PostMessageW(Some(p), WM_MENU_FORWARD_CLICK, WPARAM(0), packed);
+                    }
+                    _ => {
+                        state.activated = true;
+                        let _ = DestroyWindow(hwnd);
+                    }
+                }
                 return LRESULT(0);
             }
             if let Some(idx) = entry_at(state, y) {
@@ -1074,6 +1132,16 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
 /// 由父菜单的 WM_MENU_RETURN / 子菜单越左边界交还 capture 来协调。
 fn open_submenu_at(state: &mut MenuWindow, hwnd: HWND, index: usize) {
     if state.open_submenu_for == Some(index) {
+        // 已展开再点一次 = 收起（第53轮"单击固定展开"的开关语义）
+        if let Some(sub) = state.submenu.take() {
+            unsafe {
+                let _ = DestroyWindow(sub);
+                // 子菜单销毁会连本窗口的 capture 一起释放，同步抢回来
+                // （WM_MENU_SUBCLOSED 里还会补一次，这里先抢避免空窗期丢消息）
+                let _ = SetCapture(hwnd);
+            }
+        }
+        state.open_submenu_for = None;
         return;
     }
     if let Some(sub) = state.submenu.take() {
@@ -1123,7 +1191,7 @@ fn activate_at(state: &mut MenuWindow, hwnd: HWND, index: usize, entry: &MenuEnt
         return;
     }
     if entry.has_submenu && !entry.submenu.is_empty() {
-        // 点击带子菜单的项：沿用与悬停展开完全相同的定位逻辑。
+        // 点击带子菜单的项：展开/收起（开关语义在 open_submenu_at 里）。
         // （原来这里用 `std::ptr::eq` 在 entries 里找自己，而 entry 是 clone 出来的，
         //   地址永远不相等 → 定位恒失败，子菜单总是弹在菜单顶部第一行。）
         open_submenu_at(state, hwnd, index);

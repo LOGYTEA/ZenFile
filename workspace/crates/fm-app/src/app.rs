@@ -3586,6 +3586,10 @@ impl App {
         if self.menu_hwnd == Some(hwnd) {
             self.menu_hwnd = None;
             self.bridge = None;
+            // 菜单关了：光标还压在主窗口上却没人来设它（菜单期间主窗口不接
+            // WM_SETCURSOR），鼠标不动的话就一直挂着菜单里的那一支。这里补一次。
+            let owner = self.hwnd;
+            unsafe { crate::apply_cursor(owner, self) };
         }
     }
 
@@ -3602,7 +3606,44 @@ impl App {
                 }
             }
             self.bridge = None;
+            let owner = self.hwnd;
+            unsafe { crate::apply_cursor(owner, self) };
         }
+    }
+
+    /// 鼠标整体离开窗口：把所有 hover_* 一次清干净。
+    ///
+    /// 以前只有标题栏三大金刚键的 hover 在 WM_MOUSELEAVE 那条路上清，于是
+    /// "鼠标都移出窗口了，内容区那一行还亮着、分隔线还保持高亮、侧栏的行也还
+    /// 反着白" —— 回到窗口之前画面一直是旧的。
+    ///
+    /// **只清悬停态**：拖拽是按下之后才开始的，鼠标划出窗口不该把它打断
+    /// （拖到窗口外面松手仍要能落地）。光标不归这里管，见 `apply_cursor`。
+    pub fn clear_hover(&mut self) {
+        self.hover_caption = 0;
+        self.pressed_caption = 0;
+        self.hovering_close = false;
+        self.hover_chrome = 0;
+        self.hover_tab = None;
+        self.hover_view_btn = 0;
+        self.settings_hover = None;
+        self.settings_hover_tab = None;
+        self.settings_hover_card = None;
+        self.settings_hover_menu = None;
+        self.settings_hover_tree = None;
+        self.sidebar_hover = None;
+        self.hover_sidebar_collapse = false;
+        self.addr_hover = None;
+        self.hover_split = None;
+        self.hover_pane_div = None;
+        self.hover_bulk = false;
+        self.hover_row = None;
+        self.hover_pane = None;
+        self.hover_nav = 0;
+        self.hover_header = None;
+        self.hover_recycle = None;
+        self.hover_recycle_btn = 0;
+        self.tab_hover_since = None;
     }
 
     pub fn on_menu_activation(&mut self, action: MenuAction) {
@@ -3727,6 +3768,10 @@ impl App {
                     self.set_col_visible(&id, on);
                 }
             }
+            // 「其他(M)...」：资源管理器那套「选择详细信息」对话框（第53轮）。
+            // 在这里开而不在 main.rs 开，是因为对话框要能改 **本目录** 的列集合，
+            // 而那套读写（bag + 每目录配置）都收在 App 里。
+            Command::ChooseColumns => crate::coldlg::open(self),
             Command::AutofitColumns | Command::AutofitAllColumns => self.autofit_cols(),
             Command::ColFilterKind(k) => {
                 self.set_col_filter(if k.is_empty() { None } else { Some(ColFilter::Kind(k)) })
