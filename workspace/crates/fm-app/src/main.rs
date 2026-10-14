@@ -92,7 +92,7 @@ pub const APP_TITLE: &str = "ZenFile";
 /// semver，写了 cargo 直接报错），所以"人看的那一版号"单独放这里：
 /// `ZenFile.exe --version`、窗口标题、「关于」对话框三处共用。
 /// 发新版时改这一行（0.3 → 下一段号）并把日期换成当天即可。
-pub const APP_VERSION: &str = "Demo 0.3 Daily 2026-10-11";
+pub const APP_VERSION: &str = "0.3 Beta Weekly26-10-14";
 /// 目录栏下沿进度条的动画节拍。一直挂着，但只有 busy() 时才真的重画。
 const TIMER_BUSY: usize = 2;
 /// 界面过渡动画的节拍（16ms ≈ 60Hz，第57轮）。
