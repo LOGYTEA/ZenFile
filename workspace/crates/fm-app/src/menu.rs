@@ -918,8 +918,27 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                 state.hover = idx;
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
-            // 第53轮：子菜单改「单击固定展开」—— 父菜单上的悬停**不再**自动
-            // 开/关子菜单（原两段：悬停到子菜单项就展开、移开就销毁，全删）。
+            // 第54轮：悬停到带子菜单的项 → 照资源管理器**自动展开**（用户：
+            // "右键那些悬停展示怎么没了"）。第53轮把悬停展开整段删掉后，
+            // 鼠标划过「打开方式/排序方式/查看」只剩一根高亮条，看不到里面有什么。
+            //
+            // **必须先判 `open_submenu_for != Some(i)`**：第53轮给 open_submenu_at
+            // 加了"再点一次 = 收起"的开关语义，悬停时重复调用会把刚展开的子菜单
+            // 立刻又收回去（现象就是怎么悬停都弹不出来）。
+            //
+            // 这里只管"展开"，**不负责因为鼠标移开而收起** —— 收起仍走第53轮的
+            // "单击固定"语义（再点一次该条目 / 点空白），所以移开时子菜单保持钉住。
+            if let Some(i) = idx {
+                let has_sub = {
+                    let e = &state.entries[i];
+                    e.has_submenu && !e.submenu.is_empty()
+                };
+                if has_sub && state.open_submenu_for != Some(i) {
+                    open_submenu_at(state, hwnd, i);
+                }
+            }
+            // 第53轮「单击固定展开」：光标本窗口不当把移开当成"要收起"——
+            // 收起只由"再点一次该条目 / 点空白"触发，子菜单一直钉着。
             // 鼠标从父菜单直接移进已展开的子菜单时，把 capture 交回去让它接管。
             if idx.is_none() {
                 if let Some(sub) = state.submenu {
@@ -930,6 +949,24 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                         let _ = ClientToScreen(hwnd, &mut sp);
                         if sp.x >= sr.left && sp.x <= sr.right && sp.y >= sr.top && sp.y <= sr.bottom {
                             let _ = SetCapture(sub);
+                            // **把这一次移动补给它**（第54轮）：交还捕获的那条
+                            // WM_MOUSEMOVE 是被**本窗口**消费掉的（这时候捕获还在自己
+                            // 手里），子菜单永远看不到它；而放鼠标后到下一次移动之间
+                            // 没有任何消息，于是"鼠标明明已经进到子菜单里了，里面却
+                            // 一行都没亮"。补一条同坐标的 WM_MOUSEMOVE 让它立刻重算。
+                            // 真实操作时鼠标是连续移动的，下一帧自然就会亮 —— 但鼠标
+                            // 快速甩过去时（尤其配 hover 自动展开）这一帧的落后很明显。
+                            // 注意 WM_MOUSEMOVE 的 lparam 是**客户区坐标**
+                            // （自定义消息 WM_MENU_RETURN 才用屏幕坐标）——
+                            // 直接塞屏幕坐标会让子菜单在错误的位置判命中。
+                            let mut cp = sp;
+                            let _ = ScreenToClient(sub, &mut cp);
+                            let _ = PostMessageW(
+                                Some(sub),
+                                WM_MOUSEMOVE,
+                                WPARAM(0),
+                                LPARAM(((cp.y as isize) << 16) | (cp.x as isize & 0xFFFF)),
+                            );
                         }
                     }
                 }
@@ -958,6 +995,15 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             LRESULT(0)
         }
         WM_MENU_SUBCLOSED => {
+            // wparam = 被销毁的那个子菜单句柄（第54轮带上的身份）。
+            // **只认"当前这一个"**：过期通知（悬停/点击切到另一个子菜单时，
+            // 旧子菜单销毁的那条晚一步到）必须忽略 —— 否则会把刚开好的新子菜单
+            // 的状态清掉，并把捕获从它手里抢回来，让新子菜单从此收不到鼠标
+            // （点它里面的条目没反应，看着像"菜单悬停展示没了"）。
+            let who = HWND(wparam.0 as *mut core::ffi::c_void);
+            if state.submenu != Some(who) {
+                return LRESULT(0);
+            }
             state.submenu = None;
             state.open_submenu_for = None;
             // 子菜单销毁时释放了 capture，父菜单必须自己抢回来，
@@ -1108,10 +1154,15 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             // 否则父菜单会一直持有并试图销毁一个已经不存在的窗口。
             if let Some(p) = parent_menu {
                 if IsWindow(Some(p)).as_bool() {
+                    // wparam = **自己的句柄**（第54轮）：让父菜单能分辨这条通知是谁发的。
+                    // open_submenu_at 里"销毁旧的 → 立刻开新的"是同步发生的，旧的
+                    // 那条 SUBCLOSED 会晚一步到达；不带上身份的话父菜单只能无条件
+                    // 清状态，结果是把**刚开好的新子菜单**的状态清掉并抢走它的捕获
+                    // （捕获被抢 = 新子菜单收不到鼠标，点里面的条目毫无反应）。
                     let _ = PostMessageW(
                         Some(p),
                         if activated { WM_MENU_CLOSE_CHAIN } else { WM_MENU_SUBCLOSED },
-                        WPARAM(0),
+                        WPARAM(hwnd.0 as usize),
                         LPARAM(0),
                     );
                 }
