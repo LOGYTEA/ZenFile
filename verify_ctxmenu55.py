@@ -198,8 +198,14 @@ if len(tabs) >= 4:
 print("== S1 类型 chip（文件/文件夹/目录背景/多选/驱动器）==")
 chip_y0 = tab_y1 + round(12 * s)
 chip_y1 = chip_y0 + round(28 * s)
+# 第56轮起整页左右分栏：类型 chip 是**左栏的标题栏**，只占左 60%
+# （右边 40% 是格式样本预览，同一高度上是它的标题行，扫进去会多数一段）。
+content_l = G["side"] + round(16 * s)
+content_r_full = W - round(16 * s)
+left_w = (content_r_full - content_l) * 60 // 100
+content_r = content_l + left_w - round(12 * s) // 2
 raw, stride, W, H = V.grab(hw)
-chips = col_runs(raw, stride, G["side"] + 4, W - 4, chip_y0, chip_y1)
+chips = col_runs(raw, stride, content_l, content_r, chip_y0, chip_y1)
 print("    chip:", len(chips), chips[:8])
 V.mark(len(chips) == 5, f"顶部 5 个类型 chip（实测 {len(chips)}）")
 
@@ -227,8 +233,9 @@ if len(chips) == 5:
     V.mark(n1 >= a0 * 0.45 and n0b <= a0 * 0.15, "S2 选中态转移到「文件夹」")
 
     print("== S3 切类型 -> 左侧渲染的菜单跟着换 ==")
-    panel_l = G["side"] + round(16 * s)
-    mw_px = min(round(300 * s), ((W - round(16 * s)) - panel_l) * 42 // 100)
+    # 菜单面板同样只在左栏里排（第56轮）
+    panel_l = content_l
+    mw_px = min(round(300 * s), (content_r - content_l) * 42 // 100)
     panel_r = panel_l + mw_px
     panel_t = chip_y1 + round(10 * s)
     panel_b = G["view_bottom"] - round(10 * s)
@@ -259,7 +266,8 @@ if len(chips) == 5:
     ow_bottom = panel_t + (panel_b - panel_t) * 62 // 100
     fh = round(30 * s)
     fy0, fy1 = ow_bottom - fh, ow_bottom
-    fx0, fx1 = panel_r + round(14 * s), W - round(16 * s)
+    # 右上面板同样只在左栏里（第56轮）：右边界是左栏的 content_r，不是窗口右边
+    fx0, fx1 = panel_r + round(14 * s), content_r
 
     def ink():
         raw, stride, W2, H2 = V.grab(hw)

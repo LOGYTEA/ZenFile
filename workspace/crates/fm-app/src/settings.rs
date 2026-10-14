@@ -18,7 +18,8 @@ use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::HDC;
 use windows::Win32::Graphics::Gdi::{
     CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, GetStockObject, LineTo,
-    GetViewportOrgEx, MoveToEx, Polygon, Rectangle, RoundRect, SelectObject, SetBkMode,
+    GetViewportOrgEx, MoveToEx, IntersectClipRect, Polygon, Rectangle, RestoreDC,
+    RoundRect, SaveDC, SelectObject, SetBkMode,
     SetTextColor, SetViewportOrgEx, DT_CENTER,
     DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HBRUSH, HPEN, NULL_BRUSH,
     PS_SOLID, TRANSPARENT,
@@ -606,6 +607,19 @@ pub struct Geom {
     pub ow_rows: Vec<RECT>,
     /// 「右键菜单」：右下系统集成开关
     pub sys_panel: RECT,
+    /// 「右键菜单」右 40%：格式样本**实时预览**面板
+    pub prev_panel: RECT,
+    /// 预览面板去掉标题那一条之后的"列表区"（裁剪与命中都按它）
+    pub prev_view: RECT,
+    /// 每一格的矩形。**虚拟坐标**（y 从 0 起），绘制/命中时减 `settings_prev_scroll`；
+    /// 下标与 `fmtprev::samples()` 一一对应。
+    pub prev_cells: Vec<RECT>,
+    /// 每个字母徽标（矩形 + 字符），同样是虚拟坐标
+    pub prev_letters: Vec<(RECT, char)>,
+    /// 网格内容总高（虚拟），算滚动上界用
+    pub prev_content_h: i32,
+    /// 「右键菜单」左上那条**标题栏**（装类型 chip 的那一条）
+    pub ctx_bar: RECT,
 }
 
 /// 命中结果。
@@ -630,6 +644,10 @@ pub enum Hit {
     CtxKind(u8),
     /// 「右键菜单」右上面板底部那颗「查找可用的打开软件」按钮
     OwFind,
+    /// 「右键菜单」右侧预览区里第 n 个格式样本（下标即 `fmtprev::samples()`）
+    Preview(usize),
+    /// 「右键菜单」右侧预览区的**空白处** —— 在这里右键 = 目录右键
+    PreviewArea,
     /// 预览画布里第 n 个已放置组件（可拖动改位置 / 拖出预览删除）
     Canvas(usize),
 }
@@ -717,6 +735,12 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
         ow_find: RECT::default(),
         ow_rows: Vec::new(),
         sys_panel: RECT::default(),
+        prev_panel: RECT::default(),
+        prev_view: RECT::default(),
+        prev_cells: Vec::new(),
+        prev_letters: Vec::new(),
+        prev_content_h: 0,
+        ctx_bar: RECT::default(),
         ui_top: RECT::default(),
         ui_right: RECT::default(),
         ui_preview: RECT::default(),
@@ -727,6 +751,27 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
 
     match app.settings_tab {
         crate::app::SETTINGS_TAB_MENU => {
+            // 第56轮：整页**左右分栏** ——
+            //   左 60%：各种类型（**左上那条标题栏上的 chip 切换**）+ 该类型
+            //           真实渲染的菜单 + 能找到的打开软件 + 系统开关；
+            //   右 40%：各格式样本的**实时预览**（大图标网格、分字母、可滚动），
+            //           右键某一格 = 该格式的右键菜单，空白处 = 目录右键。
+            let total_w = content.right - content.left;
+            let gap = px(12.0);
+            let left_w = total_w * 60 / 100;
+            g.prev_panel = RECT {
+                left: content.left + left_w + gap / 2,
+                top: content.top,
+                right: content.right,
+                bottom: content.bottom,
+            };
+            // 下面那一整套（chip / 菜单 / 打开方式 / 系统开关）都只在左栏里排
+            let content = RECT {
+                left: content.left,
+                top: content.top,
+                right: content.left + left_w - gap / 2,
+                bottom: content.bottom,
+            };
             // 第55轮（照 ContextMenuManager）：最上面一排是"右键落在什么上"的
             // 类型 chip，切换它 → 下面三块（菜单预览 / 打开方式 / 系统集成）
             // 全部跟着换。左边是**按该类型的当前排布真实渲染**的菜单，右边上半
@@ -807,6 +852,58 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
                 oy += orh + px(4.0);
             }
             g.rows = system_rows(app, &g.sys_panel);
+
+            // —— 右 40%：格式样本网格 ——
+            //
+            // 排布规则（用户原话）：**一个字母占一段**，排不下就往下一排续，
+            // 这一组完了立刻换行给下一个字母 —— 绝不会两个字母挤在同一排。
+            {
+                let pv = g.prev_panel;
+                let head = px(26.0);
+                g.prev_view = RECT {
+                    left: pv.left + px(2.0),
+                    top: pv.top + head,
+                    right: pv.right - px(2.0),
+                    bottom: pv.bottom - px(2.0),
+                };
+                let pad = px(8.0);
+                let cell_w = px(86.0);
+                let cell_h = px(74.0);
+                let letter_w = px(24.0);
+                let x0 = g.prev_view.left + pad;
+                let x1 = g.prev_view.right - pad;
+                let mut x = x0;
+                let mut y = 0i32;
+                let mut first = true;
+                for (c, idxs) in crate::fmtprev::groups() {
+                    if !first {
+                        // 一组排完 → 直接换行，下一个字母从头起
+                        x = x0;
+                        y += cell_h;
+                    }
+                    first = false;
+                    if x + letter_w > x1 {
+                        x = x0;
+                        y += cell_h;
+                    }
+                    g.prev_letters
+                        .push((RECT { left: x, top: y, right: x + letter_w, bottom: y + cell_h }, c));
+                    x += letter_w;
+                    for i in idxs {
+                        if x + cell_w > x1 {
+                            x = x0;
+                            y += cell_h;
+                        }
+                        g.prev_cells
+                            .push(RECT { left: x, top: y, right: x + cell_w, bottom: y + cell_h });
+                        x += cell_w;
+                    }
+                }
+                // 末尾留一段**空白**：它是"目录右键"的地盘（用户原话"再空白区域
+                // 就是目录右键"）。没有这一段，滚到底也全是格子，目录右键就
+                // 没地方点了。行尾那些没排满的空隙同样算空白（命中里自然覆盖）。
+                g.prev_content_h = y + cell_h + px(76.0);
+            }
         }
         crate::app::SETTINGS_TAB_UI => {
             // round 25 全新布局（按用户原话"最后再明确一遍"）：
@@ -1079,6 +1176,19 @@ pub fn hit(app: &App, l: &Layout, x: i32, y: i32) -> Option<Hit> {
         if inside(r, x, y) {
             return Some(Hit::MenuRow(i));
         }
+    }
+    // 右侧预览区：**先判格、再判空白** —— 空白处右键 = 目录右键。
+    if inside(&g.prev_view, x, y) {
+        let vy = y - g.prev_view.top + app.settings_prev_scroll;
+        for (i, r) in g.prev_cells.iter().enumerate() {
+            if x >= r.left && x < r.right && vy >= r.top && vy < r.bottom {
+                return Some(Hit::Preview(i));
+            }
+        }
+        return Some(Hit::PreviewArea);
+    }
+    if inside(&g.prev_panel, x, y) {
+        return Some(Hit::PreviewArea);
     }
     for (i, r) in g.ow_rows.iter().enumerate() {
         if inside(r, x, y) {
@@ -3483,7 +3593,8 @@ fn system_rows(app: &App, r: &RECT) -> Vec<paint::SettingRow> {
 }
 
 fn paint_menu_tab(app: &App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
-    // —— 顶：类型 chip（右键落在什么上）——
+    // —— 左上标题栏：类型 chip（右键落在什么上）——
+    fill_rect(hdc, &g.ctx_bar, th.surface);
     for (i, r) in g.kind_chips.iter().enumerate() {
         let on = app.settings_ctx_kind as usize == i;
         fill_rect(hdc, r, if on { th.accent } else { th.surface_alt });
@@ -3629,6 +3740,133 @@ fn paint_menu_tab(app: &App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
     // —— 右下：系统集成 ——
     for r in &g.rows {
         paint_row(app, hdc, r, th, s);
+    }
+
+    // —— 右 40%：格式样本实时预览 ——
+    paint_prev_panel(app, hdc, g, th, s);
+}
+
+/// 右 40% 那块**格式样本预览**：大图标网格 + 分字母 + 滚动。
+///
+/// 两类目标都在这一块里右键：
+///   · 某一格 → 该格式的右键菜单（`Command` 全都不会真的执行）；
+///   · 空白处 → 目录右键（背景菜单）。
+/// 于是"每一类右键菜单长什么样"不用再靠想象，直接在这儿试。
+fn paint_prev_panel(app: &App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
+    let pv = g.prev_panel;
+    if pv.right <= pv.left || pv.bottom <= pv.top {
+        return;
+    }
+    let px = |v: f32| (v * s).round() as i32;
+    fill_rect(hdc, &pv, th.surface);
+    let hdr = RECT {
+        left: pv.left + px(10.0),
+        top: pv.top,
+        right: pv.right - px(10.0),
+        bottom: pv.top + px(26.0),
+    };
+    // 刚在预览菜单里点过一条 → 标题这行闪一句"不会真的执行"（约 2.6 秒）。
+    // 预览区就是让人反复点着看的地方，弹模态框既挡事又烦，所以走这条轻提示。
+    let note = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() }
+        .wrapping_sub(app.preview_note_at)
+        < 2600
+        && app.preview_note_at != 0;
+    if note {
+        set_color(hdc, th.accent);
+        paint::draw_text(
+            hdc,
+            "预览菜单：只展示长相，不会真的执行",
+            hdr,
+            DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS,
+        );
+    } else {
+        set_color(hdc, th.text_dim);
+        paint::draw_text(
+            hdc,
+            "预览 · 右键任意格式看它的菜单，空白处 = 目录右键",
+            hdr,
+            DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS,
+        );
+    }
+
+    let sc = app.settings_prev_scroll;
+    let isz = px(48.0);
+    let samples = crate::fmtprev::samples();
+    unsafe {
+        // 记忆 DC 是全窗口共享的：裁剪必须 SaveDC/RestoreDC 包住
+        let _sv = SaveDC(hdc);
+        let _ = IntersectClipRect(
+            hdc,
+            g.prev_view.left,
+            g.prev_view.top,
+            g.prev_view.right,
+            g.prev_view.bottom,
+        );
+        // —— 字母徽标 ——
+        for (r, c) in &g.prev_letters {
+            let t = g.prev_view.top + r.top - sc;
+            let r2 = RECT { left: r.left, top: t, right: r.right, bottom: t + (r.bottom - r.top) };
+            if r2.bottom <= g.prev_view.top || r2.top >= g.prev_view.bottom {
+                continue;
+            }
+            set_color(hdc, th.accent);
+            paint::draw_text(
+                hdc,
+                &c.to_string(),
+                r2,
+                DT_SINGLELINE | DT_NOPREFIX | DT_CENTER | DT_VCENTER,
+            );
+        }
+        // —— 每一格：大图标 + 格式名 ——
+        for (i, r) in g.prev_cells.iter().enumerate() {
+            let t = g.prev_view.top + r.top - sc;
+            let r2 = RECT { left: r.left, top: t, right: r.right, bottom: t + (r.bottom - r.top) };
+            if r2.bottom <= g.prev_view.top || r2.top >= g.prev_view.bottom {
+                continue;
+            }
+            let Some(smp) = samples.get(i) else { continue };
+            let hov = app.settings_prev_hover == Some(i);
+            if hov {
+                // 用 `hover_bg`（菜单悬停那一档），**不用 `row_hover`**：
+                // 这一块的底是 surface(43)，row_hover 只有 46 —— 差 3 级，
+                // 看上去等于没亮。hover_bg(61) 才看得出来"我指在这一格上"。
+                fill_rect(hdc, &r2, th.hover_bg);
+            }
+            let ix = (r2.left + r2.right - isz) / 2;
+            let iy = r2.top + px(5.0);
+            let h = crate::fmtprev::icon(&smp.ext);
+            if h != 0 {
+                app.icons.draw(hdc, crate::fmtprev::hicon(h), ix, iy, isz);
+            }
+            let tr = RECT {
+                left: r2.left + px(2.0),
+                top: iy + isz + px(2.0),
+                right: r2.right - px(2.0),
+                bottom: r2.bottom - px(2.0),
+            };
+            set_color(hdc, if hov { th.text } else { th.text_dim });
+            paint::draw_text(
+                hdc,
+                &smp.name,
+                tr,
+                DT_SINGLELINE | DT_NOPREFIX | DT_CENTER | DT_END_ELLIPSIS,
+            );
+        }
+        let _ = RestoreDC(hdc, -1);
+    }
+
+    // 外框：只描边不填充（`Rectangle` 会用当前画刷填内部）
+    let (pen, op, ob) = unsafe {
+        let pen = CreatePen(PS_SOLID, 1, th.border);
+        let op = SelectObject(hdc, pen.into());
+        let ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        let _ = Rectangle(hdc, pv.left, pv.top, pv.right, pv.bottom);
+        (pen, op, ob)
+    };
+    unsafe {
+        SelectObject(hdc, ob);
+        SelectObject(hdc, op);
+        let _ = DeleteObject(pen.into());
     }
 }
 

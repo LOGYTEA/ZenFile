@@ -12,6 +12,7 @@
 mod app;
 mod appfind;
 mod coldlg;
+mod fmtprev;
 mod icon_theme;
 mod icons;
 mod menu;
@@ -1276,6 +1277,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     (app.settings_hover, app.settings_hover_tab, app.settings_hover_card)
                 } else {
                     app.settings_hover_find = false;
+                    app.settings_prev_hover = None;
                     let mut ht = None;
                     let mut hc = None;
                     let mut hr = None;
@@ -1301,8 +1303,17 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                             app.settings_hover_find = true;
                         }
                         Some(settings::Hit::CtxKind(_)) => {}
+                        Some(settings::Hit::Preview(i)) => {
+                            app.settings_prev_hover = Some(i);
+                        }
+                        Some(settings::Hit::PreviewArea) => {
+                            // 空白处：清掉"停在哪一格上"，但保持"在这一块里"
+                            app.settings_prev_hover = None;
+                            app.settings_hover_menu = None;
+                        }
                         Some(settings::Hit::Canvas(_)) => {}
                         None => {
+                            app.settings_prev_hover = None;
                             app.settings_hover_menu = None;
                         }
                         Some(settings::Hit::RadiusSlider(_)) => {}
@@ -2228,8 +2239,49 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let view_top = pl.view.top + header_h;
 
             if app.tab().settings {
-                // 设置页没有文件可选，右键不弹菜单
-                app.context_targets = Some(Vec::new());
+                // 设置页：只有右侧那块**格式样本预览**能右键 ——
+                //   · 某一格   → 这个格式的右键菜单（实时预览，命令不会真的执行）；
+                //   · 空白处   → 目录右键（背景菜单那一套）。
+                // 于是"每一类菜单长什么样"在这儿当场就能试，不用去猜。
+                let in_prev = {
+                    let g = settings::geom(app, &l);
+                    inside(&g.prev_panel, x, y)
+                };
+                if in_prev {
+                    let (targets, kind) = match settings::hit(app, &l, x, y) {
+                        Some(settings::Hit::Preview(i)) => {
+                            let p = crate::fmtprev::samples()
+                                .get(i)
+                                .map(|s| s.path.clone())
+                                .unwrap_or_default();
+                            (vec![p], crate::app::MenuKind::File)
+                        }
+                        // 空白处 = 目录右键（items 为空 → 背景菜单）
+                        _ => (Vec::new(), crate::app::MenuKind::Background),
+                    };
+                    app.context_targets = Some(targets.clone());
+                    // 预览菜单里的命令一律不执行（见 `App::on_menu_activation`）
+                    app.preview_menu = true;
+                    let entries = crate::app::own_menu_rows(app, &targets, kind);
+                    let mut pt = POINT { x, y };
+                    let _ = unsafe { ClientToScreen(hwnd, &mut pt) };
+                    if let Some(h) = menu::open_menu(
+                        app_ptr,
+                        hwnd,
+                        entries,
+                        pt.x,
+                        pt.y,
+                        app.metrics.scale,
+                        app.theme,
+                        None,
+                        false,
+                    ) {
+                        app.menu_hwnd = Some(h);
+                    }
+                } else {
+                    app.context_targets = Some(Vec::new());
+                }
+                let _ = InvalidateRect(Some(hwnd), None, true);
                 LRESULT(0)
             } else if app.tab().recycle {
                 if let Some(idx) = paint::recycle_hit(app, &pl, y) {
@@ -2316,6 +2368,20 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 y: (lparam.0 >> 16) as i16 as i32,
             };
             unsafe { let _ = ScreenToClient(hwnd, &mut pt); }
+            // 设置页右侧的格式样本预览区：格子铺不下就滚它
+            if app.tab().settings {
+                let (in_prev, max_s) = {
+                    let g = settings::geom(app, &l);
+                    let m = (g.prev_content_h - (g.prev_view.bottom - g.prev_view.top)).max(0);
+                    (inside(&g.prev_panel, pt.x, pt.y), m)
+                };
+                if in_prev {
+                    app.settings_prev_scroll =
+                        (app.settings_prev_scroll - delta / 2).clamp(0, max_s);
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                    return LRESULT(0);
+                }
+            }
             if app.cfg.ui.sidebar_visible && pt.x < l.sidebar.right {
                 app.scroll_sidebar(delta / 2, &l);
                 return LRESULT(0);

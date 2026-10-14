@@ -673,6 +673,18 @@ pub struct App {
     pub settings_hover_menu: Option<usize>,
     /// 「右键菜单」页右上那颗「查找可用的打开软件」按钮的悬停态。
     pub settings_hover_find: bool,
+    /// 「右键菜单」页右侧预览区：鼠标停在第几个格式样本上。
+    pub settings_prev_hover: Option<usize>,
+    /// 「右键菜单」页右侧预览区的滚动量（格子排不下就滚，见 `prev_content_h`）。
+    pub settings_prev_scroll: i32,
+    /// 预览菜单里刚点过一条的时刻（`GetTickCount64()`）—— 用来在预览面板
+    /// 标题那一行闪一句"不会真的执行"。0 = 没有待显示的提示。
+    pub preview_note_at: u64,
+    /// 此刻弹出来的菜单是**预览区里弹的**（设置页右侧那些格式样本）。
+    ///
+    /// 预览菜单只用来看长相：`run_command` 见到它就啥也不干，只提示一句 ——
+    /// 否则"右键一个 .docx 样本然后点了删除"，会真的去动当前标签里的东西。
+    pub preview_menu: bool,
     /// 「右键菜单」页右上已经做过一次全量"查找可用的打开软件"。
     pub settings_ow_found: bool,
     /// 排布编辑器里正在拖的卡片。
@@ -1138,6 +1150,10 @@ impl App {
             menu_preview_items: None,
             settings_hover_menu: None,
             settings_hover_find: false,
+            settings_prev_hover: None,
+            settings_prev_scroll: 0,
+            preview_note_at: 0,
+            preview_menu: false,
             settings_ow_found: false,
             fast_mode: false,
             xfer: None,
@@ -1958,7 +1974,7 @@ impl App {
 
     pub fn invalidate(&self) {
         unsafe {
-            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(self.hwnd), None, true);
+            let _ = unsafe { windows::Win32::Graphics::Gdi::InvalidateRect(Some(self.hwnd), None, true) };
         }
     }
 
@@ -3691,6 +3707,7 @@ impl App {
     /// **只清悬停态**：拖拽是按下之后才开始的，鼠标划出窗口不该把它打断
     /// （拖到窗口外面松手仍要能落地）。光标不归这里管，见 `apply_cursor`。
     pub fn clear_hover(&mut self) {
+        self.settings_prev_hover = None;
         self.hover_caption = 0;
         self.pressed_caption = 0;
         self.hovering_close = false;
@@ -3718,6 +3735,19 @@ impl App {
     }
 
     pub fn on_menu_activation(&mut self, action: MenuAction) {
+        // 预览菜单（设置页右侧那些格式样本上弹出来的）**不真的执行**：
+        // 它只是"这个类型的菜单长什么样"，点了也不该动任何东西。
+        //
+        // 反馈走预览面板标题那一行的临时提示，**不用 MessageBox**：预览区是
+        // 让人反复点着看的地方，弹一个模态框出来既挡事又烦。
+        if self.preview_menu {
+            self.preview_menu = false;
+            self.preview_note_at = unsafe {
+                windows::Win32::System::SystemInformation::GetTickCount64()
+            };
+            let _ = unsafe { windows::Win32::Graphics::Gdi::InvalidateRect(Some(self.hwnd), None, true) };
+            return;
+        }
         match action {
             MenuAction::Own(cmd) => self.run_command(cmd),
             MenuAction::Shell(offset) => {
