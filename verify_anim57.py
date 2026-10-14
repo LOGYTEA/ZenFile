@@ -4,7 +4,8 @@
 
   S1 交互页左侧树点得出「动画 › 侧栏平滑定位」，右侧参数行画出 Toggle（accent）
   S2 点 Toggle 一次 → settings.user.json 里 ui.anim.sidebar = false；再点回 true
-  A1 进入子目录：地址栏面包屑是**从右侧滑进来**的（中途帧整体偏右）
+  A1 进入子目录：地址栏**末级**面包屑从右侧滑进来（中途帧末节右沿偏右）
+  A1b 同一动画里**父级面包屑不位移**（各帧最左列恒定）—— 第59轮起只动末级
   A2 关掉 anim.address 后同一动作没有中间态（第一帧就到位）—— 消极对照
   A3 大图标视图：悬停的磁贴图标**变大**（稳定后包围盒比未悬停宽 6px 以上）
   A4 关掉 anim.icon_zoom 后不再变大 —— 消极对照
@@ -148,17 +149,26 @@ def ink_count(raw, stride, x0, x1, y0, y1, thr=0x50):
     return n
 
 
-def addr_ink_left(raw, stride, G):
-    """地址栏那一带最左边的"墨"列（面包屑第一节的左沿）。"""
-    s = G["s"]
-    x0 = round(106 * s)
-    x1 = G["W"] - round(222 * s)
-    y0 = G["title"] + round(8 * s)
-    y1 = G["title"] + G["tool"] - round(8 * s)
-    for x in range(x0, x1):
-        if any(min(V.px(raw, stride, x, y)) >= 0x70 for y in range(y0, y1)):
-            return x
-    return None
+def addr_ink_span(raw, stride, G):
+  """地址栏墨迹的 (最左, 最右) 列。
+
+  第59轮：动画只作用在**末级**那一节，父级不动。所以
+    * 末级在动  → 最右列（末节右沿）随帧变化；
+    * 父级不动  → 最左列（第一节左沿）各帧恒定。
+  旧判据只看最左列，在"整串一起动"时才有信号，现在要靠最右列。
+  """
+  s = G["s"]
+  x0 = round(106 * s)
+  x1 = G["W"] - round(222 * s)
+  y0 = G["title"] + round(8 * s)
+  y1 = G["title"] + G["tool"] - round(8 * s)
+  lo = hi = None
+  for x in range(x0, x1):
+    if any(min(V.px(raw, stride, x, y)) >= 0x70 for y in range(y0, y1)):
+      if lo is None:
+        lo = x
+      hi = x
+  return (lo, hi)
 
 
 def sidebar_top(raw, stride, G, thr=0x60):
@@ -230,20 +240,20 @@ def enter_and_sample(anim_on, nframes=5, gap=0.06):
     V.move(x, y)
     time.sleep(0.15)
     raw0, st0, _, _ = V.grab(hw2)
-    left0 = addr_ink_left(raw0, st0, G2)
+    before = addr_ink_span(raw0, st0, G2)
     V.click(x, y)
     time.sleep(0.05)
     V.click(x, y)  # 第二次点击 = 双击打开（双击时限 500ms 内）
     frames = []
     for _ in range(nframes):
         r, st, _, _ = V.grab(hw2)
-        frames.append((addr_ink_left(r, st, G2), time.time()))
+        frames.append((addr_ink_span(r, st, G2), time.time()))
         time.sleep(gap)
     time.sleep(0.8)
     rawE, stE, _, _ = V.grab(hw2)
-    stable = addr_ink_left(rawE, stE, G2)
+    stable = addr_ink_span(rawE, stE, G2)
     subprocess_kill()
-    return left0, frames, stable
+    return before, frames, stable
 
 
 def subprocess_kill():
@@ -252,19 +262,28 @@ def subprocess_kill():
     time.sleep(0.4)
 
 
-left0, frames, stable = enter_and_sample(True)
-mids = [f[0] for f in frames]
-# 完全滑出视野时这一带**一点墨都没有**（返回 None），同样是"还在右边"的证据
-shifted = [m for m in mids if m is None or (stable is not None and m > stable + 10)]
-mark(bool(shifted),
-     "A1 动画开：进入子目录的中途帧面包屑偏右（起始 %s / 中途 %s / 稳定 %s）"
-     % (left0, mids, stable))
+before, frames, stable = enter_and_sample(True)
+spans = [f[0] for f in frames]
+# 末级在动 → 中途帧的最右列明显偏右（甚至整段还没滑进来 = None）；
+# 父级不动 → 各帧最左列恒定（第一节左沿不参与位移）。
+rights = [sp[1] for sp in spans if sp and sp[1] is not None]
+lefts = [sp[0] for sp in spans if sp and sp[0] is not None]
+sright = stable[1] if stable else None
+moved = [r for r in rights if sright is not None and r > sright + 10]
+mark(bool(moved) or any(sp is None for sp in spans),
+     "A1 动画开：末级面包屑中途帧偏右（起始 %s / 中途 %s / 稳定 %s）"
+     % (before, spans, stable))
+mark(bool(lefts) and sright is not None and max(lefts) - min(lefts) <= 2,
+     "A1b 父级面包屑不参与位移（各帧最左列极差=%d px）"
+     % (max(lefts) - min(lefts) if lefts else -1))
 
-left0b, framesb, stableb = enter_and_sample(False)
-midsb = [f[0] for f in framesb]
-shiftedb = [m for m in midsb if m is None or (stableb is not None and m > stableb + 10)]
-mark(not shiftedb,
-     "A2 关掉动画：同一动作没有中间态（中途 %s / 稳定 %s）" % (midsb, stableb))
+before_b, framesb, stableb = enter_and_sample(False)
+spansb = [f[0] for f in framesb]
+rightsb = [sp[1] for sp in spansb if sp and sp[1] is not None]
+srightb = stableb[1] if stableb else None
+movedb = [r for r in rightsb if srightb is not None and r > srightb + 10]
+mark(not movedb,
+     "A2 关掉动画：同一动作没有中间态（中途 %s / 稳定 %s）" % (spansb, stableb))
 
 # ---------------------------------------------------------------- 图标放大
 print("\n—— A3/A4 大图标悬停放大 ——")

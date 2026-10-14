@@ -2888,12 +2888,20 @@ fn select_marquee_into(app: &mut App, l: &paint::Layout, origin: (i32, i32), cur
     }
 
     let mut keys: Vec<String> = Vec::new();
+    // 第59轮修复：框选后焦点框必须落到"真正被框到的那一行"，而不是留在
+    // 默认的 focus_row=0 —— 否则松开后第 0 行会顶着一条高亮（与选中同款
+    // 底色 + 行首竖线），看着就像"莫名其妙选中了第一个文件/文件夹"。
+    // 循环按 0..n 顺序推进，所以第一个命中就是下标最小、位置最靠上的命中。
+    let mut first_hit: Option<usize> = None;
     if app.tab().home {
         let (_, tiles) = paint::home_layout(app, &l.view);
-        for t in &tiles {
+        for (n, t) in tiles.iter().enumerate() {
             if hits(&t.rect, &r) {
                 if let Some(e) = app.tab().entries.get(t.index) {
                     keys.push(crate::app::key_of(e));
+                    if first_hit.is_none() {
+                        first_hit = Some(n);
+                    }
                 }
             }
         }
@@ -2905,6 +2913,9 @@ fn select_marquee_into(app: &mut App, l: &paint::Layout, origin: (i32, i32), cur
             if hits(&ir, &r) {
                 if let Some(e) = app.tab().visible.get(i).and_then(|k| app.tab().entries.get(*k)) {
                     keys.push(crate::app::key_of(e));
+                    if first_hit.is_none() {
+                        first_hit = Some(i);
+                    }
                 }
             }
         }
@@ -2912,12 +2923,16 @@ fn select_marquee_into(app: &mut App, l: &paint::Layout, origin: (i32, i32), cur
     if keys.is_empty() {
         return;
     }
-    let tab = app.tab_mut();
-    tab.selected.clear();
-    for k in keys {
-        tab.selected.insert(k);
+    {
+        let tab = app.tab_mut();
+        tab.selected.clear();
+        for k in keys {
+            tab.selected.insert(k);
+        }
     }
-    app.focus_visible = true;
+    // 把焦点行挪到被框选的顶行：既消掉"第 0 行无故高亮"的错觉，又给
+    // 后续键盘操作（方向键续选）一个合理的锚点（与资源管理器一致）。
+    app.set_focus_row(first_hit.unwrap_or(0));
 }
 
 /// 详细信息视图表头的高度；其它视图没有表头。

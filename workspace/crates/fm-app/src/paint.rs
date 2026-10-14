@@ -2166,10 +2166,17 @@ fn paint_address(app: &mut App, hdc: HDC, l: &Layout) {
         }
 
         // 第57轮：地址栏进 / 出场动画。
-        //   进入（kind=0）：面包屑从地址框右沿滑进来，到位后回弹一下；
-        //   退出（kind=1）：**切换前**那一串整体向右滑出去（栈式弹出）。
-        // 动画只改一个 x 位移，命中矩形（address_bar 那份）不变 —— 300ms
-        // 的过渡里没人会去点面包屑，真点也点的是动画结束后的位置。
+        //   进入（kind=0）：**末尾那一级**从地址框右沿滑进来，到位后回弹一下；
+        //   退出（kind=1）：**切换前**那一串的末尾一级向右滑出去（栈式弹出）。
+        //
+        // 第59轮调整：**只有最后一级动，前面的父级与分隔符全部原地不动**。
+        // 早先整串一起平移，父级也跟着滑，看着像"整条地址都在动"，反而脏；
+        // 而地址栏真正表达的是"我又深了一层"，动的只该是新增的那一级。
+        // 位移量仍按地址框宽度算，末节从右沿外滑入 —— 父级不动的前提下，
+        // 这样末节入场的路径最自然（它自己那段距离被完整走完）。
+        //
+        // 动画只改末节的 x，命中矩形（address_bar 那份）不变 —— 过渡期间
+        // 没人会去点面包屑，真点也点的是动画结束后的位置。
         let anim = app.addr_anim.clone();
         let bar = match &anim {
             Some(a) if a.kind == 1 => layout_crumbs(app, l, a.prev.clone()),
@@ -2213,12 +2220,14 @@ fn paint_address(app: &mut App, hdc: HDC, l: &Layout) {
         let font = ui_font(app.metrics.scale);
         let old = SelectObject(hdc, font.into());
         SetBkMode(hdc, TRANSPARENT);
+        let n_crumbs = bar.crumbs.len();
         for (i, c) in bar.crumbs.iter().enumerate() {
+            let last = i + 1 == n_crumbs;
+            // 只有末级吃位移，父级 dx=0（shift_x 对 0 是恒等，这里直接传值即可）
             let r = match bar.rects.get(i) {
-                Some(r) => shift_x(*r, dx),
+                Some(r) => shift_x(*r, if last { dx } else { 0 }),
                 None => continue,
             };
-            let last = i + 1 == bar.crumbs.len();
             if c.chip {
                 // 搜索状态芯片（学 Pulse）：强调色淡染的圆角块 + 白字。
                 // Pulse 实测底色 #263846 = 强调蓝与面板底 ~18% 混合，这里
@@ -2245,10 +2254,13 @@ fn paint_address(app: &mut App, hdc: HDC, l: &Layout) {
         SetTextColor(hdc, t.text_dim);
         for s in &bar.seps {
             let mut w: Vec<u16> = "\u{203A}".encode_utf16().collect();
+            // 分隔符不参与位移（父级静止），直接用原矩形的一份拷贝 ——
+            // DrawTextW 要 &mut RECT，而 seps 是共享借用，只能克隆。
+            let mut sr = *s;
             DrawTextW(
                 hdc,
                 &mut w,
-                &mut shift_x(*s, dx),
+                &mut sr,
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
             );
         }
