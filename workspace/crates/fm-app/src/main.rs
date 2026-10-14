@@ -95,6 +95,12 @@ pub const APP_TITLE: &str = "ZenFile";
 pub const APP_VERSION: &str = "Demo 0.3 Daily 2026-10-11";
 /// 目录栏下沿进度条的动画节拍。一直挂着，但只有 busy() 时才真的重画。
 const TIMER_BUSY: usize = 2;
+/// 界面过渡动画的节拍（16ms ≈ 60Hz，第57轮）。
+///
+/// **不是常驻的**：有动画在跑才由 `App::sync_anim_timer` 挂上，跑完立刻
+/// Kill 掉 —— 为几段 300ms 的过渡常驻一个 60Hz 定时器纯属浪费，还阻止
+/// 系统降频。
+pub const TIMER_ANIM: usize = 3;
 const HOTKEY_MAIN: i32 = 1;
 /// 系统双击时限之上一点点：低于它是"连着两下"（= 打开），高于它算"两次慢速单击"（= 改名）。
 const DOUBLE_CLICK_MS: u64 = 500;
@@ -944,7 +950,15 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             LRESULT(1)
         }
         WM_TIMER => {
-            if wparam.0 == TIMER_BUSY {
+            if wparam.0 == TIMER_ANIM {
+                // 过渡动画（第57轮）：推一帧，画面变了才重画；跑完了就把
+                // 自己这只定时器摘掉（sync_anim_timer 里做）。
+                let app = &mut *app_ptr;
+                if app.tick_anim() {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                app.sync_anim_timer();
+            } else if wparam.0 == TIMER_BUSY {
                 let app = &mut *app_ptr;
                 paint::tick_busy_strip(hwnd, app);
             } else if wparam.0 == TIMER_DRAIN {
@@ -2495,6 +2509,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             unsafe {
                 let _ = KillTimer(Some(hwnd), TIMER_DRAIN);
                 let _ = KillTimer(Some(hwnd), TIMER_BUSY);
+                let _ = KillTimer(Some(hwnd), TIMER_ANIM);
                 if std::ptr::eq(app_ptr, APP) {
                     let _ = UnregisterHotKey(Some(hwnd), HOTKEY_MAIN);
                 }

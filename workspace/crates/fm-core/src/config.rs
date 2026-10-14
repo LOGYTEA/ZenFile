@@ -86,6 +86,42 @@ pub struct UiConfig {
     /// 默认 default = 系统图标；optimized 由 `icon_theme` 模块参数化自绘。
     #[serde(default = "default_icon_theme")]
     pub icon_theme: String,
+    /// 界面动画（第57轮，设置-交互页「动画」组）。
+    ///
+    /// 四项各自独立，关掉哪一项那一项就退回"无过渡"的画法（不是把时长调成
+    /// 0 —— 时长是固定几档，关就是关）。**只做"触发时播一次"的过渡动画**，
+    /// 不做常驻循环动画：常驻的动效会让静态截图/像素判据永远读不准，也会
+    /// 一直占着定时器。
+    #[serde(default)]
+    pub anim: AnimConfig,
+}
+
+/// 界面动画开关。默认全开。
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct AnimConfig {
+    /// 导航窗格：切换目录时**平滑滚动**到"我现在在哪"那一行；悬停高亮条也
+    /// 跟着滑过去而不是瞬移。
+    #[serde(default = "default_true")]
+    pub sidebar: bool,
+    /// 大图标 / 中图标：鼠标悬停或选中时，那个条目的图标**放大**一点。
+    #[serde(default = "default_true")]
+    pub icon_zoom: bool,
+    /// 详细信息 / 列表：悬停或选中的瞬间，图标**轻微回弹**一下（果冻感）。
+    #[serde(default = "default_true")]
+    pub icon_bounce: bool,
+    /// 地址栏：进入目录时面包屑从右侧滑入并回弹一下；返回时向右滑出。
+    #[serde(default = "default_true")]
+    pub address: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for AnimConfig {
+    fn default() -> Self {
+        Self { sidebar: true, icon_zoom: true, icon_bounce: true, address: true }
+    }
 }
 
 fn default_icon_theme() -> String {

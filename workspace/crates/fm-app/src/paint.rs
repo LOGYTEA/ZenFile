@@ -676,6 +676,9 @@ pub fn grid_content_h(g: &IconGrid, count: usize) -> i32 {
 // ---------------------------------------------------------------- 绘制
 
 pub fn paint(app: &mut App, hdc: HDC, width: i32, height: i32) {
+    // 动画的"每帧开始"：把上一帧的 悬停/选中 集合滚成 prev（判"刚变成
+    // 这个状态"用），并清空这一帧的放大目标（没写到的项 = 不放大）。
+    app.begin_anim_frame();
     unsafe {
         let mem = CreateCompatibleDC(Some(hdc));
         let bmp = CreateCompatibleBitmap(hdc, width, height);
@@ -2032,8 +2035,13 @@ pub(crate) unsafe fn text_width(hdc: HDC, font: HFONT, text: &str) -> i32 {
 /// `…`（点它跳到被折叠的最深一层）。**先量宽再决定折叠** —— 少了这一步，路径一深
 /// 就会画出右边框外面去。
 pub fn address_bar(app: &mut App, l: &Layout) -> AddressBar {
+    let crumbs = app.address_crumbs();
+    layout_crumbs(app, l, crumbs)
+}
+
+/// 把**任意一串**面包屑排进地址框（第57轮：退出动画要排的是切换前那一串）。
+fn layout_crumbs(app: &mut App, l: &Layout, mut crumbs: Vec<crate::app::Crumb>) -> AddressBar {
     let scale = app.metrics.scale;
-    let mut crumbs = app.address_crumbs();
     let pad = (8.0 * scale).round() as i32;
     let cpad = (5.0 * scale).round() as i32;
     let avail = (l.address.right - l.address.left - pad * 2).max(20);
@@ -2103,6 +2111,15 @@ pub fn address_bar(app: &mut App, l: &Layout) -> AddressBar {
     AddressBar { crumbs, rects, seps }
 }
 
+/// 把一个矩形整体平移 `dx`（地址栏进出场动画用）。
+fn shift_x(r: RECT, dx: i32) -> RECT {
+    if dx == 0 {
+        r
+    } else {
+        RECT { left: r.left + dx, top: r.top, right: r.right + dx, bottom: r.bottom }
+    }
+}
+
 /// 命中测试：返回被点到的面包屑下标。
 pub fn address_hit(bar: &AddressBar, x: i32, y: i32) -> Option<usize> {
     for (i, r) in bar.rects.iter().enumerate() {
@@ -2142,7 +2159,41 @@ fn paint_address(app: &mut App, hdc: HDC, l: &Layout) {
             return;
         }
 
-        let bar = address_bar(app, l);
+        // 第57轮：地址栏进 / 出场动画。
+        //   进入（kind=0）：面包屑从地址框右沿滑进来，到位后回弹一下；
+        //   退出（kind=1）：**切换前**那一串整体向右滑出去（栈式弹出）。
+        // 动画只改一个 x 位移，命中矩形（address_bar 那份）不变 —— 300ms
+        // 的过渡里没人会去点面包屑，真点也点的是动画结束后的位置。
+        let anim = app.addr_anim.clone();
+        let bar = match &anim {
+            Some(a) if a.kind == 1 => layout_crumbs(app, l, a.prev.clone()),
+            _ => address_bar(app, l),
+        };
+        let mut dx = 0i32;
+        if let Some(a) = &anim {
+            let now = GetTickCount64();
+            let w = (l.address.right - l.address.left).max(1) as f32;
+            let (dur, p) = if a.kind == 0 {
+                (crate::app::ANIM_ADDR_IN_MS, (now.saturating_sub(a.start)) as f32 / crate::app::ANIM_ADDR_IN_MS as f32)
+            } else {
+                (crate::app::ANIM_ADDR_OUT_MS, (now.saturating_sub(a.start)) as f32 / crate::app::ANIM_ADDR_OUT_MS as f32)
+            };
+            let _ = dur;
+            let p = p.clamp(0.0, 1.0);
+            dx = if a.kind == 0 {
+                // 先 3 次 ease-out 滑到位，后 38% 走一段抛物线"弹一下"
+                let e = 1.0 - (1.0 - p).powi(3);
+                let mut d = (1.0 - e) * w;
+                if p > 0.62 {
+                    let q = (p - 0.62) / 0.38;
+                    d -= 7.0 * scale * (1.0 - (2.0 * q - 1.0).powi(2));
+                }
+                d as i32
+            } else {
+                // 退出：加速向右滑出（越滑越快，像被推出栈）
+                (p * p * w) as i32
+            };
+        }
         // 必须 Save/Restore：这是**整窗共用的内存 DC**，裁剪区一改，后面画的
         // 导航窗格、列表、状态栏全被裁进地址框里（整窗变成一片空白）。
         let saved = SaveDC(hdc);
@@ -2158,7 +2209,7 @@ fn paint_address(app: &mut App, hdc: HDC, l: &Layout) {
         SetBkMode(hdc, TRANSPARENT);
         for (i, c) in bar.crumbs.iter().enumerate() {
             let r = match bar.rects.get(i) {
-                Some(r) => *r,
+                Some(r) => shift_x(*r, dx),
                 None => continue,
             };
             let last = i + 1 == bar.crumbs.len();
@@ -2191,7 +2242,7 @@ fn paint_address(app: &mut App, hdc: HDC, l: &Layout) {
             DrawTextW(
                 hdc,
                 &mut w,
-                &mut s.clone(),
+                &mut shift_x(*s, dx),
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
             );
         }
@@ -2479,6 +2530,60 @@ pub fn paint_sidebar(app: &mut App, hdc: HDC, l: &Layout) {
         // 排列本身由 App 产出，绘制与命中测试共用同一份，不存在"看得见点不到"。
         let rows = app.sidebar_rows();
         let cur = std::fs::canonicalize(&app.tab().path).unwrap_or_default();
+        // 第57轮：动画要"知道当前位置在哪一行"，所以先整棵判一遍 active。
+        // 画的时候也复用这份结果（原来是在循环里逐行判，一帧要问一遍 Shell）。
+        let actives: Vec<bool> = rows
+            .iter()
+            .map(|r| !r.spacer && sidebar_row_active(app, r, &cur))
+            .collect();
+        let active_idx = actives.iter().position(|v| *v);
+        if app.cfg.ui.anim.sidebar {
+            // 目标 y **每帧按当前滚动量重算**：滚动本身也在动，写死一个值
+            // 会让指示条滑到旧位置上。
+            let y_of = |i: usize| -> Option<f32> {
+                if i >= rows.len() || rows[i].spacer {
+                    return None;
+                }
+                Some(sidebar_row_geoms(l, i, rows[i].depth, scale, app.sidebar_scroll).0.top as f32)
+            };
+            let at = active_idx.and_then(y_of);
+            let ht = app.sidebar_hover.and_then(y_of);
+            app.sb_active_target = at;
+            app.sb_hover_target = ht;
+            // 只有"我在哪"那一行**换了**才重新算滚动目标 —— 每帧算一次会把
+            // 用户自己滚的位置抢回来（表现为"手动滚完又被拽回去"）。
+            if let Some(ai) = active_idx {
+                if app.sb_last_active != Some(ai) {
+                    app.sb_last_active = Some(ai);
+                    if let Some(top) = active_idx.and_then(y_of) {
+                        let rh = sidebar_row_h(scale);
+                        let top = top as i32;
+                        let need = if top < l.sidebar.top {
+                            top - l.sidebar.top
+                        } else if top + rh > l.sidebar.bottom {
+                            top + rh - l.sidebar.bottom
+                        } else {
+                            0
+                        };
+                        if need != 0 {
+                            // 钳制口径与 scroll_sidebar 完全一致（同一个 max）
+                            let total = rows.len() as i32 * rh;
+                            let view_h = l.sidebar.bottom - l.sidebar.top - rh;
+                            let max = (total - view_h).max(0);
+                            app.sb_scroll_target = Some((app.sidebar_scroll + need).clamp(0, max));
+                            app.sync_anim_timer();
+                        }
+                    }
+                }
+            }
+        } else {
+            app.sb_active_target = None;
+            app.sb_hover_target = None;
+            app.sb_scroll_target = None;
+            app.sb_last_active = None;
+            app.sb_active_y = None;
+            app.sb_hover_y = None;
+        }
         // 图标句柄先取好再画：dir_icon 需要 &mut，不能一边借 rows 一边改缓存
         let mut icons: Vec<Option<HICON>> = vec![None; rows.len()];
         let mut glyphs: Vec<Option<&'static str>> = vec![None; rows.len()];
@@ -2552,15 +2657,25 @@ pub fn paint_sidebar(app: &mut App, hdc: HDC, l: &Layout) {
                 let _ = DeleteObject(lb.into());
             }
 
-            let active = sidebar_row_active(app, row, &cur);
+            let active = actives.get(i).copied().unwrap_or(false);
             let hovered = app.sidebar_hover == Some(i);
+            // 第57轮：动画开着时高亮条画在**缓动后的 y** 上 —— 从上一行滑过来，
+            // 而不是"消失 + 在新行出现"。关掉动画就完全照旧（用行本体的 y）。
+            let bar_top = if app.cfg.ui.anim.sidebar {
+                let eased = if active { app.sb_active_y } else { app.sb_hover_y };
+                eased.map(|v| v.round() as i32).unwrap_or(row_r.top)
+            } else {
+                row_r.top
+            };
+            let bar_h = row_r.bottom - row_r.top;
             if active || hovered {
                 let only_hover = hovered && !active;
+                let r2 = RECT { left: row_r.left, top: bar_top, right: row_r.right, bottom: bar_top + bar_h };
                 fill_radius(
                     app,
                     hdc,
                     if only_hover { "sidebar.hover" } else { "sidebar.selected" },
-                    &row_r,
+                    &r2,
                     if only_hover { t.surface } else { t.hover_bg },
                     None,
                 );
@@ -2573,7 +2688,7 @@ pub fn paint_sidebar(app: &mut App, hdc: HDC, l: &Layout) {
                     app,
                     hdc,
                     "sidebar.selected",
-                    &RECT { left: row_r.left, top: row_r.top, right: row_r.left + (3.0 * scale) as i32, bottom: row_r.bottom },
+                    &RECT { left: row_r.left, top: bar_top, right: row_r.left + (3.0 * scale) as i32, bottom: bar_top + bar_h },
                     t.accent,
                     None,
                 );
@@ -3258,6 +3373,34 @@ pub fn detail_cols(app: &App, l: &Layout, icon_size: i32) -> DetailCols {
 ///
 /// 大图标视图里必须先试缩略图 —— `SHGFI_LARGEICON` 只给 32×32，拉伸到 64/96
 /// 必然发虚；而 IShellItemImageFactory 对图片/视频给的就是真内容。
+/// 第57轮：条目图标**这一帧该画多大**。
+///
+/// 两件事叠在一起：
+///   * 大图标 / 中图标：悬停或选中时放大 `ANIM_ZOOM`，缓动进出；
+///   * 详细信息 / 列表：刚变成悬停/选中的那一下"果冻"回弹（阻尼振荡）。
+///
+/// 返回值**量化到 2px**：放大过程中每帧一个新尺寸会把图标的两张派生缓存
+/// （`upscaled` / `scaled_thumbs`，key 里都含尺寸）撑爆，跑一遍动画就
+/// 把正常尺寸的条目全挤出去，反而更慢。
+fn icon_draw_size(app: &App, key: &str, base: i32, large: bool) -> i32 {
+    let mut s = base as f32;
+    if large {
+        if let Some(z) = app.icon_zoom.get(key) {
+            s *= 1.0 + z;
+        }
+    }
+    if let Some(t0) = app.icon_bounce.get(key) {
+        let now = unsafe { GetTickCount64() };
+        let e = now.saturating_sub(*t0) as f32 / crate::app::ANIM_BOUNCE_MS as f32;
+        if e < 1.0 {
+            // 阻尼余弦：t=0 立刻鼓一下，之后来回衰减到 1.0（果冻感）
+            let w = 2.0 * std::f32::consts::PI * crate::app::ANIM_BOUNCE_FREQ * e;
+            s *= 1.0 + crate::app::ANIM_BOUNCE_AMP * (1.0 - e) * w.cos();
+        }
+    }
+    (((s / 2.0).round() * 2.0) as i32).max(4)
+}
+
 fn draw_item_icon(
     app: &App,
     hdc: HDC,
@@ -3463,6 +3606,9 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
         let _ = SaveDC(hdc);
         let _ = IntersectClipRect(hdc, l.view.left, list_top, l.view.right, l.view.bottom);
 
+        // 第57轮：这一帧"悬停 / 选中 / 焦点"的条目（key, 是不是大图标视图）。
+        // 画完之后统一登记动画 —— 循环里改不了 App：`tab` 正借着它。
+        let mut hot_items: Vec<(String, bool)> = Vec::new();
         let tab = app.tab();
         for i in from..to {
             let index = visible[i];
@@ -3502,7 +3648,8 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
                 continue;
             }
             let r = RECT { left: x, top: y, right: x + w_cell, bottom: y + tile_h };
-            let selected = tab.selected.contains(&crate::app::key_of(entry));
+            let ekey = crate::app::key_of(entry);
+            let selected = tab.selected.contains(&ekey);
             // 焦点行只在用户真的交互过之后才画出来：否则每次打开文件夹，
             // 第 0 行都顶着一条高亮，看着像"默认就勾选了第一行"。
             let focused = app.focus_visible && i == tab.focus_row;
@@ -3511,6 +3658,9 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
             // 两者一样重就分不清"我已经选了它"和"我只是指在这儿"。
             let hovered =
                 !selected && !focused && app.hover_row == Some(index) && app.hover_pane == Some(app.focus_pane);
+            if hovered || selected || focused {
+                hot_items.push((ekey.clone(), large_icon));
+            }
             if hovered {
                 fill_radius(app, hdc, "content.hover", &r, t.row_hover, None);
             }
@@ -3535,9 +3685,12 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
             let thumb = icon_thumbs.get(k).copied().flatten();
             let alpha = icon_alpha.get(k).copied().unwrap_or(255);
             let name = names.get(k).cloned().unwrap_or_default();
+            // 第57轮：图标动画后的实际尺寸 + 让图标**中心不动**的偏移量
+            let isz = icon_draw_size(app, &ekey, icon_size, large_icon);
+            let ioff = (isz - icon_size) / 2;
             if mode == fm_core::ViewMode::Details {
                 // 名称列特殊：左边要让出图标位，所以 x 由 col_boxes 给
-                draw_item_icon(app, hdc, icon, thumb, col_name - icon_size - icon_gap, y + (row_h - icon_size) / 2, icon_size, alpha);
+                draw_item_icon(app, hdc, icon, thumb, col_name - icon_size - icon_gap - ioff, y + (row_h - icon_size) / 2 - ioff, isz, alpha);
                 // 名称列文字：右沿 = 名称列自己的右沿（隐藏了「位置」列时
                 // 就是下一列的左沿）。必须带 DT_END_ELLIPSIS：名字长了不省略
                 // 就会一路画到下一列上（长文件名压在"修改日期"上面）。
@@ -3602,13 +3755,13 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
                 }
             } else if mode == fm_core::ViewMode::List {
                 let ix = l.view.left + text_pad;
-                draw_item_icon(app, hdc, icon, thumb, ix, y + (row_h - icon_size) / 2, icon_size, alpha);
+                draw_item_icon(app, hdc, icon, thumb, ix - ioff, y + (row_h - icon_size) / 2 - ioff, isz, alpha);
                 let name_r = RECT { left: ix + icon_size + 8, top: y, right: l.view.right, bottom: y + row_h };
                 draw_text(hdc, &name, name_r, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
             } else {
                 // 网格磁贴：图标在格子顶部居中，名字压在图标下方、居中并省略过长部分
-                let cx = x + (w_cell - icon_size) / 2;
-                draw_item_icon(app, hdc, icon, thumb, cx, y + (8.0 * app.metrics.scale) as i32, icon_size, alpha);
+                let cx = x + (w_cell - isz) / 2;
+                draw_item_icon(app, hdc, icon, thumb, cx, y + (8.0 * app.metrics.scale) as i32 - ioff, isz, alpha);
                 let name_r = RECT {
                     left: x + 4,
                     top: y + icon_size + (4.0 * app.metrics.scale) as i32,
@@ -3619,6 +3772,31 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
             }
         }
         let _ = RestoreDC(hdc, -1);
+
+        // 第57轮：登记这一帧的图标动画（`tab` 的借用到此结束，可以改 App 了）。
+        //
+        // 大图标 / 中图标 = **放大**（悬停或选中期间一直大着，缓动进出）；
+        // 详细信息 / 列表 = **回弹**（只在"刚变成悬停/选中"那一帧弹一次，
+        // 判据是它不在上一帧的 hot 集合里 —— 一直在上面就不会反复弹）。
+        if !hot_items.is_empty() {
+            let anim = app.cfg.ui.anim;
+            let mut touched = false;
+            for (k, large) in hot_items.drain(..) {
+                if large && anim.icon_zoom {
+                    app.icon_zoom_tgt.insert(k.clone(), crate::app::ANIM_ZOOM);
+                    touched = true;
+                }
+                if !large && anim.icon_bounce && !app.icon_prev_active.contains(&k) {
+                    let now = GetTickCount64();
+                    app.icon_bounce.insert(k.clone(), now);
+                    touched = true;
+                }
+                app.icon_active.insert(k);
+            }
+            if touched {
+                app.sync_anim_timer();
+            }
+        }
 
         // 表头**最后**画，且底色不透明：滚动时条目绝不会压到它上面
         if mode == fm_core::ViewMode::Details {

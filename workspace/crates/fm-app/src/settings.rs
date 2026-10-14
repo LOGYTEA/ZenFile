@@ -1127,6 +1127,9 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
             let rh2 = row_h2;
             let cur = app.settings_interact_sel;
             if let Some(a) = cur.and_then(|id| interact_find(id, &interact_tree()).and_then(|n| n.action)) {
+                let id = cur.unwrap();
+                // 动画组是开关：行右端画 Toggle（第57轮）
+                let tg = if is_anim_action(a) { Some(anim_state(app, id)) } else { None };
                 g.rows.push(row(
                     RECT {
                         left: pv_left,
@@ -1134,10 +1137,10 @@ pub fn geom(app: &App, l: &Layout) -> Geom {
                         right: content.right,
                         bottom: row_top + rh2,
                     },
-                    interact_param_label(cur.unwrap()),
-                    interact_param_value(app, cur.unwrap()),
+                    interact_param_label(id),
+                    interact_param_value(app, id),
                     a,
-                    None,
+                    tg,
                 ));
             }
         }
@@ -1225,6 +1228,10 @@ pub fn hit(app: &App, l: &Layout, x: i32, y: i32) -> Option<Hit> {
         for r in &g.rows {
             if inside(&r.rect, x, y) {
                 let a = r.action;
+                // 动画组是开关（第57轮）：点整行就切，不用去够 [−][+] 两颗小按钮
+                if is_anim_action(a) {
+                    return Some(Hit::Row(a));
+                }
                 return if x >= r.rect.right - bw {
                     Some(Hit::Row(a + 2)) // [+]
                 } else if x >= r.rect.right - 2 * bw {
@@ -1331,7 +1338,39 @@ fn interact_param_label(id: &str) -> &'static str {
         "selbar.h" => "高度（0 = 跟行高）",
         "selbar.stroke" => "描边粗细（空心时生效）",
         "selbar.hollow" => "空心（只描边不填色）",
+        "anim.sidebar" => "切换目录时滚到当前项",
+        "anim.icon_zoom" => "悬停 / 选中时图标放大",
+        "anim.icon_bounce" => "悬停 / 选中时弹一下",
+        "anim.address" => "进入 / 返回时滑入滑出",
         _ => "参数",
+    }
+}
+
+/// 「动画」这四项都是开关（action 4020/4023/4026/4029）。
+pub fn is_anim_action(a: u32) -> bool {
+    matches!(a, 4020 | 4023 | 4026 | 4029)
+}
+
+/// 选中项是动画组时，右侧预览区要写的说明。
+fn anim_desc(id: &str) -> &'static [&'static str] {
+    match id {
+        "anim.sidebar" => &[
+            "切换文件夹时，导航窗格平滑滚动到「我现在在哪」那一行；",
+            "鼠标在导航窗格里移动时，悬停高亮条也是滑过去而不是瞬移。",
+        ],
+        "anim.icon_zoom" => &[
+            "大图标 / 中图标视图：鼠标悬停或被选中的那个条目，",
+            "图标放大一点点（缓动进出，不是循环跳动）。",
+        ],
+        "anim.icon_bounce" => &[
+            "详细信息 / 列表视图：刚悬停上或刚被选中那一下，",
+            "图标轻微回弹一次（果冻感），之后恢复原状。",
+        ],
+        "anim.address" => &[
+            "进入新目录：面包屑从地址栏右侧滑进来，到位后弹一下；",
+            "返回上一级：旧的那一串像出栈一样向右滑出去。",
+        ],
+        _ => &[],
     }
 }
 
@@ -1349,7 +1388,25 @@ fn interact_param_value(app: &App, id: &str) -> String {
         }
         "selbar.stroke" => format!("{} DIP", sb.stroke),
         "selbar.hollow" => if sb.hollow { "开" } else { "关" }.to_string(),
+        "anim.sidebar" => on_off(app.cfg.ui.anim.sidebar),
+        "anim.icon_zoom" => on_off(app.cfg.ui.anim.icon_zoom),
+        "anim.icon_bounce" => on_off(app.cfg.ui.anim.icon_bounce),
+        "anim.address" => on_off(app.cfg.ui.anim.address),
         _ => String::new(),
+    }
+}
+
+fn on_off(v: bool) -> String {
+    if v { "开" } else { "关" }.to_string()
+}
+
+/// 动画某项当前的开关状态。
+fn anim_state(app: &App, id: &str) -> bool {
+    match id {
+        "anim.sidebar" => app.cfg.ui.anim.sidebar,
+        "anim.icon_zoom" => app.cfg.ui.anim.icon_zoom,
+        "anim.icon_bounce" => app.cfg.ui.anim.icon_bounce,
+        _ => app.cfg.ui.anim.address,
     }
 }
 
@@ -1371,17 +1428,32 @@ fn inode(id: &'static str, name: &'static str, action: Option<u32>, kids: Vec<In
 }
 
 pub fn interact_tree() -> Vec<InteractNode> {
-    vec![inode(
-        "selbar",
-        "选中行首竖线",
-        None,
-        vec![
-            inode("selbar.w", "宽度", Some(4000), vec![]),
-            inode("selbar.h", "高度", Some(4003), vec![]),
-            inode("selbar.stroke", "描边粗细", Some(4006), vec![]),
-            inode("selbar.hollow", "空心", Some(4009), vec![]),
-        ],
-    )]
+    vec![
+        inode(
+            "selbar",
+            "选中行首竖线",
+            None,
+            vec![
+                inode("selbar.w", "宽度", Some(4000), vec![]),
+                inode("selbar.h", "高度", Some(4003), vec![]),
+                inode("selbar.stroke", "描边粗细", Some(4006), vec![]),
+                inode("selbar.hollow", "空心", Some(4009), vec![]),
+            ],
+        ),
+        // 第57轮：动画四项。四项都是开关（不是数值），所以行右端画的是
+        // Toggle 而不是 [−][+]，点整行就切。
+        inode(
+            "anim",
+            "动画",
+            None,
+            vec![
+                inode("anim.sidebar", "侧栏平滑定位", Some(4020), vec![]),
+                inode("anim.icon_zoom", "图标放大（大图标）", Some(4023), vec![]),
+                inode("anim.icon_bounce", "图标回弹（列表）", Some(4026), vec![]),
+                inode("anim.address", "地址栏滑入滑出", Some(4029), vec![]),
+            ],
+        ),
+    ]
 }
 
 fn interact_find<'a>(id: &str, nodes: &'a [InteractNode]) -> Option<&'a InteractNode> {
@@ -1479,6 +1551,11 @@ pub fn apply_sel_bar_action(app: &mut App, a: u32) {
         4009..=4011 => {
             app.set_sel_bar(|sb| sb.hollow = !sb.hollow);
         }
+        // 第57轮：动画四项开关（点整行 / 点 [−][+] 都是切换）
+        4020..=4022 => app.set_anim(|a| a.sidebar = !a.sidebar),
+        4023..=4025 => app.set_anim(|a| a.icon_zoom = !a.icon_zoom),
+        4026..=4028 => app.set_anim(|a| a.icon_bounce = !a.icon_bounce),
+        4029..=4031 => app.set_anim(|a| a.address = !a.address),
         _ => {}
     }
 }
@@ -3118,6 +3195,40 @@ fn paint_interact(app: &App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
         // 高得多时**整体垂直居中** —— 让三条挤在顶部、底下留一大片空白，
         // 看着像没画完（第一版就是这样：参数行被甩到窗口最底）。
         let head_h = px(28.0);
+        // 第57轮：选中「动画」组时预览区改画**文字说明** —— 动画是要去看
+        // 的，画三条静态样例行说明不了什么，反而让人以为这就是效果本身。
+        let anim_sel = app
+            .settings_interact_sel
+            .map(|id| id.starts_with("anim."))
+            .unwrap_or(false);
+        if anim_sel {
+            let lines = anim_desc(app.settings_interact_sel.unwrap_or(""));
+            let lh = px(22.0);
+            for (k, s) in lines.iter().enumerate() {
+                let lr = RECT {
+                    left: pv.left,
+                    top: pv.top + head_h + k as i32 * lh,
+                    right: pv.right,
+                    bottom: pv.top + head_h + (k as i32 + 1) * lh,
+                };
+                set_color(hdc, th.text);
+                paint::draw_text(hdc, s, lr, DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS);
+            }
+            let st = anim_state(app, app.settings_interact_sel.unwrap_or(""));
+            let sr = RECT {
+                left: pv.left,
+                top: pv.top + head_h + lines.len() as i32 * lh + px(8.0),
+                right: pv.right,
+                bottom: pv.top + head_h + (lines.len() as i32 + 1) * lh + px(8.0),
+            };
+            set_color(hdc, th.text_dim);
+            paint::draw_text(
+                hdc,
+                if st { "当前：开" } else { "当前：关（这一项没有过渡动画）" },
+                sr,
+                DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS,
+            );
+        } else {
         let avail = (pv.bottom - pv.top - head_h - px(10.0)).max(px(60.0));
         let gap = px(10.0);
         let want = ((avail - gap * 2) / 3).min(px(56.0)).max(px(22.0));
@@ -3198,11 +3309,22 @@ fn paint_interact(app: &App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
             paint::draw_text(hdc, if *sel { "221 GB / 369 GB" } else { "" }, zr,
                 DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS);
         }
+        } // 非动画组才画三条样例行（上面 else 的收口）
     }
 
-    // —— 右侧下方：当前选中项的参数行（[−] 值 [+]）——
+    // —— 右侧下方：当前选中项的参数行（[−] 值 [+] / Toggle）——
     for r in &g.rows {
         fill_rect(hdc, &r.rect, th.surface);
+        // 第57轮：开关型（动画四项）画成真正的 Toggle，占满行右端
+        if let Some(on) = r.toggle {
+            let mut lr = r.rect;
+            lr.left += px(10.0);
+            lr.right = r.rect.right - px(58.0);
+            set_color(hdc, th.text);
+            paint::draw_text(hdc, &r.label, lr, DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS);
+            paint::draw_toggle(hdc, r, app, on);
+            continue;
+        }
         // 标签
         set_color(hdc, th.text);
         let mut lr = r.rect;

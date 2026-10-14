@@ -572,6 +572,39 @@ pub struct App {
     pub cut_set: HashSet<String>,
     /// 导航窗格的滚动偏移（像素）。树比窗格长时才非 0。
     pub sidebar_scroll: i32,
+
+    // —— 界面动画（第57轮：设置-交互页「动画」组）——
+    //
+    // 都是"触发时播一次"的过渡动画（切目录 / 悬停 / 选中），没有常驻循环
+    // 动效：常驻会一直占着定时器，也会让静态截图的像素判据永远读不准。
+    /// 动画定时器是不是还挂着。只用它避免重复 SetTimer 把周期重置
+    /// （每帧 InvalidateRect 都去 Set 一次的话，定时器永远等不到 16ms 期满）。
+    anim_timer_on: std::cell::Cell<bool>,
+    /// 地址栏的进 / 出场动画。`kind`: 0=进入（从右滑入 + 回弹），1=退出（向右滑出）。
+    pub addr_anim: Option<AddrAnim>,
+    /// 导航窗格"当前位置"指示条**此刻画在哪个 y**（每帧向 target 缓动）。
+    pub sb_active_y: Option<f32>,
+    /// 上面那个 y 这一帧的目标（由 paint 按行几何写入）。
+    pub sb_active_target: Option<f32>,
+    /// 导航窗格悬停高亮条此刻画在哪个 y。
+    pub sb_hover_y: Option<f32>,
+    pub sb_hover_target: Option<f32>,
+    /// 导航窗格平滑滚动的目标偏移（切目录时把"我在哪"那一行滚进视野）。
+    pub sb_scroll_target: Option<i32>,
+    /// 上一次定位过的"当前位置"行下标。只有它变了才需要重新算滚动 ——
+    /// 否则每帧算一次会把用户自己滚的位置抢走。
+    pub sb_last_active: Option<usize>,
+    /// 条目图标的当前放大系数（大图标 / 中图标视图，key = 条目 key）。
+    pub icon_zoom: HashMap<String, f32>,
+    /// 条目图标这一帧的放大**目标**（paint 每帧重写，没写到的项 = 0）。
+    pub icon_zoom_tgt: HashMap<String, f32>,
+    /// 正在"弹一下"的条目（key -> 开始时刻 ms，详细信息 / 列表视图）。
+    pub icon_bounce: HashMap<String, u64>,
+    /// 这一帧处于 悬停 / 选中 / 焦点 的条目 key。
+    pub icon_active: HashSet<String>,
+    /// 上一帧处于 悬停 / 选中 / 焦点 的条目 key —— "是不是刚变成这个状态"
+    /// 靠它判（只在刚变的那一帧弹一次，不是一直弹）。
+    pub icon_prev_active: HashSet<String>,
     /// 焦点行要不要**画**出来。
     ///
     /// `focus_row` 永远存在（第 0 行默认就是焦点行），但资源管理器在刚打开一个
@@ -908,6 +941,31 @@ pub enum IndexMsg {
     Failed(String),
 }
 
+/// 地址栏的进 / 出场动画（第57轮）。
+///
+/// `kind == 0`：进入新目录，面包屑从地址框右沿滑进来，到位后回弹一下。
+/// `kind == 1`：退出（后退），**切换前**那一串面包屑整体向右滑出去 ——
+/// 所以要把它存下来（`prev`），不然画的时候拿到的已经是新路径了。
+#[derive(Clone)]
+pub struct AddrAnim {
+    pub kind: u8,
+    /// 开始的时刻（`GetTickCount64()`）
+    pub start: u64,
+    /// 退出时画的那串面包屑
+    pub prev: Vec<Crumb>,
+}
+
+/// 动画时长（ms）。写死而不是做成可调项：这些数字是"看着顺"的经验值，
+/// 给用户一个 100~600 的滑杆只会让人调出一个卡手的界面。
+pub const ANIM_ADDR_IN_MS: u64 = 300;
+pub const ANIM_ADDR_OUT_MS: u64 = 200;
+pub const ANIM_BOUNCE_MS: u64 = 380;
+/// 大图标 / 中图标下"悬停 / 选中"放大的幅度（比例）。
+pub const ANIM_ZOOM: f32 = 0.10;
+/// 详细信息 / 列表下回弹的幅度与振荡圈数。
+pub const ANIM_BOUNCE_AMP: f32 = 0.18;
+pub const ANIM_BOUNCE_FREQ: f32 = 1.6;
+
 /// 地址栏面包屑的一节。
 #[derive(Clone)]
 pub struct Crumb {
@@ -1144,7 +1202,7 @@ impl App {
             // 两个分组默认都展开：这一页一共四项，全展开才 6 行，
             // 藏着反而让用户多点一次（外观页的三级圆角树默认展开也是这个理由）
             settings_interact_sel: Some("selbar.w"),
-            settings_interact_open: ["selbar", "selbar2"].into_iter().collect(),
+            settings_interact_open: ["selbar", "anim"].into_iter().collect(),
             hotkey_capture: None,
             openwith_preview: None,
             menu_preview_items: None,
@@ -1176,6 +1234,19 @@ impl App {
             hover_header: None,
             cut_set: HashSet::new(),
             sidebar_scroll: 0,
+            anim_timer_on: std::cell::Cell::new(false),
+            addr_anim: None,
+            sb_active_y: None,
+            sb_active_target: None,
+            sb_hover_y: None,
+            sb_hover_target: None,
+            sb_scroll_target: None,
+            sb_last_active: None,
+            icon_zoom: HashMap::new(),
+            icon_zoom_tgt: HashMap::new(),
+            icon_bounce: HashMap::new(),
+            icon_active: HashSet::new(),
+            icon_prev_active: HashSet::new(),
             display_names: HashMap::new(),
             focus_visible: false,
             hover_tab: None,
@@ -1917,6 +1988,180 @@ impl App {
         }));
     }
 
+    /// 改「动画」开关并写回用户层（设置-交互页）。
+    pub fn set_anim(&mut self, f: impl FnOnce(&mut fm_core::config::AnimConfig)) {
+        f(&mut self.cfg.ui.anim);
+        let _ = fm_core::config::Config::save_user_patch(&serde_json::json!({
+            "ui": { "anim": self.cfg.ui.anim }
+        }));
+    }
+
+    // ------------------------------------------------------------ 动画驱动
+    //
+    // 一个 16ms 的定时器（`crate::TIMER_ANIM`）推着所有过渡动画走，**没有
+    // 动画在跑的时候它是被 Kill 掉的**（`sync_anim_timer`）—— 常驻一个 60Hz
+    // 定时器只为几段 300ms 的过渡，白白阻止系统降频。
+
+    /// 起一段地址栏动画。`prev` 只在退出（kind=1）时用：画的是切换前的面包屑。
+    pub fn start_addr_anim(&mut self, kind: u8, prev: Vec<Crumb>) {
+        if !self.cfg.ui.anim.address {
+            return;
+        }
+        let start = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
+        self.addr_anim = Some(AddrAnim { kind, start, prev });
+        self.sync_anim_timer();
+    }
+
+    /// 每帧开始调用一次（paint 入口）：把"这一帧悬停/选中了谁"滚成"上一帧"，
+    /// 用来判定"是不是刚变成这个状态"（刚变才弹一下）。
+    pub fn begin_anim_frame(&mut self) {
+        std::mem::swap(&mut self.icon_active, &mut self.icon_prev_active);
+        self.icon_active.clear();
+        self.icon_zoom_tgt.clear();
+    }
+
+    /// 还有没有动画在跑（决定定时器要不要继续挂着）。
+    pub fn anim_active(&self) -> bool {
+        if self.addr_anim.is_some()
+            || self.sb_scroll_target.is_some()
+            || !self.icon_bounce.is_empty()
+        {
+            return true;
+        }
+        for (c, t) in [(self.sb_active_y, self.sb_active_target), (self.sb_hover_y, self.sb_hover_target)] {
+            if let (Some(c), Some(t)) = (c, t) {
+                if (t - c).abs() > 0.5 {
+                    return true;
+                }
+            }
+        }
+        for (k, v) in &self.icon_zoom {
+            if (self.icon_zoom_tgt.get(k).copied().unwrap_or(0.0) - *v).abs() > 0.002 {
+                return true;
+            }
+        }
+        for k in self.icon_zoom_tgt.keys() {
+            if !self.icon_zoom.contains_key(k) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 推进一帧动画。返回 true = 画面变了，调用方该重画。
+    pub fn tick_anim(&mut self) -> bool {
+        let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
+        let mut dirty = false;
+
+        // —— 地址栏：跑完就撤 ——
+        if self.addr_anim.is_some() {
+            let done = self
+                .addr_anim
+                .as_ref()
+                .map(|a| {
+                    let dur = if a.kind == 0 { ANIM_ADDR_IN_MS } else { ANIM_ADDR_OUT_MS };
+                    now.saturating_sub(a.start) >= dur
+                })
+                .unwrap_or(false);
+            if done {
+                self.addr_anim = None;
+            }
+            dirty = true;
+        }
+
+        // —— 导航窗格：平滑滚动到目标行 ——
+        if let Some(t) = self.sb_scroll_target {
+            let cur = self.sidebar_scroll as f32;
+            let d = t as f32 - cur;
+            if d.abs() <= 0.5 {
+                self.sidebar_scroll = t;
+                self.sb_scroll_target = None;
+            } else {
+                // 指数缓动：与帧率无关的"每帧靠近 24%"，60Hz 下约 150ms 到位
+                self.sidebar_scroll = (cur + d * 0.24).round() as i32;
+            }
+            dirty = true;
+        }
+
+        // —— 导航窗格：指示条 / 悬停条缓动到位 ——
+        match (self.sb_active_y, self.sb_active_target) {
+            (_, None) => self.sb_active_y = None,
+            (None, Some(t)) => self.sb_active_y = Some(t),
+            (Some(c), Some(t)) => {
+                let d = t - c;
+                if d.abs() <= 0.5 {
+                    self.sb_active_y = Some(t);
+                } else {
+                    self.sb_active_y = Some(c + d * 0.28);
+                    dirty = true;
+                }
+            }
+        }
+        match (self.sb_hover_y, self.sb_hover_target) {
+            (_, None) => self.sb_hover_y = None,
+            (None, Some(t)) => self.sb_hover_y = Some(t),
+            (Some(c), Some(t)) => {
+                let d = t - c;
+                if d.abs() <= 0.5 {
+                    self.sb_hover_y = Some(t);
+                } else {
+                    self.sb_hover_y = Some(c + d * 0.4);
+                    dirty = true;
+                }
+            }
+        }
+
+        // —— 图标放大（大图标 / 中图标）——
+        if !self.icon_zoom.is_empty() || !self.icon_zoom_tgt.is_empty() {
+            let mut keys: Vec<String> = self.icon_zoom.keys().cloned().collect();
+            for k in self.icon_zoom_tgt.keys() {
+                if !self.icon_zoom.contains_key(k) {
+                    keys.push(k.clone());
+                }
+            }
+            for k in keys {
+                let cur = self.icon_zoom.get(&k).copied().unwrap_or(0.0);
+                let tgt = self.icon_zoom_tgt.get(&k).copied().unwrap_or(0.0);
+                if (cur - tgt).abs() <= 0.002 {
+                    if tgt <= 0.0 {
+                        self.icon_zoom.remove(&k);
+                    } else {
+                        self.icon_zoom.insert(k, tgt);
+                    }
+                } else {
+                    self.icon_zoom.insert(k, cur + (tgt - cur) * 0.28);
+                    dirty = true;
+                }
+            }
+        }
+
+        // —— 图标回弹（详细信息 / 列表）：到点就出表 ——
+        if !self.icon_bounce.is_empty() {
+            self.icon_bounce.retain(|_, st| now.saturating_sub(*st) < ANIM_BOUNCE_MS);
+            dirty = true;
+        }
+
+        dirty
+    }
+
+    /// 按"还有没有动画"起 / 停定时器。状态没变就不动它 —— 每帧都 SetTimer
+    /// 会把 16ms 周期一直往后推，动画直接卡住不动。
+    pub fn sync_anim_timer(&mut self) {
+        let on = self.anim_active();
+        if on == self.anim_timer_on.get() {
+            return;
+        }
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
+            if on {
+                let _ = SetTimer(Some(self.hwnd), crate::TIMER_ANIM, 16, None);
+            } else {
+                let _ = KillTimer(Some(self.hwnd), crate::TIMER_ANIM);
+            }
+        }
+        self.anim_timer_on.set(on);
+    }
+
     /// 当前标签下标越界了就夹回来（删标签、拖走标签之后都要）。
     fn clamp_pane_active(&mut self, i: usize) {
         if i >= self.panes.len() {
@@ -2152,6 +2397,8 @@ impl App {
         // 从大图标的文件夹走进详细信息文件夹，视图跟着变才是对的。
         self.apply_view_for(&path);
         self.reload();
+        // 地址栏进入动画：面包屑从右沿滑进来（kind=0，不需要旧的那一串）
+        self.start_addr_anim(0, Vec::new());
         self.invalidate();
     }
 
@@ -2171,7 +2418,7 @@ impl App {
         let from = self.tab().path.clone();
         self.tab_mut().history_pos -= 1;
         let target = self.tab().history[self.tab().history_pos].clone();
-        self.apply_history(&target, Some(from));
+        self.apply_history(&target, Some(from), true);
     }
 
     pub fn go_forward(&mut self) {
@@ -2181,10 +2428,12 @@ impl App {
         let from = self.tab().path.clone();
         self.tab_mut().history_pos += 1;
         let target = self.tab().history[self.tab().history_pos].clone();
-        self.apply_history(&target, Some(from));
+        self.apply_history(&target, Some(from), false);
     }
 
-    fn apply_history(&mut self, target: &Path, select: Option<PathBuf>) {
+    fn apply_history(&mut self, target: &Path, select: Option<PathBuf>, back: bool) {
+        // 后退时地址栏要"把旧的那串向右滑出去"，所以切换前先把面包屑抄一份
+        let prev_crumbs = self.address_crumbs();
         // 离开前先把当前目录的滚动位置存起来（回头再回来要用）。
         let cur_key = norm_key(&self.tab().path);
         if !cur_key.is_empty() {
@@ -2215,6 +2464,8 @@ impl App {
         // 滚动位置是"目录"的属性，**排序一变行高/顺序就变**，老位置会指到
         // 完全无关的行 —— 与其猜，不如重新钳一次（clamp_scroll_to 走同一函数）。
         self.clamp_scroll_to(&crate::paint::layout_for(self));
+        // 后退 = 旧面包屑向右滑出（kind=1）；前进 = 新的从右滑入（kind=0）
+        self.start_addr_anim(if back { 1 } else { 0 }, prev_crumbs);
         self.invalidate();
     }
 
@@ -4507,6 +4758,12 @@ impl App {
         for drive in self.drives.keys().cloned().collect::<Vec<_>>() {
             let Some(rest) = full.strip_prefix(drive.as_str()) else { continue };
             self.sidebar_expanded.insert(SIDEBAR_THISPC.to_string());
+            // **盘符自己那一层也要展开**（第57轮）：节点的 key 是 `C:\`
+            // （带反斜杠，`node_key(PathBuf::from(root))`），而下面循环里累计的
+            // `acc` 从 `C:` 起、**不带**反斜杠 —— 少了这一行，盘符节点永远
+            // 不在展开集合里，树里就只有"此电脑"一个空箭头，"跟随展开到当前
+            // 文件夹"等于什么都没做。
+            self.sidebar_expanded.insert(drive.clone());
             let mut acc = drive.trim_end_matches('\\').to_string();
             for comp in rest.split('\\') {
                 if comp.is_empty() {
