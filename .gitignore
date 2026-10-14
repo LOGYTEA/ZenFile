@@ -7,6 +7,8 @@ workspace/target/
 workspace/.cargo/
 # 一次性排查脚本与截图产物
 probe_*.py
+dump_*.py
+__pycache__/
 shot*.png
 analyze.py
 band2.py
