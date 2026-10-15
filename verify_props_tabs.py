@@ -51,7 +51,7 @@ WM_LBUTTONDOWN, WM_LBUTTONUP = 0x0201, 0x0202
 WM_COMMAND = 0x0111
 READONLY, HIDDEN, ARCHIVE, SYSTEM = 0x1, 0x2, 0x20, 0x4
 
-BASE = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), "NexProps")
+BASE = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), "ZenProps")
 # 只放一个文件的目录：右键第 0 行必然是那个文件
 FDIR = os.path.join(BASE, "f_only")
 os.makedirs(FDIR, exist_ok=True)

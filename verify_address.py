@@ -59,7 +59,7 @@ WM_KEYDOWN = 0x0100
 WM_MOUSEMOVE = 0x0200
 HOVER = (0x3D, 0x3D, 0x3D)
 
-BASE = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), "NexAddr")
+BASE = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), "ZenAddr")
 os.makedirs(BASE, exist_ok=True)
 DEEP = os.path.join(BASE, "Level1", "Level2", "Level3", "Level4")
 os.makedirs(DEEP, exist_ok=True)

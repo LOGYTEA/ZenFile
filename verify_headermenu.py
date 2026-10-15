@@ -40,7 +40,7 @@ EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\Zen
 CFG_DIR = os.path.join(os.environ["APPDATA"], "ZenFile")
 APP_CFG = os.path.join(CFG_DIR, "settings.json")
 BAK = APP_CFG + ".bak"
-BASE = os.path.join(os.environ["TEMP"], "NexHeadMenu")
+BASE = os.path.join(os.environ["TEMP"], "ZenHeadMenu")
 
 VIEW_LEFT, VIEW_TOP, HEADER_H = 157, 74, 26
 ROW_H = 28                   # MENU_ROW * scale(1)

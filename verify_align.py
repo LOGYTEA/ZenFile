@@ -22,7 +22,7 @@ verify_env.isolate()
 
 EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\ZenFile.exe"
 # 素材一律落在 %TEMP%（用户明确要求：别往桌面写东西），且要够多才撑得出行距样本。
-BASE = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), "NexAlign")
+BASE = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), "ZenAlign")
 shutil.rmtree(BASE, ignore_errors=True)
 os.makedirs(BASE, exist_ok=True)
 for i in range(30):

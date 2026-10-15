@@ -53,7 +53,7 @@ EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\Zen
 WM_MOUSEMOVE = 0x0200
 WM_RBUTTONUP = 0x0205
 
-BASE = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), "NexMenuProbe")
+BASE = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), "ZenMenuProbe")
 os.makedirs(BASE, exist_ok=True)
 for i in range(6):
     open(os.path.join(BASE, f"f{i}.txt"), "w").write("x" * i)

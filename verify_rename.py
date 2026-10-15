@@ -73,7 +73,7 @@ WM_LBUTTONDOWN, WM_LBUTTONUP = 0x0201, 0x0202
 WM_RBUTTONUP, WM_MOUSEMOVE, WM_KEYDOWN = 0x0205, 0x0200, 0x0100
 WM_SETTEXT = 0x000C
 
-BASE = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), "NexRename")
+BASE = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), "ZenRename")
 shutil.rmtree(BASE, ignore_errors=True)
 ONE = os.path.join(BASE, "one")
 BULK = os.path.join(BASE, "bulk")

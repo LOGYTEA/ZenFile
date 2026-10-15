@@ -71,7 +71,7 @@ WM_XBUTTONDOWN = 0x020B
 WM_KEYDOWN = 0x0100
 WM_CLOSE = 0x0010
 
-BASE = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), "NexVerify9")
+BASE = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), "ZenVerify9")
 NOTEPAD = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "System32", "notepad.exe")
 
 SEL_BG = (0x47, 0x47, 0x47)      # selection_bg

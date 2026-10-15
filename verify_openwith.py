@@ -67,7 +67,7 @@ EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\Zen
 WM_LBUTTONDOWN, WM_LBUTTONUP = 0x0201, 0x0202
 WM_RBUTTONUP, WM_MOUSEMOVE = 0x0205, 0x0200
 
-BASE = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), "NexOpenWith")
+BASE = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), "ZenOpenWith")
 # 只放一个文件：右键第 0 行必然是那个文件
 FDIR = os.path.join(BASE, "f")
 os.makedirs(FDIR, exist_ok=True)

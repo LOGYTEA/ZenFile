@@ -2,7 +2,7 @@
 
 分两轮，素材都造在 Desktop 下：
 
-  素材目录：%TEMP%/NexIconVerify（**不写桌面**）
+  素材目录：%TEMP%/ZenIconVerify（**不写桌面**）
 
   轮 1（合成 ini）：A_IconFile / B_IconResource / C_Plain
         —— 覆盖 IconFile+IconIndex、IconResource+环境变量展开、无 ini 三种情况。
@@ -58,7 +58,7 @@ EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\Zen
 WM_GETTEXT = 0x000D
 
 # 素材一律落在 TEMP：测试脚本不许往用户桌面写东西
-DESK = os.path.join(os.environ.get("TEMP", "C:\\Windows\\Temp"), "NexIconVerify")
+DESK = os.path.join(os.environ.get("TEMP", "C:\\Windows\\Temp"), "ZenIconVerify")
 ICO = os.path.join(DESK, "nex_red.ico")
 ICO2 = os.path.join(DESK, "nex_green.ico")
 
@@ -280,7 +280,7 @@ if __name__ == "__main__":
     n2 = sh.ExtractIconExW(ICO2, 0, ctypes.byref(wt.HICON()), None, 1)
 
     os.makedirs(DESK, exist_ok=True)
-    base1 = os.path.join(DESK, "NexIconTest")
+    base1 = os.path.join(DESK, "ZenIconTest")
     rmdir(base1)
     make_ico(ICO, (255, 0, 0))
     make_ico(ICO2, (0, 255, 0))
@@ -296,7 +296,7 @@ if __name__ == "__main__":
         _json.dump({"files": {"view": {"show_system": True, "show_hidden": True}}}, _f)
     ok1 = run(base1, exp1, "轮1 合成 desktop.ini")
 
-    base2 = os.path.join(DESK, "NexRealIni")
+    base2 = os.path.join(DESK, "ZenRealIni")
     rmdir(base2)
     exp2 = setup_real(base2)
     ok2 = run(base2, exp2, "轮2 系统真实 desktop.ini")

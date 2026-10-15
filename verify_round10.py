@@ -80,7 +80,7 @@ HTMINBUTTON, HTMAXBUTTON, HTCLOSE = 8, 9, 20
 WINDOW_BG = (0x20, 0x20, 0x20)
 SEL_BG = (0x47, 0x47, 0x47)
 
-BASE = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), "NexVerify10")
+BASE = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), "ZenVerify10")
 NOTEPAD = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "System32", "notepad.exe")
 
 ok_all = True

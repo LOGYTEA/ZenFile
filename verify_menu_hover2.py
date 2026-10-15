@@ -56,7 +56,7 @@ g.DeleteDC.argtypes = [ctypes.c_void_p]
 
 EXE = r"C:\Users\Administrator\Desktop\project\File\workspace\target\release\ZenFile.exe"
 WM_RBUTTONUP = 0x0205
-BASE = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), "NexHover54")
+BASE = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), "ZenHover54")
 os.makedirs(BASE, exist_ok=True)
 for i in range(6):
     open(os.path.join(BASE, "f%d.txt" % i), "w").write("x" * i)

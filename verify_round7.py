@@ -50,7 +50,7 @@ WM_RBUTTONUP = 0x0205
 WM_MOUSEMOVE = 0x0200
 MENU_ROW = 28
 
-BASE = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), "NexVerify7")
+BASE = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), "ZenVerify7")
 
 
 def kill_all():

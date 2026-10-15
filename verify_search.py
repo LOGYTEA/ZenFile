@@ -50,7 +50,7 @@ WM_SETTEXT = 0x000C
 WM_KEYDOWN = 0x0100
 CACHE = os.path.join(os.environ.get("LOCALAPPDATA", ""), "ZenFile", "index", "C.bin")
 
-BASE = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), "NexSearch")
+BASE = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), "ZenSearch")
 A = os.path.join(BASE, "A")
 B = os.path.join(BASE, "B")
 D = os.path.join(B, "deep")
