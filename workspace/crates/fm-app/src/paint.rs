@@ -26,6 +26,7 @@ use windows::Win32::Foundation::HINSTANCE;
 use windows::Win32::UI::WindowsAndMessaging::HICON;
 
 use crate::app::{human, App};
+use crate::app::{CAP_CLOSE_TAB, CAP_MENU, CAP_NEW_TAB, CAP_TOGGLE};
 use crate::icons::wide;
 use crate::theme::Metrics;
 use crate::theme::Theme;
@@ -1318,21 +1319,21 @@ pub fn paint_title_bar(app: &mut App, hdc: HDC, l: &Layout) {
         // 指示保留在各窗格顶上 —— 一个是总览、一个是局部，不算重复。
         paint_tab_strip(app, hdc, l, app.focus_pane);
         // （原"- ZenFile"字样已按用户要求删掉：标题栏右侧那块地盘留给标签）
+        //
+        // 第63轮：**先记动画，再画**。`note_cap_hover` 只在"这一帧刚变成悬停"
+        // 时插一条记录（`or_insert` 保证同一键不会重置），而绘制端随后调
+        // `cap_phase()` 读到它 —— 顺序反了就永远读到上一帧的相位（恒为 0），
+        // 表现为"动画不播"。
+        let toggle_on = app.hover_chrome & crate::app::HOVER_SIDEBAR_TOGGLE != 0;
+        let menu_on = app.hover_chrome & crate::app::HOVER_MENU_BTN != 0;
+        app.note_cap_hover(CAP_TOGGLE, toggle_on);
+        app.note_cap_hover(CAP_MENU, menu_on);
+        for w in [1u8, 2, 3] {
+            app.note_cap_hover(w, app.hover_caption == w);
+        }
         // 侧栏折叠开关（最左）与更多菜单（最小化左侧）
-        draw_chrome_button(
-            app,
-            hdc,
-            &l.sidebar_toggle,
-            ChromeGlyph::PaneToggle,
-            app.hover_chrome & crate::app::HOVER_SIDEBAR_TOGGLE != 0,
-        );
-        draw_chrome_button(
-            app,
-            hdc,
-            &l.menu_btn,
-            ChromeGlyph::MoreDots,
-            app.hover_chrome & crate::app::HOVER_MENU_BTN != 0,
-        );
+        draw_chrome_button(app, hdc, &l.sidebar_toggle, ChromeGlyph::PaneToggle, toggle_on);
+        draw_chrome_button(app, hdc, &l.menu_btn, ChromeGlyph::MoreDots, menu_on);
         // 标题按钮（自绘）。命中与动作由 WM_NC* 消息自己接管 —— 客户区已扩展到
         // 整窗，系统那套非客户区默认处理在这里靠不住（三个键点不动）。
         // 悬停/按下都要有反馈：没有反馈的按钮在用户眼里就是"坏的"。
@@ -1395,6 +1396,11 @@ fn paint_tab_strip(app: &mut App, hdc: HDC, l: &Layout, pi: usize) {
             }
         }
 
+        // 第63轮：标签 × 与 `+` 键的动画也在这里起手。放在绘制循环**之前**，
+        // 否则标签 i 的 × 读到的是"上一帧"的相位（恒 0）。
+        app.note_cap_hover(CAP_CLOSE_TAB, app.hover_tab_close.is_some());
+        app.note_cap_hover(CAP_NEW_TAB, app.hover_new_tab);
+
         for (i, tab) in app.panes[pi].tabs.iter().enumerate() {
             let r = l.tab_rect(i, n, &app.metrics);
             let hovered = pi == app.focus_pane && app.hover_tab == Some(i);
@@ -1446,13 +1452,20 @@ fn paint_tab_strip(app: &mut App, hdc: HDC, l: &Layout, pi: usize) {
             // 早先学资源管理器"只画当前/悬停那个"，结果用户找不到 ×，反馈就是
             // "标签关不掉" —— 看不见的按钮等于不存在。代价是标签栏稍挤一点，
             // 但"能关"比"像"重要。非活动标签的 × 画淡一点，视觉重心仍在当前标签。
+            //
+            // 第63轮：底色块**只在鼠标真压在 × 上时**亮（之前跟着整个标签的
+            // hover 一起亮，鼠标离 × 还差一个字宽它就亮了），并且 × 在悬停
+            // 瞬间**放大一下**再归位。
             {
                 let cr = l.tab_close_rect(i, n, &app.metrics);
-                if hovered {
-                    fill_radius(app, hdc, "title.tab", &cr, t.hover_bg, None);
+                let on_close = app.hover_tab_close == Some(i);
+                let cp = if on_close { app.cap_phase(CAP_CLOSE_TAB) } else { 0.0 };
+                if on_close {
+                    fill_radius(app, hdc, "title.button", &cr, t.hover_bg, None);
                 }
                 let cc = if i == app.panes[pi].active || hovered { t.text } else { t.text_dim };
-                if !draw_ui_icon(hdc, crate::icon_theme::Ui::Close, &cr, (11.0 * app.metrics.scale).round() as i32, cc) {
+                let ics = (((11.0 * app.metrics.scale).round() as f32) * (1.0 + 0.45 * cp)).round() as i32;
+                if !draw_ui_icon(hdc, crate::icon_theme::Ui::Close, &cr, ics, cc) {
                     SetTextColor(hdc, cc);
                     let g = glyph_font(app.metrics.scale);
                     let old_g = SelectObject(hdc, g.into());
@@ -1465,7 +1478,9 @@ fn paint_tab_strip(app: &mut App, hdc: HDC, l: &Layout, pi: usize) {
         // 新建标签（+）：紧跟最后一个标签
         let plus = l.new_tab_rect(n, &app.metrics);
         if l.new_tab_visible && plus.right < l.tabs.right {
-            draw_chrome_button(app, hdc, &plus, ChromeGlyph::Plus, false);
+            // 第63轮：`+` 键原先恒传 `hover=false`，画出来是个**永远不响**的
+            // 按钮。现在把真实悬停态接上，底色块与形变都跟其他键同一套。
+            draw_chrome_button(app, hdc, &plus, ChromeGlyph::Plus, app.hover_new_tab);
         }
         // （原"- ZenFile"字样已按用户要求删掉：标题栏右侧那块地盘留给标签）
         SelectObject(hdc, old);
@@ -1685,37 +1700,64 @@ fn draw_ui_icon(hdc: HDC, kind: crate::icon_theme::Ui, r: &RECT, size: i32, colo
     true
 }
 
-fn draw_chrome_glyph(app: &App, hdc: HDC, r: &RECT, which: ChromeGlyph) {
+/// 标题栏自有键的字形。`phase` 是 `App::cap_phase(which)`（0=静止，1=峰值）。
+///
+/// 第63轮：三个键各有各的"内部动法"，都是**几何形变而不是换图**：
+/// - 侧栏开关：左边那栏实心面板宽度随 phase 收窄（像真的在折叠）
+/// - 更多菜单：三条杠逐条**左右错开**（上/中/下往不同方向推）
+/// - 新建标签：整条十字**转 45°**，摆出 X 的姿态再转回来
+///
+/// 形变都作用在字形自身的绘制参数上，所以主题接管（`draw_ui_icon`）时
+/// 走的是同一条路，不会有两套动画。
+fn draw_chrome_glyph(app: &App, hdc: HDC, r: &RECT, which: ChromeGlyph, phase: f32) {
+    let s = app.metrics.scale;
+    // (边长系数, 自转角度)。取自上表。
+    let (k, spin) = match which {
+        ChromeGlyph::PaneToggle => (1.0 + 0.10 * phase, 0.0),
+        ChromeGlyph::MoreDots => (1.0 + 0.14 * phase, 0.0),
+        ChromeGlyph::Plus => (1.0 + 0.30 * phase, 45.0 * phase),
+    };
     // 主题接管时（第49轮）：按钮字形也走自绘主题。直角黑白（默认）恒返回
     // false → 下面的 GDI 手绘照旧，零回归。
-    let s = app.metrics.scale;
-    let (kind, sz) = match which {
-        ChromeGlyph::PaneToggle => (crate::icon_theme::Ui::PaneToggle, (17.0 * s).round() as i32),
-        ChromeGlyph::MoreDots => (crate::icon_theme::Ui::Hamburger, (15.0 * s).round() as i32),
-        ChromeGlyph::Plus => (crate::icon_theme::Ui::Plus, (13.0 * s).round() as i32),
+    let (kind, sz0) = match which {
+        ChromeGlyph::PaneToggle => (crate::icon_theme::Ui::PaneToggle, 17.0),
+        ChromeGlyph::MoreDots => (crate::icon_theme::Ui::Hamburger, 15.0),
+        ChromeGlyph::Plus => (crate::icon_theme::Ui::Plus, 13.0),
     };
-    if draw_ui_icon(hdc, kind, r, sz, app.theme.text) {
-        return;
-    }
-    let s = app.metrics.scale;
+    let sz = ((sz0 * s).round() as f32 * k).round() as i32;
     let cx = (r.left + r.right) / 2;
     let cy = (r.top + r.bottom) / 2;
+    let gr = RECT { left: cx - sz / 2, top: cy - sz / 2, right: cx - sz / 2 + sz, bottom: cy - sz / 2 + sz };
+    // 主题接管时**一律走主题图标**（只看尺寸变化，不看 spin）。
+    //
+    // 别写成 `if spin.abs() <= 0.01 && draw_ui_icon(...)`：那样 `+` 在动画
+    // 期间会从主题圆角图标**切回 GDI 直角手绘**，动画结束又切回去 ——
+    // 看起来是"字形先变成另一个东西再变回来"，比不旋转难看得多。
+    // 主题图标没法绕中心旋转（要走贴图变换），所以主题下 `+` 只有缩放，
+    // 旋转是直角黑白主题才有的额外一档。
+    if draw_ui_icon(hdc, kind, &gr, sz, app.theme.text) {
+        return;
+    }
     unsafe {
         let pen = CreatePen(PS_SOLID, (1.0 * s).round().max(1.0) as i32, app.theme.text);
         let old_pen = SelectObject(hdc, pen.into());
         let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
         match which {
             ChromeGlyph::PaneToggle => {
-                let w = (14.0 * s).round() as i32;
-                let h = (11.0 * s).round() as i32;
+                let w = ((14.0 * s).round() as f32 * k).round() as i32;
+                let h = ((11.0 * s).round() as f32 * k).round() as i32;
                 let left = cx - w / 2;
                 let top = cy - h / 2;
                 // 外框
                 let _ = Rectangle(hdc, left, top, left + w, top + h);
-                // 左侧填实的一栏（宽 5px）：表示"被收起的那一栏"
-                let b = CreateSolidBrush(app.theme.text);
-                FillRect(hdc, &RECT { left: left + 1, top: top + 1, right: left + (5.0 * s).round() as i32, bottom: top + h - 1 }, b);
-                let _ = DeleteObject(b.into());
+                // 左侧填实的一栏（宽 5px，phase 越大越窄）：表示"被收起的那一栏"
+                // —— 悬停时这栏往里收，像真的在折叠。
+                let panel = (((5.0 * s).round() as f32) * (1.0 - 0.7 * phase)).round() as i32;
+                if panel > 0 {
+                    let b = CreateSolidBrush(app.theme.text);
+                    FillRect(hdc, &RECT { left: left + 1, top: top + 1, right: left + 1 + panel, bottom: top + h - 1 }, b);
+                    let _ = DeleteObject(b.into());
+                }
             }
             ChromeGlyph::MoreDots => {
                 // **三条杠**（第33轮：用户要求把"更多"菜单从三个点改成
@@ -1725,26 +1767,48 @@ fn draw_chrome_glyph(app: &App, hdc: HDC, r: &RECT, which: ChromeGlyph) {
                 // 尺寸与三个窗口键（最小化/最大化/关闭）**同一套口径**：
                 // 宽 11px、高 11px、线宽 1px，所以它跟旁边那排键看上去
                 // 是同一族，不会一个胖一个瘦。
-                let w = (11.0 * s).round() as i32;
+                //
+                // 第63轮：上/中/下三条随 phase **逐条左右错开**（-1/0/+1），
+                // 一眼能看出"这排东西在动"，而不是整块一起抖。
+                let w = ((11.0 * s).round() as f32 * k).round() as i32;
                 let th = (1.0 * s).round().max(1.0) as i32;
                 // 三条线的 y 间距：4px（11px 的框里放 3 条，视觉重心居中）
                 let step = (4.0 * s).round().max(3.0) as i32;
                 let b = CreateSolidBrush(app.theme.text);
-                for k in -1..=1 {
-                    let y = cy + k * step - th / 2;
-                    let _ = FillRect(hdc, &RECT { left: cx - w / 2, top: y, right: cx - w / 2 + w, bottom: y + th }, b);
+                for (kk, yk) in [(-1, -1), (0, 0), (1, 1)] {
+                    let y = cy + yk * step - th / 2;
+                    let dx = (kk as f32 * (2.0 * s) * phase).round() as i32;
+                    let _ = FillRect(hdc, &RECT { left: cx - w / 2 + dx, top: y, right: cx - w / 2 + dx + w, bottom: y + th }, b);
                 }
                 let _ = DeleteObject(b.into());
             }
             ChromeGlyph::Plus => {
                 // 十字用两个**实心细条**画，不用两条 1px 线：GDI 的线在
                 // 非整数位置会落半格，交点处还会缺一个像素，看着就是"歪的 +"。
-                let arm = (9.0 * s).round() as i32;
+                //
+                // 第63轮：悬停时整条十字转 45°。用 **LineTo** 而不是实心条 ——
+                // 实心条没法转，只有斜线能摆出对角姿态。
+                let arm = ((9.0 * s).round() as f32 * k).round() as i32;
                 let th = (1.0 * s).round().max(1.0) as i32;
                 let b = CreateSolidBrush(app.theme.text);
-                FillRect(hdc, &RECT { left: cx - arm / 2, top: cy - th / 2, right: cx + arm / 2 + arm % 2, bottom: cy - th / 2 + th }, b);
-                FillRect(hdc, &RECT { left: cx - th / 2, top: cy - arm / 2, right: cx - th / 2 + th, bottom: cy + arm / 2 + arm % 2 }, b);
-                let _ = DeleteObject(b.into());
+                if spin.abs() <= 0.01 {
+                    FillRect(hdc, &RECT { left: cx - arm / 2, top: cy - th / 2, right: cx + arm / 2 + arm % 2, bottom: cy - th / 2 + th }, b);
+                    FillRect(hdc, &RECT { left: cx - th / 2, top: cy - arm / 2, right: cx - th / 2 + th, bottom: cy + arm / 2 + arm % 2 }, b);
+                    let _ = DeleteObject(b.into());
+                } else {
+                    // 转 45°：两条对角线。实心条没法转，只有斜线能摆出对角姿态 ——
+                    // 笔画略细，但在这个尺寸上"在转"这件事比粗细更显眼。
+                    let _ = DeleteObject(b.into());
+                    let p2 = CreatePen(PS_SOLID, th.max(1), app.theme.text);
+                    let oldp2 = SelectObject(hdc, p2.into());
+                    let diag = ((arm as f32) * std::f32::consts::FRAC_1_SQRT_2).round() as i32;
+                    MoveToEx(hdc, cx - diag, cy - diag, None);
+                    LineTo(hdc, cx + diag, cy + diag);
+                    MoveToEx(hdc, cx + diag, cy - diag, None);
+                    LineTo(hdc, cx - diag, cy + diag);
+                    SelectObject(hdc, oldp2);
+                    let _ = DeleteObject(p2.into());
+                }
             }
         }
         SelectObject(hdc, old_brush);
@@ -1759,8 +1823,37 @@ fn draw_chrome_glyph(app: &App, hdc: HDC, r: &RECT, which: ChromeGlyph) {
 /// 字体时整排键位都变成空心方块，而它又不像菜单图标那样能退回系统图标 ——
 /// 标题栏是最不该出错的地方。这三个符号本来就是纯几何图形，用 MoveTo/LineTo
 /// 画既不会缺字，也和资源管理器画出来的完全一样。
-fn draw_caption_glyph(app: &App, hdc: HDC, r: &RECT, which: u8) {
+///
+/// 第63轮：`phase` 是 `App::cap_phase(which)`，0=静止、1=弹到最大。
+/// **形变方向按键的语义给**，这样"弹一下"本身就有信息：
+///
+/// | 键 | 形变 | 为什么 |
+/// |---|---|---|
+/// | 最大化 | 放大 1.35x | "往上顶"，直觉上是变大 |
+/// | 最小化 | 缩到 0.82x + 下移 | "沉下去"，与缩到窗口语义一致 |
+/// | 关闭 | 缩到 0.7x | "收起来"，越收越小的消失感 |
+///
+/// 三者都用**同一个 `sin(πt)` 包络**（`cap_phase` 里算好），所以播放一次就
+/// 归位，不留残余偏移。
+fn draw_caption_glyph(app: &App, hdc: HDC, r: &RECT, which: u8, phase: f32) {
     let s = app.metrics.scale;
+    // (缩放系数, 纵向位移)。取自上表。
+    let (k, dy) = match which {
+        1 => (1.0 - 0.18 * phase, (2.0 * s).round() as i32 * phase as i32),
+        2 => (1.0 + 0.35 * phase, 0),
+        _ => (1.0 - 0.30 * phase, 0),
+    };
+    // 符号框：按 k 在命中区里缩放并按 dy 竖移。
+    let (cx0, cy0) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+    let base = (13.0 * s).round() as i32; // 主题字形边长
+    let sz = ((base as f32 * k).round() as i32).max(1);
+    let half_sz = sz / 2;
+    let gr = RECT {
+        left: cx0 - half_sz,
+        top: cy0 + dy - half_sz,
+        right: cx0 - half_sz + sz,
+        bottom: cy0 + dy - half_sz + sz,
+    };
     // 主题接管时走自绘字形；还原态（两个错开方框）用专门的 Restore 字形。
     let kind = match which {
         1 => Some(crate::icon_theme::Ui::Min),
@@ -1774,14 +1867,14 @@ fn draw_caption_glyph(app: &App, hdc: HDC, r: &RECT, which: u8) {
         _ => Some(crate::icon_theme::Ui::Close),
     };
     if let Some(k) = kind {
-        if draw_ui_icon(hdc, k, r, (13.0 * s).round() as i32, app.theme.text) {
+        if draw_ui_icon(hdc, k, &gr, sz, app.theme.text) {
             return;
         }
     }
-    let cx = (r.left + r.right) / 2;
-    let cy = (r.top + r.bottom) / 2;
+    let cx = (gr.left + gr.right) / 2;
+    let cy = (gr.top + gr.bottom) / 2;
     // 符号本体 11px（100% 缩放）：1px 笔画在小尺寸下才不至于糊成一团。
-    let half = (5.5 * s).round() as i32;
+    let half = ((5.5 * s).round() as f32 * k).round() as i32;
     let box_w = half * 2;
     let th = (1.0 * s).round().max(1.0) as i32;
     unsafe {
@@ -1863,6 +1956,14 @@ const CAPTION_HOVER_GAP: i32 = 5;
 /// **底色走 `fill_radius` + `title.button`**，和侧栏折叠开关、更多菜单键
 /// 同一批绘制函数 —— 那两个键第33轮就已经是"悬停浮出圆角块"了，只有三大
 /// 金刚键还停在铺满标题栏的老写法上，现在三者终于一致。颜色一个没动。
+///
+/// 第63轮：字形按 `cap_phase(which)` 做**各不相同的形变**，弹一下再归位：
+/// - 最大化：放大一点（"顶上去"）
+/// - 最小化：缩小 + 下移（"沉下去"）
+/// - 关闭：缩小一点（"收起来"）
+///
+/// 形变作用于**字形**，底色块不参与 —— 底色是"这个键被选中了"的静态提示，
+/// 让它跟着一起抖会像按钮在抽搐。
 fn draw_caption_button(app: &App, hdc: HDC, r: &RECT, which: u8) {
     let t = &app.theme;
     unsafe {
@@ -1880,7 +1981,7 @@ fn draw_caption_button(app: &App, hdc: HDC, r: &RECT, which: u8) {
         }
         // 字形仍按**整条命中区**居中：视觉上仍是标题栏正中那个符号，
         // 只有底色块缩小了，不该顺手把符号也挪走。
-        draw_caption_glyph(app, hdc, r, which);
+        draw_caption_glyph(app, hdc, r, which, app.cap_phase(which));
     }
 }
 
@@ -1897,7 +1998,7 @@ fn caption_hover_rect(r: &RECT) -> RECT {
     RECT { left: x, top: cy - h / 2, right: x + h, bottom: cy - h / 2 + h }
 }
 
-/// 标题栏自有按钮（侧栏开关 / 更多菜单）：带悬停底色，观感对齐资源管理器。
+/// 标题栏自有按钮（侧栏开关 / 更多菜单 / 新建标签）：带悬停底色与形变动画。
 ///
 /// **「更多」这个键是主菜单入口**，第33轮用户要求"永远自己就带一层白色背景"，
 /// 但第62轮那条要求把"背景"重新定义了一遍：**不是铺满整条标题栏的竖条，
@@ -1905,7 +2006,12 @@ fn caption_hover_rect(r: &RECT) -> RECT {
 /// 悬停时（而更多键是常驻的）等于标题栏上永远糊着一块 44 宽的色条。
 /// 现在底色块和三大金刚键走**同一个** `caption_hover_rect`，四个键彻底一致。
 ///
-/// 「侧栏折叠开关」保持"平时透明、hover 才亮"（它真的是那种次要控件），
+/// 第63轮：`which` 用来取 `cap_phase` 的形变相位，也决定"内部细节"怎么动：
+/// - 侧栏开关：左侧那栏面板**横向收放**（像真的在折叠）
+/// - 更多菜单：三条杠**左右错开**一下（像在呼吸）
+/// - 新建标签：十字**转 45°**变成对角（第一次见"加号变叉"的动感）
+///
+/// 侧栏折叠开关保持"平时透明、hover 才亮"（它真的是那种次要控件），
 /// 但亮起来的形状同样跟着改小。
 fn draw_chrome_button(app: &App, hdc: HDC, r: &RECT, glyph: ChromeGlyph, hover: bool) {
     let t = &app.theme;
@@ -1922,7 +2028,12 @@ fn draw_chrome_button(app: &App, hdc: HDC, r: &RECT, glyph: ChromeGlyph, hover: 
             // 第62轮：底色块收成固定大小，不再占满整条标题栏。
             fill_radius(app, hdc, "title.button", &caption_hover_rect(r), t.hover_bg, None);
         }
-        draw_chrome_glyph(app, hdc, r, glyph);
+        let which = match glyph {
+            ChromeGlyph::PaneToggle => CAP_TOGGLE,
+            ChromeGlyph::MoreDots => CAP_MENU,
+            ChromeGlyph::Plus => CAP_NEW_TAB,
+        };
+        draw_chrome_glyph(app, hdc, r, glyph, app.cap_phase(which));
     }
 }
 

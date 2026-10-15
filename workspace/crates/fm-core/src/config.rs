@@ -112,6 +112,11 @@ pub struct AnimConfig {
     /// 地址栏：进入目录时面包屑从右侧滑入并回弹一下；返回时向右滑出。
     #[serde(default = "default_true")]
     pub address: bool,
+    /// 标题栏按键：鼠标刚划上去时，按钮与里面的符号**各弹一下**
+    /// （最大化放大、最小化缩下去、关闭缩起来、侧栏开关收放面板），
+    /// 播完一次归位。这是"一次性过渡"，不是常驻循环。
+    #[serde(default = "default_true")]
+    pub caption: bool,
 }
 
 fn default_true() -> bool {
@@ -120,7 +125,13 @@ fn default_true() -> bool {
 
 impl Default for AnimConfig {
     fn default() -> Self {
-        Self { sidebar: true, icon_zoom: true, icon_bounce: true, address: true }
+        Self {
+            sidebar: true,
+            icon_zoom: true,
+            icon_bounce: true,
+            address: true,
+            caption: true,
+        }
     }
 }
 

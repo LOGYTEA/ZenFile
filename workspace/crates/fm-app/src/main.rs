@@ -1274,6 +1274,22 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             }
             // 标签栏悬停：决定了哪个标签显示关闭按钮
             let hover_tab = hit_tab(app, &l, x, y);
+            // 第63轮：`+`（新建标签）与标签上的 `×` 各自的悬停。
+            //
+            // **两者都必须独立于 `hover_tab` 判**：`hover_tab` 在鼠标落在标签
+            // **任意位置**时都为真，若拿它当 `×` 的悬停判据，鼠标离 `×` 还有
+            // 一个字宽时 `×` 就亮了，而真压在 `×` 上时和"标签悬停"分不出来。
+            // 两个悬停必须有各自的命中矩形。
+            let hover_tab_close = if y >= l.tabs.top && y <= l.tabs.bottom {
+                let pn = pl_tab_count(app);
+                (0..pn).find(|&i| inside(&l.tab_close_rect(i, pn, &app.metrics), x, y))
+            } else {
+                None
+            };
+            let hover_new_tab = {
+                let plus = l.new_tab_rect(pl_tab_count(app), &app.metrics);
+                l.new_tab_visible && plus.right < l.tabs.right && inside(&plus, x, y)
+            };
             // 目录栏最右侧「批量重命名」按钮的悬停。虚拟视图里不画，就也不该有悬停态
             let hover_bulk = paint::bulk_rename_available(app) && inside(&l.bulk_btn, x, y);
             // 内容区里鼠标指着的**条目**（条目下标，不是行号）。
@@ -1439,6 +1455,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 || hover_rec_btn != app.hover_recycle_btn
                 || hover_set_tab != app.settings_hover_tab
                 || hover_set_card != app.settings_hover_card
+                || hover_tab_close != app.hover_tab_close
+                || hover_new_tab != app.hover_new_tab
             {
                 app.settings_hover_tab = hover_set_tab;
                 app.settings_hover_card = hover_set_card;
@@ -1458,6 +1476,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 app.settings_hover = hover_setting;
                 app.sidebar_hover = hover_sidebar;
                 app.addr_hover = hover_addr;
+                app.hover_tab_close = hover_tab_close;
+                app.hover_new_tab = hover_new_tab;
             // 三大金刚键的 hover **只**在 WM_NCMOUSEMOVE 里更新（那才是
             // 非客户区消息）。鼠标从标题栏划进客户区时走的是这条
             // WM_MOUSEMOVE，而这里原本没清 `hover_caption` ——

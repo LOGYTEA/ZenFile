@@ -585,6 +585,17 @@ pub struct App {
     anim_last: std::cell::Cell<u64>,
     /// 地址栏的进 / 出场动画。`kind`: 0=进入（从右滑入 + 回弹），1=退出（向右滑出）。
     pub addr_anim: Option<AddrAnim>,
+    /// 标题栏按键的悬停动画（键编号 -> 状态）。键编号见 `CAP_*`。
+    ///
+    /// 第63轮：三大金刚键 + 侧栏开关 + 更多菜单 + 新建标签，鼠标刚划上去时
+    /// 各弹一下（形变方向按键的语义不同），播完归位。**受设置-交互页
+    /// 「标题栏按键」那个开关控制**，关掉就完全不进这张表。
+    pub cap_anim: HashMap<u8, CapAnim>,
+    /// 已经弹过一次的键（`cap_anim` 出表后靠它挡住重复触发）。
+    ///
+    /// 没有这张表的话，鼠标在同一个键上停满 420ms 后下一帧又会插一条新记录，
+    /// 动画**无限循环**，16ms 定时器也永远 Kill 不掉。
+    pub cap_fired: HashSet<u8>,
     /// 导航窗格"当前位置"指示条**此刻画在哪个 y**（每帧向 target 缓动）。
     pub sb_active_y: Option<f32>,
     /// 上面那个 y 这一帧的目标（由 paint 按行几何写入）。
@@ -616,6 +627,15 @@ pub struct App {
     pub focus_visible: bool,
     /// 标题栏上鼠标悬停的标签序号（用于画关闭按钮）。
     pub hover_tab: Option<usize>,
+    /// 鼠标正悬停的标签**关闭按钮（×）**。
+    ///
+    /// 之前只记 `hover_tab`（落在标签任意位置都为真），于是 × 的底色跟着整个
+    /// 标签一起亮 —— 鼠标离 × 还有一个字宽时它就亮了，鼠标真压在 × 上时反而
+    /// 和"标签悬停"分不出来。两者必须**分开记**。
+    pub hover_tab_close: Option<usize>,
+    /// 鼠标正悬停的「新建标签（+）」键。第63轮加：它原先恒不传 hover，
+    /// 画出来是个永远不响的按钮。
+    pub hover_new_tab: bool,
     /// 状态栏布局切换按钮的悬停位：0=无，1=大图标，2=详细信息。
     pub hover_view_btn: u8,
     /// "返回/上一级之后要把哪一项选中"。
@@ -969,6 +989,36 @@ pub const ANIM_ZOOM: f32 = 0.10;
 pub const ANIM_BOUNCE_AMP: f32 = 0.18;
 pub const ANIM_BOUNCE_FREQ: f32 = 1.6;
 
+/// 标题栏按键悬停动画：一次播放完就归位的时长（ms）。
+pub const ANIM_CAPTION_MS: u64 = 420;
+
+/// 标题栏按键的编号（`paint::draw_caption_button` 的 `which` 同口径，
+/// 0 号留给"侧栏开关 / 更多菜单 / 新建标签"那类自有键）。
+pub const CAP_MIN: u8 = 1;
+pub const CAP_MAX: u8 = 2;
+pub const CAP_CLOSE: u8 = 3;
+/// `which` 取这两个值时表示自有键（侧栏开关 / 更多菜单 / 新建标签）。
+pub const CAP_TOGGLE: u8 = 10;
+pub const CAP_MENU: u8 = 11;
+pub const CAP_NEW_TAB: u8 = 12;
+/// 标签上的关闭按钮（×）。**单独一个编号**，不能复用 `CAP_CLOSE`：
+/// 三个窗口键任何时候只有一个可能悬停，而标签 × 是**每个标签都有一个**，
+/// 共用一个 key 会让"记一个键的动画"变成"记一堆键的动画"。
+pub const CAP_CLOSE_TAB: u8 = 20;
+
+/// 一个标题栏按键的悬停动画（弹一下 → 归位）。
+///
+/// 只存"开始时刻"：进度每帧现算即可。`start` 用 `Option` 包起来是有意的 ——
+/// 键被移开鼠标时**整条记录删掉**（而不是把时刻改小），这样"还有没有动画在跑"
+/// 的判据和"这一刻该画成什么样"是同一个数据源，不会出现"定时器还挂着但画的是
+/// 静止态"这种空转。
+#[derive(Clone, Copy)]
+pub struct CapAnim {
+    /// 开始时刻（`GetTickCount64()`）
+    pub start: u64,
+}
+
+
 /// 地址栏面包屑的一节。
 #[derive(Clone)]
 pub struct Crumb {
@@ -1240,6 +1290,8 @@ impl App {
             anim_timer_on: std::cell::Cell::new(false),
             anim_last: std::cell::Cell::new(0),
             addr_anim: None,
+            cap_anim: HashMap::new(),
+            cap_fired: HashSet::new(),
             sb_active_y: None,
             sb_active_target: None,
             sb_hover_y: None,
@@ -1254,6 +1306,8 @@ impl App {
             display_names: HashMap::new(),
             focus_visible: false,
             hover_tab: None,
+            hover_tab_close: None,
+            hover_new_tab: false,
             hover_view_btn: 0,
             pending_select: None,
             pending_rename: false,
@@ -2016,6 +2070,60 @@ impl App {
         self.sync_anim_timer();
     }
 
+    /// 记一笔"这个标题栏按键刚被划到（或刚被划开）"，让它弹一下。
+    ///
+    /// **"只弹一次"靠 `cap_fired` 这张表保证**，不是靠 `cap_anim` 本身：
+    /// 动画播完 420ms 就从 `cap_anim` 出表，而此时鼠标多半还停在那个键上 ——
+    /// 下一帧 `on=true` 又会插一条新记录，于是动画**无限循环**下去，定时器
+    /// 也永远 Kill 不掉。所以记过的键要进 `cap_fired`，只有"移开又划回来"
+    /// （`on` 先 false 后 true）才允许重播。这与 `icon_bounce` 靠
+    /// `icon_active`/`icon_prev_active` 判"刚变成"是同一个思路，但用集合
+    /// 更直接：这套是"同一时刻只有一个键可能悬停"，不需要帧间对比。
+    ///
+    /// 开关关着时**连状态都不进**：`cap_fired` 与 `cap_anim` 一起清空，
+    /// 否则会有"动画已关但上一次记录还挂着"导致定时器空转。
+    pub fn note_cap_hover(&mut self, which: u8, on: bool) {
+        if !self.cfg.ui.anim.caption {
+            self.cap_anim.remove(&which);
+            self.cap_fired.remove(&which);
+            return;
+        }
+        if on {
+            if self.cap_fired.insert(which) {
+                self.cap_anim.insert(
+                    which,
+                    CapAnim { start: unsafe { windows::Win32::System::SystemInformation::GetTickCount64() } },
+                );
+            }
+        } else {
+            // 移开鼠标：动画立刻作废（不回弹、不留残影），并允许下次重播。
+            // 不作废的话，鼠标快速划过时每个键都会留一段没播完的记录，
+            // 画面上是一串互相打架的形变。
+            self.cap_anim.remove(&which);
+            self.cap_fired.remove(&which);
+        }
+    }
+
+    /// 某个标题栏按键的动画相位：`0`=静止（默认），`1`=峰值。
+    ///
+    /// 用 `sin(π·t)` 而不是线性缓动：起手弹到最大再落回默认，中间不需要
+    /// 回弹震荡 —— 用户要的是"弹一下"，一次就够，反复震荡在这么小的符号上
+    /// 看久了只会晕。`t<0`（还没起）或 `t>1`（已结束）都夹到 0。
+    pub fn cap_phase(&self, which: u8) -> f32 {
+        if !self.cfg.ui.anim.caption {
+            return 0.0;
+        }
+        let Some(a) = self.cap_anim.get(&which) else {
+            return 0.0;
+        };
+        let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
+        let t = now.saturating_sub(a.start) as f32 / ANIM_CAPTION_MS as f32;
+        if !(0.0..=1.0).contains(&t) {
+            return 0.0;
+        }
+        (std::f32::consts::PI * t).sin()
+    }
+
     /// 每帧开始调用一次（paint 入口）：把"这一帧悬停/选中了谁"滚成"上一帧"，
     /// 用来判定"是不是刚变成这个状态"（刚变才弹一下）。
     pub fn begin_anim_frame(&mut self) {
@@ -2029,6 +2137,7 @@ impl App {
         if self.addr_anim.is_some()
             || self.sb_scroll_target.is_some()
             || !self.icon_bounce.is_empty()
+            || !self.cap_anim.is_empty()
         {
             return true;
         }
@@ -2160,6 +2269,16 @@ impl App {
         // —— 图标回弹（详细信息 / 列表）：到点就出表 ——
         if !self.icon_bounce.is_empty() {
             self.icon_bounce.retain(|_, st| now.saturating_sub(*st) < ANIM_BOUNCE_MS);
+            dirty = true;
+        }
+
+        // —— 标题栏按键：弹一下 → 到点归位 ——
+        //
+        // 到点就**从表里删掉**，不是把进度置 0：留着一条"已结束"的记录会让
+        // `anim_active()` 永远为真，16ms 定时器就永远 Kill 不掉（第58轮
+        // 取消选中放大卡住缩不回的同源坑）。
+        if !self.cap_anim.is_empty() {
+            self.cap_anim.retain(|_, a| now.saturating_sub(a.start) < ANIM_CAPTION_MS);
             dirty = true;
         }
 
@@ -3990,6 +4109,8 @@ impl App {
         self.hovering_close = false;
         self.hover_chrome = 0;
         self.hover_tab = None;
+        self.hover_tab_close = None;
+        self.hover_new_tab = false;
         self.hover_view_btn = 0;
         self.settings_hover = None;
         self.settings_hover_tab = None;

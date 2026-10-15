@@ -1342,13 +1342,14 @@ fn interact_param_label(id: &str) -> &'static str {
         "anim.icon_zoom" => "悬停 / 选中时图标放大",
         "anim.icon_bounce" => "悬停 / 选中时弹一下",
         "anim.address" => "进入 / 返回时滑入滑出",
+        "anim.caption" => "悬停时按钮形变",
         _ => "参数",
     }
 }
 
-/// 「动画」这四项都是开关（action 4020/4023/4026/4029）。
+/// 「动画」这五项都是开关（action 4020/4023/4026/4029/4032）。
 pub fn is_anim_action(a: u32) -> bool {
-    matches!(a, 4020 | 4023 | 4026 | 4029)
+    matches!(a, 4020 | 4023 | 4026 | 4029 | 4032)
 }
 
 /// 选中项是动画组时，右侧预览区要写的说明。
@@ -1369,6 +1370,13 @@ fn anim_desc(id: &str) -> &'static [&'static str] {
         "anim.address" => &[
             "进入新目录：面包屑从地址栏右侧滑进来，到位后弹一下；",
             "返回上一级：旧的那一串像出栈一样向右滑出去。",
+        ],
+        "anim.caption" => &[
+            "鼠标划上标题栏按键时，那一键弹一下再自己归位：",
+            "最大化放大、最小化缩小下沉、关闭收起来；",
+            "侧栏开关里那栏面板横向收放、更多菜单三条杠错开、",
+            "新建标签 + 转 45°、标签上的 × 放大。",
+            "是「一次性过渡」不是常驻抖动 —— 停在键上不动也不会一直动。",
         ],
         _ => &[],
     }
@@ -1392,6 +1400,7 @@ fn interact_param_value(app: &App, id: &str) -> String {
         "anim.icon_zoom" => on_off(app.cfg.ui.anim.icon_zoom),
         "anim.icon_bounce" => on_off(app.cfg.ui.anim.icon_bounce),
         "anim.address" => on_off(app.cfg.ui.anim.address),
+        "anim.caption" => on_off(app.cfg.ui.anim.caption),
         _ => String::new(),
     }
 }
@@ -1406,7 +1415,8 @@ fn anim_state(app: &App, id: &str) -> bool {
         "anim.sidebar" => app.cfg.ui.anim.sidebar,
         "anim.icon_zoom" => app.cfg.ui.anim.icon_zoom,
         "anim.icon_bounce" => app.cfg.ui.anim.icon_bounce,
-        _ => app.cfg.ui.anim.address,
+        "anim.address" => app.cfg.ui.anim.address,
+        _ => app.cfg.ui.anim.caption,
     }
 }
 
@@ -1440,7 +1450,7 @@ pub fn interact_tree() -> Vec<InteractNode> {
                 inode("selbar.hollow", "空心", Some(4009), vec![]),
             ],
         ),
-        // 第57轮：动画四项。四项都是开关（不是数值），所以行右端画的是
+        // 第57轮：动画五项。五项都是开关（不是数值），所以行右端画的是
         // Toggle 而不是 [−][+]，点整行就切。
         inode(
             "anim",
@@ -1451,6 +1461,8 @@ pub fn interact_tree() -> Vec<InteractNode> {
                 inode("anim.icon_zoom", "图标放大（大图标）", Some(4023), vec![]),
                 inode("anim.icon_bounce", "图标回弹（列表）", Some(4026), vec![]),
                 inode("anim.address", "地址栏滑入滑出", Some(4029), vec![]),
+                // 第63轮：标题栏按键的形变（最大/最小/关闭/侧栏开关/+/×）。
+                inode("anim.caption", "标题栏按键形变", Some(4032), vec![]),
             ],
         ),
     ]
@@ -1551,11 +1563,24 @@ pub fn apply_sel_bar_action(app: &mut App, a: u32) {
         4009..=4011 => {
             app.set_sel_bar(|sb| sb.hollow = !sb.hollow);
         }
-        // 第57轮：动画四项开关（点整行 / 点 [−][+] 都是切换）
+        // 第57轮：动画五项开关（点整行 / 点 [−][+] 都是切换）
         4020..=4022 => app.set_anim(|a| a.sidebar = !a.sidebar),
         4023..=4025 => app.set_anim(|a| a.icon_zoom = !a.icon_zoom),
         4026..=4028 => app.set_anim(|a| a.icon_bounce = !a.icon_bounce),
         4029..=4031 => app.set_anim(|a| a.address = !a.address),
+        // 第63轮：标题栏按键形变。**关掉时必须把已在跑的那段清掉** ——
+        // `cap_phase` 自己会读开关返回 0，但 `cap_anim` 里若还留着记录，
+        // `anim_active()` 仍为真，16ms 定时器就永远 Kill 不掉。下一帧
+        // `note_cap_hover` 会顺手清（它每帧都跑），但那一帧的空转已经
+        // 够让设置页关掉开关后 CPU 曲线翘一下了，所以显式清。
+        4032..=4034 => {
+            app.set_anim(|a| a.caption = !a.caption);
+            if !app.cfg.ui.anim.caption {
+                app.cap_anim.clear();
+                app.cap_fired.clear();
+                app.sync_anim_timer();
+            }
+        }
         _ => {}
     }
 }
