@@ -2864,7 +2864,10 @@ fn select_marquee_into(app: &mut App, l: &paint::Layout, origin: (i32, i32), cur
     // WM_LBUTTONDOWN 用的 pane_layout 同一份），拿全局 view 算会选到错的行。
     let pl = if app.split() { paint::pane_layout(app, l, app.focus_pane) } else { *l };
     let l = &pl;
-    let r = paint::marquee_rect_from(origin, cur);
+    // 第60轮：钳进显示区，与 paint_drag_overlay 的绘制用同一份几何 ——
+    // 框选框不许越出文件/文件夹区域，命中范围也必须跟着收，
+    // 否则会出现"框看着停在区内却选中了区外条目"的错位。
+    let r = paint::marquee_rect_from_in(origin, cur, l.view);
     let hits = |a: &RECT, b: &RECT| a.right > b.left && a.left < b.right && a.bottom > b.top && a.top < b.bottom;
 
     if app.tab().recycle {

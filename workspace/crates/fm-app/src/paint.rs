@@ -937,7 +937,14 @@ fn paint_drag_overlay(app: &mut App, hdc: HDC, l: &Layout) {
     // 先把要用的标量抄出来：下面取面包屑矩形要 &mut app，不能让 &app.drag
     // 的借用一直挂着。
     let (kind, cur, items_n, marquee) = match app.drag.as_ref() {
-        Some(d) if d.active => (d.kind, d.cur, d.items.len(), marquee_rect(d)),
+        Some(d) if d.active => (
+            d.kind,
+            d.cur,
+            d.items.len(),
+            // 第60轮：钳进显示区 —— 框选框不许越出文件/文件夹区域。
+            // l.view 已是当前窗格（分栏由 pane_layout 覆写过）。
+            marquee_rect_in(d, l.view),
+        ),
         _ => return,
     };
     let t = app.theme;
@@ -1232,6 +1239,36 @@ fn draw_drag_image(
     }
 }
 
+/// 框选矩形（把起点/当前点规整成左上-右下），并**钳进显示区 `bounds`**。
+///
+/// 钳制是用户明确要求的：框选框不许越出文件/文件夹显示区。早先只做
+/// min/max，光标拖到状态栏甚至侧栏上，遮罩就跟着盖过去。
+///
+/// 绘制（`paint_drag_overlay`）与命中（`select_marquee_into`）都必须走这里，
+/// 否则会出现"框看着停在区内、却选中了区外的条目"这类错位。
+pub fn marquee_rect_in(drag: &crate::app::Drag, bounds: RECT) -> RECT {
+    clamp_to(marquee_rect(drag), bounds)
+}
+
+/// 同上，但只吃两个 i32 坐标；让框选逻辑在持有 `&app::Drag` 借用的同时
+/// 也能调（比如 `WM_MOUSEMOVE` 边拖边算选中时）。
+pub fn marquee_rect_from_in(origin: (i32, i32), cur: (i32, i32), bounds: RECT) -> RECT {
+    clamp_to(marquee_rect_from(origin, cur), bounds)
+}
+
+/// 把 `r` 收进 `b`（左上-右下规整后取交集）。`b` 退化时原样返回，
+/// 免得出现负宽高把 GDI 画崩。
+fn clamp_to(r: RECT, b: RECT) -> RECT {
+    let left = r.left.max(b.left);
+    let top = r.top.max(b.top);
+    let right = r.right.min(b.right);
+    let bottom = r.bottom.min(b.bottom);
+    if right <= left || bottom <= top {
+        return r;
+    }
+    RECT { left, top, right, bottom }
+}
+
 /// 框选矩形（把起点/当前点规整成左上-右下）。
 pub fn marquee_rect(drag: &crate::app::Drag) -> RECT {
     let (x0, y0) = drag.origin;
@@ -1244,9 +1281,9 @@ pub fn marquee_rect(drag: &crate::app::Drag) -> RECT {
     }
 }
 
-/// 同上，但只吃两个 i32 坐标；让框选逻辑在持有 `&app::Drag` 借用的同时
-/// 也能调（比如 `WM_MOUSEMOVE` 边拖边算选中时）。
-pub fn marquee_rect_from(origin: (i32, i32), cur: (i32, i32)) -> RECT {
+/// 同上，但只吃两个 i32 坐标。**未钳制**，仅供 `marquee_rect_from_in` /
+/// `marquee_rect_in` 内部与单测使用；框选实际路径一律走 `_in` 版本。
+fn marquee_rect_from(origin: (i32, i32), cur: (i32, i32)) -> RECT {
     let (x0, y0) = origin;
     let (x1, y1) = cur;
     RECT {
