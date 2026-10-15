@@ -15,6 +15,7 @@ mod coldlg;
 mod fmtprev;
 mod icon_theme;
 mod icons;
+mod icon_spec;
 mod menu;
 mod openwith;
 mod plugin_host;
@@ -108,7 +109,10 @@ const DOUBLE_CLICK_MS: u64 = 500;
 
 /// zenfile-app 自己的自检项（`zenfile-core::selftest` 碰不到 UI 层这边的模块）。
 fn app_selftest() -> i32 {
-    let cases = crate::sysview::selftest();
+    let mut cases = crate::sysview::selftest();
+    // 第66轮：图标规格自检 —— 用户报"所有图标风格不统一、大小都不一样"。
+    // 把规格本身变成可核对的输出：全软件到底有几种尺寸、各档笔画多粗。
+    cases.extend(crate::icon_spec::selftest());
     let mut pass = 0usize;
     println!("\n—— zenfile-app 附加自检 ——");
     for (name, ok, detail) in &cases {

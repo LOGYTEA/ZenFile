@@ -1422,9 +1422,18 @@ fn paint_tab_strip(app: &mut App, hdc: HDC, l: &Layout, pi: usize) {
                 app.icons.draw(hdc, h, icon_x, icon_y, icon_s);
             } else if let Some(g) = tab_glyphs[i] {
                 // 设置齿轮：主题接管时走自绘 Gear 字形
-                let ir = RECT { left: icon_x, top: icon_y, right: icon_x + icon_s, bottom: icon_y + icon_s };
+                //
+                // 第66轮：齿轮**查规格**（Md），并在 16px 槽位里居中。
+                // 之前直接用 `icon_s`(=16, shell 图标槽位) 画 —— 一个 UI 控件
+                // 图标套着文件图标的尺寸，这就是"同一种风格另一种风格"的
+                // 典型来源：两个数字都是 16，但它们属于**不同的尺寸体系**。
+                let gs = crate::icon_spec::size_of(crate::icon_theme::Ui::Gear, app.metrics.scale);
+                let ir = crate::icon_spec::centered(
+                    &RECT { left: icon_x, top: icon_y, right: icon_x + icon_s, bottom: icon_y + icon_s },
+                    gs,
+                );
                 if !(g == "\u{E713}"
-                    && draw_ui_icon(hdc, crate::icon_theme::Ui::Gear, &ir, icon_s, fg)) {
+                    && draw_ui_icon(hdc, crate::icon_theme::Ui::Gear, &ir, gs, fg)) {
                     let gf = glyph_font(app.metrics.scale);
                     let og = SelectObject(hdc, gf.into());
                     draw_text(hdc, g, ir, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
@@ -1464,8 +1473,18 @@ fn paint_tab_strip(app: &mut App, hdc: HDC, l: &Layout, pi: usize) {
                     fill_radius(app, hdc, "title.button", &cr, t.hover_bg, None);
                 }
                 let cc = if i == app.panes[pi].active || hovered { t.text } else { t.text_dim };
-                let ics = (((11.0 * app.metrics.scale).round() as f32) * (1.0 + 0.45 * cp)).round() as i32;
-                if !draw_ui_icon(hdc, crate::icon_theme::Ui::Close, &cr, ics, cc) {
+                // 第66轮：× 与三大金刚键的 × **共用 Sm 档**（之前这里是 11，
+                // 窗口键是 13 —— 两个"×"外形完全一样、大小却差 2px，
+                // 一眼就能看出不是一套）。
+                let base = crate::icon_spec::size_of(crate::icon_theme::Ui::Close, app.metrics.scale);
+                let ics = ((base as f32) * (1.0 + 0.45 * cp)).round() as i32;
+                if !draw_ui_icon(
+                    hdc,
+                    crate::icon_theme::Ui::Close,
+                    &crate::icon_spec::centered(&cr, ics),
+                    ics,
+                    cc,
+                ) {
                     SetTextColor(hdc, cc);
                     let g = glyph_font(app.metrics.scale);
                     let old_g = SelectObject(hdc, g.into());
@@ -1631,8 +1650,14 @@ fn paint_pane_title(app: &mut App, hdc: HDC, l: &Layout, pi: usize, focused: boo
                 drew_icon = true;
             }
         } else if settings {
-            let ir = RECT { left: icon_x, top: icon_y, right: icon_x + icon_s, bottom: icon_y + icon_s };
-            if !draw_ui_icon(hdc, crate::icon_theme::Ui::Gear, &ir, icon_s, t.text) {
+            // 第66轮：同上面的齿轮 —— 查规格(Md)并在槽位里居中，不再用
+            // shell 图标的 `icon_s`(16)。
+            let gs = crate::icon_spec::size_of(crate::icon_theme::Ui::Gear, app.metrics.scale);
+            let ir = crate::icon_spec::centered(
+                &RECT { left: icon_x, top: icon_y, right: icon_x + icon_s, bottom: icon_y + icon_s },
+                gs,
+            );
+            if !draw_ui_icon(hdc, crate::icon_theme::Ui::Gear, &ir, gs, t.text) {
                 let gf = glyph_font(app.metrics.scale);
                 let og = SelectObject(hdc, gf.into());
                 draw_text(hdc, "\u{E713}", ir, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
@@ -1688,7 +1713,7 @@ pub enum ChromeGlyph {
 ///
 /// 返回 false = 主题没接管（直角黑白默认）或渲染失败 —— 调用方继续走
 /// 原来的字体字形 / GDI 手绘路径，零回归。
-fn draw_ui_icon(hdc: HDC, kind: crate::icon_theme::Ui, r: &RECT, size: i32, color: COLORREF) -> bool {
+pub fn draw_ui_icon(hdc: HDC, kind: crate::icon_theme::Ui, r: &RECT, size: i32, color: COLORREF) -> bool {
     let Some(h) = crate::icon_theme::ui_icon(kind, size, color) else {
         return false;
     };
@@ -1717,14 +1742,15 @@ fn draw_chrome_glyph(app: &App, hdc: HDC, r: &RECT, which: ChromeGlyph, phase: f
         ChromeGlyph::MoreDots => (1.0 + 0.14 * phase, 0.0),
         ChromeGlyph::Plus => (1.0 + 0.30 * phase, 45.0 * phase),
     };
-    // 主题接管时（第49轮）：按钮字形也走自绘主题。直角黑白（默认）恒返回
-    // false → 下面的 GDI 手绘照旧，零回归。
-    let (kind, sz0) = match which {
-        ChromeGlyph::PaneToggle => (crate::icon_theme::Ui::PaneToggle, 17.0),
-        ChromeGlyph::MoreDots => (crate::icon_theme::Ui::Hamburger, 15.0),
-        ChromeGlyph::Plus => (crate::icon_theme::Ui::Plus, 13.0),
+    // 第66轮：**尺寸不再各写各的**，一律查 `icon_spec::spec`。
+    // 之前这里是 `PaneToggle 17 / Hamburger 15 / Plus 13` 三个裸数字，
+    // 与 `draw_caption_glyph` 里的 13、标签 × 的 11 各不相干。
+    let kind = match which {
+        ChromeGlyph::PaneToggle => crate::icon_theme::Ui::PaneToggle,
+        ChromeGlyph::MoreDots => crate::icon_theme::Ui::Hamburger,
+        ChromeGlyph::Plus => crate::icon_theme::Ui::Plus,
     };
-    let sz = ((sz0 * s).round() as f32 * k).round() as i32;
+    let sz = (crate::icon_spec::size_of(kind, s) as f32 * k).round() as i32;
     let cx = (r.left + r.right) / 2;
     let cy = (r.top + r.bottom) / 2;
     let gr = RECT { left: cx - sz / 2, top: cy - sz / 2, right: cx - sz / 2 + sz, bottom: cy - sz / 2 + sz };
@@ -1739,7 +1765,8 @@ fn draw_chrome_glyph(app: &App, hdc: HDC, r: &RECT, which: ChromeGlyph, phase: f
         return;
     }
     unsafe {
-        let pen = CreatePen(PS_SOLID, (1.0 * s).round().max(1.0) as i32, app.theme.text);
+        // 笔画粗细也查规格（统一光学粗细），不再各处写 `(1.0 * s)`。
+        let pen = CreatePen(PS_SOLID, crate::icon_spec::stroke_px(sz, s), app.theme.text);
         let old_pen = SelectObject(hdc, pen.into());
         let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
         match which {
@@ -1844,16 +1871,10 @@ fn draw_caption_glyph(app: &App, hdc: HDC, r: &RECT, which: u8, phase: f32) {
         _ => (1.0 - 0.30 * phase, 0),
     };
     // 符号框：按 k 在命中区里缩放并按 dy 竖移。
+    //
+    // 第66轮：base 查 `icon_spec::spec` 而不是写死 13.0 —— 窗口键、
+    // 新建标签 +、标签关闭 × 现在共用 Sm 这一档，规格只有一处定义。
     let (cx0, cy0) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
-    let base = (13.0 * s).round() as i32; // 主题字形边长
-    let sz = ((base as f32 * k).round() as i32).max(1);
-    let half_sz = sz / 2;
-    let gr = RECT {
-        left: cx0 - half_sz,
-        top: cy0 + dy - half_sz,
-        right: cx0 - half_sz + sz,
-        bottom: cy0 + dy - half_sz + sz,
-    };
     // 主题接管时走自绘字形；还原态（两个错开方框）用专门的 Restore 字形。
     let kind = match which {
         1 => Some(crate::icon_theme::Ui::Min),
@@ -1866,6 +1887,17 @@ fn draw_caption_glyph(app: &App, hdc: HDC, r: &RECT, which: u8, phase: f32) {
         }
         _ => Some(crate::icon_theme::Ui::Close),
     };
+    let base = kind
+        .map(|k| crate::icon_spec::size_of(k, s))
+        .unwrap_or_else(|| crate::icon_spec::Size::Sm.scaled(s));
+    let sz = ((base as f32 * k).round() as i32).max(1);
+    let half_sz = sz / 2;
+    let gr = RECT {
+        left: cx0 - half_sz,
+        top: cy0 + dy - half_sz,
+        right: cx0 - half_sz + sz,
+        bottom: cy0 + dy - half_sz + sz,
+    };
     if let Some(k) = kind {
         if draw_ui_icon(hdc, k, &gr, sz, app.theme.text) {
             return;
@@ -1873,10 +1905,13 @@ fn draw_caption_glyph(app: &App, hdc: HDC, r: &RECT, which: u8, phase: f32) {
     }
     let cx = (gr.left + gr.right) / 2;
     let cy = (gr.top + gr.bottom) / 2;
-    // 符号本体 11px（100% 缩放）：1px 笔画在小尺寸下才不至于糊成一团。
-    let half = ((5.5 * s).round() as f32 * k).round() as i32;
+    // GDI 降级路径：符号本体按**边长的 0.42** 算，笔画查规格 —— 与主题路径
+    // 光学一致。之前的 `5.5 * s` 是又一个独立数字：13px 档下 5.5 ≈ 0.42×13，
+    // 但换档后它不会跟着变。
+    let half = (((sz as f32 * 0.42).round() as i32) as f32 * k).round() as i32;
+    let half = half.max(2);
     let box_w = half * 2;
-    let th = (1.0 * s).round().max(1.0) as i32;
+    let th = crate::icon_spec::stroke_px(sz, s);
     unsafe {
         // 横竖笔画一律用**实心细条**画，不用 MoveTo/LineTo：GDI 的线端点不补齐，
         // 转角处会缺一个像素，10px 的尺寸下看着就是"歪的/断的"。
@@ -2470,7 +2505,10 @@ pub fn paint_toolbar(app: &mut App, hdc: HDC, l: &Layout) {
             }
             fill_radius(app, hdc, "toolbar.button", &r, t.row_hover, None);
         }
-        let nav_sz = (20.0 * app.metrics.scale).round() as i32;
+        // 第66轮：导航键尺寸查规格（Xl），不再写死 `20.0 * scale`。
+        // 三个键共用 `nav_sz`，且 `icon_spec` 保证 Back/Forward/Up 同档 ——
+        // 之前它们同用 20 没错，但**没人保证下一个新增的导航键也会跟上**。
+        let nav_sz = crate::icon_spec::size_of(crate::icon_theme::Ui::Back, app.metrics.scale);
         let c_back = if app.can_back() { t.text } else { t.text_dim };
         if !draw_ui_icon(hdc, crate::icon_theme::Ui::Back, &l.back, nav_sz, c_back) {
             SetTextColor(hdc, c_back);
@@ -2547,11 +2585,13 @@ fn paint_bulk_button(app: &App, hdc: HDC, l: &Layout) {
             bottom: r.bottom - (3.0 * s) as i32,
         };
         let main_col = if enabled { t.text } else { t.text_dim };
+        // 第66轮：尺寸查规格（Xl），与导航键同档 —— 它们在工具栏同一排，
+        // 大小必须一致（之前是 19 vs 20）。
         if !draw_ui_icon(
             hdc,
             crate::icon_theme::Ui::Rename,
             &gr,
-            (19.0 * s).round() as i32,
+            crate::icon_spec::size_of(crate::icon_theme::Ui::Rename, s),
             main_col,
         ) {
             let g = glyph_font(s);
@@ -2638,9 +2678,13 @@ pub fn tick_busy_strip(hwnd: HWND, app: &App) {
 /// 16px 的 Segoe MDL2 字符，图标格大半是留白，看着又大又糊。
 pub fn draw_tree_chevron(hdc: HDC, r: &RECT, color: COLORREF, down: bool) {
     // 主题接管时（第49轮）：树箭头也走主题字形（圆角套把三角的角倒圆）。
-    let sz = ((r.right - r.left).min(r.bottom - r.top)).max(8);
+    //
+    // 第66轮：尺寸查规格（Xs），**不再按格子实算**。之前是
+    // `(min(w,h)).max(8)` —— 槽位放大一点图标就跟着变大，同一个箭头在
+    // 不同地方大小不同，正是"改一处另一处就变"的根源。
     let kind = if down { crate::icon_theme::Ui::ChevronDown } else { crate::icon_theme::Ui::ChevronRight };
-    if draw_ui_icon(hdc, kind, r, sz, color) {
+    let sz = crate::icon_spec::size_of(kind, 1.0);
+    if draw_ui_icon(hdc, kind, &crate::icon_spec::centered(r, sz), sz, color) {
         return;
     }
     let cx = (r.left + r.right) / 2;
@@ -4811,9 +4855,12 @@ pub fn status_view_hit(l: &Layout, m: &Metrics, x: i32, y: i32) -> Option<zenfil
 ///   * 详细信息 = 一个**表格**：顶部一条表头线 + 若干行，行里还有列分隔
 unsafe fn draw_view_glyph(hdc: HDC, r: &RECT, grid: bool, color: COLORREF) {
     // 主题接管时（第49轮）：这两个视图字形也走主题。
-    let sz = ((r.right - r.left).min(r.bottom - r.top) - 4).max(10);
+    //
+    // 第66轮：尺寸查规格（Xs），不再"格子减 4"。状态栏那两个键的格子
+    // 与树箭头一样是微型档，规格必须同源。
     let kind = if grid { crate::icon_theme::Ui::ViewGrid } else { crate::icon_theme::Ui::ViewList };
-    if draw_ui_icon(hdc, kind, r, sz, color) {
+    let sz = crate::icon_spec::size_of(kind, 1.0);
+    if draw_ui_icon(hdc, kind, &crate::icon_spec::centered(r, sz), sz, color) {
         return;
     }
     let brush = CreateSolidBrush(color);
@@ -5025,16 +5072,20 @@ fn paint_search_decor(hwnd: HWND, hdc_in: Option<HDC>) {
         // 当**文字**用 DrawTextW 画的，而字形字体的行高受 DT_SINGLELINE 限制，
         // 那个图标字符被压扁成了一条竖着的条纹。矢量画在物理上不可能畸变。
         let m = ((r.bottom - r.top) as f32 * 0.28).round().max(4.0) as i32; // 半径
-        let lw = (1.0 * scale).round().max(1.0) as i32;
+        let lw = crate::icon_spec::stroke_px(12, scale);
         let cx = (6.0 * scale).round() as i32 + m;
         let cy = (r.top + r.bottom) / 2 - m / 4;   // 偏上一点点：给下方手柄留位，整体仍与文字齐平
         // 主题接管时：放大镜也走主题字形（第49轮）。占位宽度仍按 m 算，
         // 免得提示文字的起点随主题切换跳动。
+        //
+        // 第66轮：**尺寸查规格**（Xl，与导航键同档），不再用 `2*m+2` 那个
+        // 跟着搜索框高度漂的动态值 —— 那是全软件唯一"尺寸随别的控件走"
+        // 的图标，缩放一次它就变一次。
         let themed = draw_ui_icon(
             hdc,
             crate::icon_theme::Ui::Search,
             &RECT { left: cx - m, top: cy - m, right: cx + m, bottom: cy + m },
-            (2 * m + ((2.0 * scale).round() as i32).max(2)).max(10),
+            crate::icon_spec::size_of(crate::icon_theme::Ui::Search, scale),
             t.text_dim,
         );
         if !themed {

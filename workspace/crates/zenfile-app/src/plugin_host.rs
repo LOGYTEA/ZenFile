@@ -140,7 +140,7 @@ impl PipeClient {
         use windows::core::HSTRING;
         use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE};
         use windows::Win32::Storage::FileSystem::{
-            CreateFileW, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_FLAGS_AND_ATTRIBUTES,
+            CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_FLAGS_AND_ATTRIBUTES,
             OPEN_EXISTING,
         };
 
