@@ -1713,6 +1713,15 @@ pub enum ChromeGlyph {
 ///
 /// 返回 false = 主题没接管（直角黑白默认）或渲染失败 —— 调用方继续走
 /// 原来的字体字形 / GDI 手绘路径，零回归。
+/// 画一枚 UI 字形。返回 false = 渲染失败，调用方走各自的降级路径。
+///
+/// # 第67轮：自绘字形是**唯一实现**，false 只在异常时出现
+///
+/// 之前 `default` 主题下 `ui_icon` 必返 None，于是每个调用点都准备了一套
+/// GDI 手绘字形 —— **同一个软件两套字形**（详见 `icon_theme::ui_icon` 的
+/// 对照表）。现在自绘对所有主题生效，`false` 只剩"HICON 创建失败"这一种
+/// 异常情况。下面的降级代码因此变成"保险"而不是"日常路径"，但仍然保留：
+/// 渲染失败时**什么都不画**比画一个错的形状更糟。
 pub fn draw_ui_icon(hdc: HDC, kind: crate::icon_theme::Ui, r: &RECT, size: i32, color: COLORREF) -> bool {
     let Some(h) = crate::icon_theme::ui_icon(kind, size, color) else {
         return false;
@@ -1734,6 +1743,9 @@ pub fn draw_ui_icon(hdc: HDC, kind: crate::icon_theme::Ui, r: &RECT, size: i32, 
 ///
 /// 形变都作用在字形自身的绘制参数上，所以主题接管（`draw_ui_icon`）时
 /// 走的是同一条路，不会有两套动画。
+///
+/// 第67轮：`draw_ui_icon` 对所有主题都生效（之前 `default` 主题恒 false，
+/// 落进下面的 GDI 手绘），所以这段 fallback 现在只在渲染失败时触发。
 fn draw_chrome_glyph(app: &App, hdc: HDC, r: &RECT, which: ChromeGlyph, phase: f32) {
     let s = app.metrics.scale;
     // (边长系数, 自转角度)。取自上表。

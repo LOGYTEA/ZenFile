@@ -128,20 +128,48 @@ def grab(hwnd):
     return raw, stride, w, h
 
 
-def glyph_box(raw, stride, x0, x1, y0, y1, target=(222, 222, 222), tol=40):
-    """在给定矩形里找"字形色"的像素包围盒。
+def _lum(c):
+    return (c[0] * 299 + c[1] * 587 + c[2] * 114) // 1000
 
-    字形色 = theme.text(222,222,222)。必须按颜色筛而不是"非背景色" ——
-    底色块(61) 和 danger(228,88,90) 也在同一个矩形里，用"非背景"会把
-    它们一起框进来，包围盒恒等于整个 24×24 底色块，动画完全测不出来。
+
+def glyph_box(raw, stride, x0, x1, y0, y1, threshold=120):
+    """在给定矩形里找**字形**像素的包围盒。
+
+    第67轮：判据从「绝对色值 text=222」改成「**比区域底色亮多少**」。
+
+    字形统一成 1px 描边后，绝对色值判据在两个图标上失效：
+      * 「最小化」是 7x2 的细横线 —— 抗锯齿后没有一整块纯 222 的像素，
+        框出来是空 → rest=(0,0)，后面所有「归位」判定跟着崩；
+      * 「最大化」是 1px 描边的空心方框 —— 同样采不到。
+
+    相对亮度判据对实心/空心/描边一视同仁。
+
+    另外必须排除**有色**像素：hover 底色块(61 灰)与关闭键的
+    danger(228,88,90 红)也在同一个矩形里。字形是中性色（R==G==B），
+    danger 的 R 比 G/B 高 140 一档，一测便知。
     """
+    hist = {}
+    for y in range(max(0, y0), y1):
+        b = y * stride
+        for x in range(max(0, x0), x1):
+            o = b + x * 4
+            c = (raw[o + 2], raw[o + 1], raw[o])
+            hist[c] = hist.get(c, 0) + 1
+    if not hist:
+        return None, 0
+    bg = max(hist, key=hist.get)
+    bg_l = _lum(bg)
     xs, ys = [], []
     for y in range(max(0, y0), y1):
         b = y * stride
         for x in range(max(0, x0), x1):
             o = b + x * 4
             c = (raw[o + 2], raw[o + 1], raw[o])
-            if all(abs(c[i] - target[i]) <= tol for i in range(3)):
+            if c == bg:
+                continue
+            if abs(c[0] - c[1]) > 24 or abs(c[1] - c[2]) > 24:
+                continue          # 有色 = danger 关闭键，不算字形
+            if _lum(c) - bg_l >= threshold:
                 xs.append(x)
                 ys.append(y)
     if not xs:
@@ -264,7 +292,7 @@ def sweep(l, r, n=9):
     for _ in range(n):
         time.sleep(0.05)
         raw, s, w, h = grab(hw)
-        bb, cnt = glyph_box(raw, s, l, r, 0, TITLE_H, target=TEXT)
+        bb, cnt = glyph_box(raw, s, l, r, 0, TITLE_H)
         boxes.append(bb)
     return boxes
 
@@ -278,7 +306,7 @@ for name, l, r in KEYS:
     # 先取一张"鼠标不在任何键上"的静止帧当基准
     away()
     raw, s, w, h = grab(hw)
-    rest_bb, _ = glyph_box(raw, s, l, r, 0, TITLE_H, target=TEXT)
+    rest_bb, _ = glyph_box(raw, s, l, r, 0, TITLE_H)
     rest = (rest_bb[2] - rest_bb[0] + 1, rest_bb[3] - rest_bb[1] + 1) if rest_bb else (0, 0)
 
     boxes = sweep(l, r)
@@ -326,7 +354,7 @@ for name, l, r in KEYS:
 # 侧栏开关（最左）
 away()
 raw, s, w, h = grab(hw)
-tg_bb, _ = glyph_box(raw, s, 0, HIT_W, 0, TITLE_H, target=TEXT)
+tg_bb, _ = glyph_box(raw, s, 0, HIT_W, 0, TITLE_H)
 tg_rest = (tg_bb[2] - tg_bb[0] + 1, tg_bb[3] - tg_bb[1] + 1) if tg_bb else (0, 0)
 boxes = sweep(0, HIT_W)
 sizes = [(b[2] - b[0] + 1, b[3] - b[1] + 1) for b in boxes if b]

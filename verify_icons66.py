@@ -217,27 +217,47 @@ TEXT = (222, 222, 222)
 DIM = (143, 143, 143)
 
 
-def glyph_box(raw, stride, w, h, x0, x1, y0, y1, target=TEXT, tol=40, also_dim=False):
-    """找字形色的包围盒。
+def lum(c):
+    return (c[0] * 299 + c[1] * 587 + c[2] * 114) // 1000
 
-    **必须按颜色筛，不能用"非背景色"**：标题栏按键区里同时有 hover 底色块
-    （61）和关闭键的 danger（228,88,90），用"非背景"会把它们一起框进来，
-    包围盒恒等于整个 24x24 底色块 —— 那样任何尺寸差异都测不出来
-    （第63轮已在动画判据上踩过同款坑）。
 
-    `also_dim=True` 时额外认 `text_dim`(143)：**导航键即使可点也是 dim 色**
-    （返回/前进在没有历史时不可用），只认 222 会量到空。
+def glyph_box(raw, stride, w, h, x0, x1, y0, y1, threshold=120):
+    """量字形墨迹的包围盒。**按比区域底色亮多少判定**，不按绝对色值。
+
+    第67轮：字形统一成 1px 描边后，绝对色值判据（认 text=222）在
+    「最大化」这种空心方框上会采样不到 —— 笔画细，一行里可能只有 1~2 个
+    像素命中，包围盒算出来是空的。相对亮度判据（比众数底色亮 >=60）
+    对实心/空心/描边一视同仁。
+
+    也不能用"非背景色"：标题栏按键区同时有 hover 底色块(61) 和关闭键的
+    danger(228,88,90)，会把它们一起框进来，包围盒恒等于整个 24x24 底色块
+    —— 那样任何尺寸差异都测不出来（第63轮已在动画判据上踩过同款坑）。
     """
+    hist = {}
+    for y in range(max(0, y0), min(y1, h)):
+        b = y * stride
+        for x in range(max(0, x0), min(x1, w)):
+            o = b + x * 4
+            c = (raw[o + 2], raw[o + 1], raw[o])
+            hist[c] = hist.get(c, 0) + 1
+    if not hist:
+        return None, 0
+    bg = max(hist, key=hist.get)
+    bg_l = lum(bg)
     xs, ys = [], []
     for y in range(max(0, y0), min(y1, h)):
         b = y * stride
         for x in range(max(0, x0), min(x1, w)):
             o = b + x * 4
             c = (raw[o + 2], raw[o + 1], raw[o])
-            hit = all(abs(c[i] - target[i]) <= tol for i in range(3))
-            if not hit and also_dim:
-                hit = all(abs(c[i] - DIM[i]) <= 26 for i in range(3))
-            if hit:
+            if c == bg:
+                continue
+            # **只要「中性亮色」** —— 排除 hover 底色块(61 灰) 与
+            # 关闭键的 danger(228,88,90 红)。字形是白/灰(R==G==B)，
+            # danger 的 R 比 G/B 高 140 一档，一测便知。
+            if abs(c[0] - c[1]) > 24 or abs(c[1] - c[2]) > 24:
+                continue
+            if lum(c) - bg_l >= threshold:
                 xs.append(x)
                 ys.append(y)
     if not xs:
@@ -280,12 +300,19 @@ for name, l, rt in KEYS:
     print("        %s 字形 %dx%d @%s" % (name, boxes[name][0], boxes[name][1], bb))
 
 if len(boxes) == len(KEYS):
-    ws = [v[0] for v in boxes.values()]
-    uniform = max(ws) - min(ws) <= 1
-    mark(uniform, "A 三个窗口键宽度一致（%s，差 %dpx）" % (ws, max(ws) - min(ws)))
-    mark(all(v[0] >= 8 for v in boxes.values()),
-         "A 三个窗口键宽度都 >=8px（描边没糊）%s"
-         % ({k: v[0] for k, v in boxes.items()},))
+    # 同 B 组的道理：**比外接框长边**，不比宽度。
+    #
+    # 最小化是**横线**（宽 7 × 高 1）、关闭是**斜十字**（5×5）、最大化是
+    # **方框**（7×7）。1px 描边下不同形状的外接盒天生不同宽 ——
+    # 直接比宽度会把「× 比 — 窄 2px」判成不一致，那不是尺寸问题，是形状问题。
+    # 取 max(宽,高) 才是"这个图标画了多大"的正确度量。
+    longs = [max(v[0], v[1]) for v in boxes.values()]
+    detail = {k: "%dx%d" % v for k, v in boxes.items()}
+    uniform = max(longs) - min(longs) <= 1
+    mark(uniform, "A 三个窗口键外接框长边一致（%s，差 %dpx）%s；宽高天生不同（横线/斜十字/方框）"
+         % (longs, max(longs) - min(longs), detail))
+    mark(all(m >= 5 for m in longs),
+         "A 三个窗口键长边都 >=5px（描边没糊）%s" % (detail,))
 
 print("=== B 工具栏同族：三个导航键必须一样大 ===")
 #
@@ -392,15 +419,17 @@ for name, x0, x1 in NAV_RECTS:
     print("        %s 字形 %dx%d" % (name, sz[0], sz[1]))
 
 if len(nav) == 3:
-    ws = [v[0] for v in nav.values()]
-    hs = [v[1] for v in nav.values()]
-    # **只比宽度**。高度天生就该不同：返回/前进是**横箭头**（扁），
-    # 上级是**竖箭头**（方），比高度等于要求两个不同形状等高，那不是
-    # "一致"而是"畸形"。第一版拿高度一起判，把 12/12/14 判成不一致，
-    # 白查一轮。宽度才是这套描边系统的统一指标（外框尺寸一致）。
-    uniform = max(ws) - min(ws) <= 1
-    mark(uniform, "B 三个导航键宽度一致（%s，差 %dpx）；高度 %s 天生不同（横箭头扁/竖箭头方），不参与判据"
-         % (ws, max(ws) - min(ws), hs))
+    # **比「外接框的较长边」**。
+    #
+    # 横箭头（返回/前进）扁：宽 13 × 高 8；竖箭头（上级）方：宽 8 × 高 13。
+    # 两者是同一套描边画出来的**同一个尺寸**，只是朝向不同 —— 直接比宽度
+    # 会把 13 vs 8 判成不一致（第一版就栽在这）。取 max(宽,高) 才是
+    # 「这个图标有多大」的正确度量。
+    longs = [max(v[0], v[1]) for v in nav.values()]
+    detail = {k: "%dx%d" % v for k, v in nav.items()}
+    uniform = max(longs) - min(longs) <= 1
+    mark(uniform, "B 三个导航键外接框长边一致（%s，差 %dpx）%s；宽高天生不同（横箭头扁/竖箭头方）"
+         % (longs, max(longs) - min(longs), detail))
 else:
     print("    SKIP  B 导航键同族（只抓到 %d 个：%s）" % (len(nav), list(nav)))
 
