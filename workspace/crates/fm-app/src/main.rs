@@ -1008,6 +1008,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             if (wparam.0 & 0xFFFF) == 0 {
                 let app = &mut *app_ptr;
                 app.dismiss_menus();
+                // 第61轮：失活 = **capture 极可能已被别的窗口抢走**，那么
+                // WM_LBUTTONUP 永远送不到这里，框选矩形 / 拖拽影像就会
+                // 永远赖在画面上（用户截图里那个"空白处多一个半透明蓝框"）。
+                cancel_drag(app);
                 // 窗口失活时清标题栏按键的悬停/按下态（第36轮用户报
                 // "鼠标都移出去了还有背景色"）。这里是最可靠的信号 ——
                 // 没有 TrackMouseEvent 时鼠标从非客户区直接划出窗口，
@@ -1020,6 +1024,35 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 }
             }
             LRESULT(0)
+        }
+        // 第61轮：capture 丢失时收掉拖拽状态。
+        //
+        // 之前只在 WM_MOUSEMOVE 里靠 GetKeyState 兜底，可松手后鼠标不动，
+        // 那条兜底一辈子不触发 —— 截图里"空白处多一个半透明蓝框"就是它。
+        //
+        // **WM_CAPTURECHANGED 必须转发 DefWindowProc**（第38轮踩过）：
+        // 那条消息是系统在鼠标捕获转移时发的，我们 `return 0` 等于告诉系统
+        // "这次捕获变化我处理了"，后续点击/菜单全部失灵（实测右键菜单弹不出、
+        // 快捷键收不到，整条 GUI 输入链断掉）。清理归清理，转发不能省。
+        //
+        // 刻意**不**挂 WM_KILLFOCUS：改名编辑框（rename.rs）拿焦点时主窗口
+        // 会收到它，挂上去等于"按 F2 改名刚开始就被取消拖拽"；窗口失活那条路
+        // 已经由上面 WM_ACTIVATE 的 cancel_drag 覆盖了。
+        WM_CANCELMODE => {
+            let app = &mut *app_ptr;
+            if app.drag.is_some() || app.tab_drag.is_some() {
+                cancel_drag(app);
+                let _ = InvalidateRect(Some(hwnd), None, true);
+            }
+            LRESULT(0)
+        }
+        WM_CAPTURECHANGED => {
+            let app = &mut *app_ptr;
+            if app.drag.is_some() || app.tab_drag.is_some() {
+                cancel_drag(app);
+                let _ = InvalidateRect(Some(hwnd), None, true);
+            }
+            DefWindowProcW(hwnd, WM_CAPTURECHANGED, wparam, lparam)
         }
         WM_COMMAND => {
             let source = (wparam.0 & 0xFFFF) as i32;
@@ -2805,6 +2838,30 @@ const FKEYS: [&str; 24] = [
     "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12", "f13", "f14",
     "f15", "f16", "f17", "f18", "f19", "f20", "f21", "f22", "f23", "f24",
 ];
+
+/// 强制收掉一切拖拽状态，**不做任何落地**（不选中、不搬文件、不分栏）。
+///
+/// 第61轮新增。丢松手消息的路径有好几条（capture 被菜单/对话框抢走、
+/// 窗口失活、最小化、Alt+Tab），每一条的后果都一样：框选矩形 / 拖拽影像
+/// 永远赖在画面上。以前只在 `WM_MOUSEMOVE` 里靠 `GetKeyState` 兜底，
+/// 可用户松手后鼠标不动的话那条兜底一辈子不触发 —— 截图里"空白处多一个
+/// 半透明蓝框"就是这个。
+///
+/// 刻意不复用 `finish_drag`：那条会拿松手坐标去算投放目标，
+/// 而失活/取消场景下那个坐标毫无意义，误判成"落在某个文件夹上"
+/// 就会把文件搬到用户没打算去的地方。
+fn cancel_drag(app: &mut App) {
+    let mut had = app.drag.take().is_some();
+    app.drag_dock = None;
+    app.drop_target = None;
+    app.tab_hover_since = None;
+    if app.tab_drag.take().is_some() {
+        had = true;
+    }
+    if had {
+        let _ = unsafe { ReleaseCapture() };
+    }
+}
 
 /// 松手：条目拖拽去落地 / 框选去选中。
 fn finish_drag(app: &mut App, l: &paint::Layout, x: i32, y: i32) {
