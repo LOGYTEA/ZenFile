@@ -31,6 +31,17 @@ pub struct ProcessTree {
 
 unsafe impl Send for ProcessTree {}
 
+impl Default for ProcessTree {
+    /// 降级路径：Job Object 建不起来时给一个"无作业"的实例。
+    ///
+    /// 插件宿主用 `unwrap_or_default()` 兜底 —— **整个程序起不来比多留几个
+    /// 孤儿进程严重得多**。降级后插件功能完全正常，只是宿主异常退出时
+    /// 插件不会被内核自动带走（用户仍可在面板里逐个停掉）。
+    fn default() -> Self {
+        Self { job: HANDLE(std::ptr::null_mut()), children: Vec::new() }
+    }
+}
+
 pub struct ChildProcess {
     pub pid: u32,
     process: HANDLE,
@@ -84,9 +95,12 @@ impl ProcessTree {
         .map_err(Error::from)?;
 
         // job 分配失败不应让整机模块瘫痪 —— 降级为手动管理生命周期。
-        let assigned = unsafe { AssignProcessToJobObject(self.job, pi.hProcess) };
-        if assigned.is_err() {
-            eprintln!("[warn] AssignProcessToJobObject 失败，降级为手动退出通知");
+        // 降级实例（`job` 为空）直接跳过，别打警告刷屏 —— 它不是故障。
+        if !self.job.is_invalid() {
+            let assigned = unsafe { AssignProcessToJobObject(self.job, pi.hProcess) };
+            if assigned.is_err() {
+                eprintln!("[warn] AssignProcessToJobObject 失败，降级为手动退出通知");
+            }
         }
         unsafe { ResumeThread(pi.hThread) };
 
@@ -103,6 +117,10 @@ impl ProcessTree {
             let _ = unsafe { CloseHandle(child.thread) };
             let _ = unsafe { CloseHandle(child.process) };
         }
+        if !self.job.is_invalid() {
+            let _ = unsafe { CloseHandle(self.job) };
+            self.job = HANDLE(std::ptr::null_mut());
+        }
     }
 
     pub fn child_count(&self) -> usize {
@@ -113,7 +131,54 @@ impl ProcessTree {
 impl Drop for ProcessTree {
     fn drop(&mut self) {
         self.shutdown_all();
-        let _ = unsafe { CloseHandle(self.job) };
+    }
+}
+
+/// 按 pid 终止一个进程。
+///
+/// 插件运行时需要这个 —— 它按 id 管插件，不是按 `ProcessTree.children`
+/// 的下标顺序管（插件可以随时启停，下标早就乱了）。
+///
+/// **找不到或没权限时返回 false，不 panic**：进程可能刚好自己退了，
+/// 那是正常情况不是错误。
+pub fn terminate_pid(pid: u32) -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        match OpenProcess(PROCESS_TERMINATE, false, pid) {
+            Ok(h) => {
+                let ok = TerminateProcess(h, 0).is_ok();
+                let _ = CloseHandle(h);
+                ok
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// 进程是否还活着。
+pub fn process_alive(pid: u32) -> bool {
+    // `SYNCHRONIZE`（0x00100000）这个访问权限常量 **windows-rs 0.62 没有以
+    // 可用名重新导出**，所以写字面值；类型交给 `OpenProcess` 的签名推断
+    // （硬写 `PROCESS_ACCESS_RIGHTS` 反而会 E0425，它在 Threading 不在 Foundation）。
+    use windows::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        match OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
+            Ok(h) => {
+                // 0 立即返回；`WAIT_TIMEOUT` = 还活着（内核还没终结它）
+                let r = WaitForSingleObject(h, 0);
+                let _ = CloseHandle(h);
+                r == WAIT_TIMEOUT
+            }
+            Err(_) => false,
+        }
     }
 }
 

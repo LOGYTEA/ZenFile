@@ -1672,35 +1672,82 @@ fn advanced_rows(app: &App, content: &RECT) -> Vec<paint::SettingRow> {
     out
 }
 
-/// 「插件」：列出子模块，可直接开关。
+/// 「插件」：列出**真实运行时状态**，可直接启停。
+///
+/// 第65轮之前这页读的是 `cfg.modules` —— 那份配置从来没人填过内容，
+/// 所以它永远显示"没有已注册的插件模块"，而 `fm-{id}.exe` 那个名字也是
+/// 编出来的（插件压根不是独立 exe，是同一个 `ZenFile.exe` 的另一个进程）。
+///
+/// 现在直接读 `app.plugins`（`zenfile_core::plugin::PluginHost`）：
+/// 扫 `plugins/` 目录里每个子目录的 `plugin.json`，管它们的进程生命周期。
+/// **清单损坏的插件也要列出来**（标"启动失败"+ 错误原因），不能静默跳过 ——
+/// 用户装了个插件面板上什么都没有，他会以为是软件没扫到。
+///
+/// 动作编号 1000 + 槽位下标。命中后按**当前槽位顺序**反查 id ——
+/// 不能拿配置里的 key 下标，那份顺序与实际发现的顺序可能不一致。
 fn plugin_rows(app: &App, content: &RECT) -> Vec<paint::SettingRow> {
     let s = app.metrics.scale;
     let rh = (34.0 * s).round() as i32;
+    let gap = (4.0 * s).round() as i32;
     let mut out = Vec::new();
     let mut y = content.top;
-    if app.cfg.modules.is_empty() {
+
+    let slots: Vec<_> = app.plugins.slots().collect();
+    if slots.is_empty() {
         out.push(row(
             RECT { left: content.left, top: y, right: content.right, bottom: y + rh },
-            "没有已注册的插件模块",
-            String::new(),
+            "没有找到插件",
+            "把插件放进 ZenFile.exe 同级的 plugins 目录，每个插件一个子目录，里面放 plugin.json".to_string(),
             0,
             None,
         ));
         return out;
     }
-    for (id, m) in &app.cfg.modules {
-        // 动作编号用 1000 + 模块下标，命中后反查 id
-        let idx = app.cfg.modules.keys().position(|k| k == id).unwrap_or(0);
+
+    for (idx, slot) in slots.iter().enumerate() {
+        let on = slot.wanted;
+        // 副标题：状态 + 崩溃次数 + 出错原因，三选一，按重要性排。
+        // 崩溃次数是有用的诊断信息（"它老是崩" vs "它跑得好好的"），
+        // 但只在真的有崩溃时才写出来，否则每行都挂个"崩溃 0 次"很吵。
+        let detail = if let Some(err) = &slot.error {
+            format!("{} · {}", slot.state.as_str(), err)
+        } else if slot.crashes > 0 {
+            format!("{} · 已崩溃 {} 次", slot.state.as_str(), slot.crashes)
+        } else if !slot.manifest.description.is_empty() {
+            format!("{} · {}", slot.state.as_str(), slot.manifest.description)
+        } else {
+            slot.state.as_str().to_string()
+        };
         out.push(row(
             RECT { left: content.left, top: y, right: content.right, bottom: y + rh },
-            &format!("{id}（fm-{id}.exe）"),
-            String::new(),
+            &slot.manifest.name,
+            detail,
             1000 + idx as u32,
-            Some(m.enabled),
+            Some(on),
         ));
-        y += rh + (4.0 * s).round() as i32;
+        y += rh + gap;
     }
+
+    // 底部一行说明：让用户知道"插件崩了不会带崩软件"这件事。
+    out.push(row(
+        RECT { left: content.left, top: y, right: content.right, bottom: y + rh },
+        "每个插件跑在独立进程里",
+        "插件崩溃、无响应都不会影响文件管理器本身；卡住的插件会被自动重启（最多 3 次）".to_string(),
+        0,
+        None,
+    ));
     out
+}
+
+/// 插件页 action（1000+）命中 → 反查槽位 id → 切开关。
+///
+/// **按当前顺序反查**，不能拿配置 key 的下标 —— 见 `plugin_rows` 的注释。
+pub fn plugin_toggle(app: &mut App, idx: usize) {
+    let Some(id) = app.plugins.slots().nth(idx).map(|s| s.manifest.id.clone()) else {
+        return;
+    };
+    let want_on = !app.plugins.slot(&id).map(|s| s.wanted).unwrap_or(false);
+    let _ = app.set_plugin_enabled(&id, want_on);
 }
 
 // ---------------------------------------------------------------- 绘制

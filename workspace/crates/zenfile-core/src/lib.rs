@@ -28,6 +28,7 @@ pub mod ipc;
 pub mod natural;
 pub mod ops;
 pub mod paths;
+pub mod plugin;
 pub mod process;
 pub mod recycle;
 pub mod selftest;
@@ -42,6 +43,15 @@ pub use types::{
 
 /// IPC 协议版本：宿主与网关内插件协商用（§10.2）。
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// 单调递增的毫秒时钟。
+///
+/// **不能用 `SystemTime::now()`**：它不是单调的（NTP 校时会让它往回跳），
+/// 拿它算超时会把一个正常插件误判成"卡死"。`GetTickCount64` 从系统启动起
+/// 递增且不受校时影响。
+pub fn now_ms() -> u64 {
+    unsafe { windows::Win32::System::SystemInformation::GetTickCount64() }
+}
 
 /// 大小列用什么单位显示。
 ///

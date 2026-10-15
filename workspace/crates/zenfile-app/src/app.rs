@@ -521,6 +521,11 @@ pub struct App {
     pub hover_chrome: u8,
     /// 鼠标是不是悬在目录栏最右侧的「批量重命名」按钮上
     pub hover_bulk: bool,
+    /// 插件运行时（第65轮）。管着一堆插件进程的生命周期。
+    ///
+    /// **面板上那个"插件"页读的就是它**，不再读 `cfg.modules` 里那份
+    /// 从来没人填过的空配置 —— 之前那页永远显示"没有已注册的插件模块"。
+    pub plugins: zenfile_core::plugin::PluginHost,
     pub show_hidden: bool,
     /// 是否显示"受保护的操作系统文件"（带 FILE_ATTRIBUTE_SYSTEM 的项）。
     /// 与 show_hidden 相互独立 —— 资源管理器也是两道分开的开关。
@@ -1275,6 +1280,9 @@ impl App {
             hovering_close: false,
             hover_chrome: 0,
             hover_bulk: false,
+            plugins: zenfile_core::plugin::PluginHost::new(
+                std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ZenFile.exe")),
+            ),
             drives: HashMap::new(),
             drives_stamp: None,
             sidebar_expanded: HashSet::new(),
@@ -2305,6 +2313,60 @@ impl App {
             }
         }
         self.anim_timer_on.set(on);
+    }
+
+    /// 扫一遍插件目录，把要跑的插件拉起来。
+    ///
+    /// **整个进程只做一次**：插件是进程级共享资源，而 `App` 是**每个窗口一个**
+    /// （多开窗口时每个 `spawn_window` 都 new 一个）。每个窗口都 discover
+    /// 的话，开 4 个窗口就拉起 4 份插件进程 —— 用户看到的是任务管理器里
+    /// 同一插件出现四遍、互相抢同一根管道。
+    ///
+    /// 用 `static` 的一次性门守住。
+    pub fn discover_plugins(&mut self) {
+        use std::sync::OnceLock;
+        static DONE: OnceLock<()> = OnceLock::new();
+        if DONE.get().is_some() {
+            return;
+        }
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ZenFile.exe"));
+        let dir = zenfile_core::plugin::plugins_dir_for(&exe);
+        self.plugins.discover(&dir);
+        zenfile_core::plugin::ensure_all(&mut self.plugins);
+        let _ = DONE.set(());
+    }
+
+    /// 推进插件状态机。返回 true = 有插件状态变了，调用方该重画。
+    ///
+    /// 挂在消息循环的定时器上按帧调。**不能省这一步**：省了的话插件崩溃
+    /// 之后宿主根本不知道，它会在面板上永远显示"运行中"。
+    pub fn tick_plugins(&mut self) -> bool {
+        let dirty = self.plugins.tick();
+        if dirty {
+            zenfile_core::plugin::ensure_all(&mut self.plugins);
+        }
+        dirty
+    }
+
+    /// 用户在面板上启 / 停一个插件。
+    pub fn set_plugin_enabled(
+        &mut self,
+        id: &str,
+        on: bool,
+    ) -> zenfile_core::error::Result<()> {
+        // 同步落盘，否则下次启动又回到配置里的旧值 —— 用户会以为开关没生效。
+        self.cfg.modules.entry(id.to_string()).or_insert_with(|| {
+            zenfile_core::config::ModuleConfig {
+                enabled: on,
+                autostart: false,
+                settings: Default::default(),
+            }
+        }).enabled = on;
+        let r = self.plugins.set_enabled(id, on);
+        let _ = zenfile_core::config::Config::save_user_patch(&serde_json::json!({
+            "modules": self.cfg.modules
+        }));
+        r
     }
 
     /// 当前标签下标越界了就夹回来（删标签、拖走标签之后都要）。

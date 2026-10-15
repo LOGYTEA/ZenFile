@@ -716,6 +716,64 @@ pub fn run() -> i32 {
         &format!("{dup:?}（NTFS 上大小写视为同一个文件）"),
     );
 
+    // —— 插件运行时（第65轮）——
+    //
+    // 重点验**崩溃隔离**：拉起一个会立刻退出的"插件进程"，宿主侧必须
+    // 仍然活着、并且如实报告那个插件没了。这条是用户明确提的要求
+    // （"不要插件崩了整个软件直接崩"），所以进自检当常驻回归。
+    {
+        // 插件目录的**根**下建一个子目录，plugin.json 放在子目录里 ——
+        // discover 只扫一层子目录（每个插件一个目录），写在根下会被跳过。
+        // 第一版就是写错了位置，`plugin::discover` 与 `plugin::spawn` 双双 FAIL。
+        let root = std::env::temp_dir().join(format!("ZenFileSelftestPlug{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pl_dir = root.join("selftest");
+        std::fs::create_dir_all(&pl_dir).unwrap();
+        std::fs::write(
+            pl_dir.join("plugin.json"),
+            r#"{"id":"selftest","name":"自检插件","protocol_version":1,"autostart":false}"#,
+        )
+        .unwrap();
+
+        let mut ph = crate::plugin::PluginHost::new(std::env::current_exe().unwrap_or_default());
+        ph.discover(&root);
+        let found = ph.slot("selftest").is_some();
+        h.check("plugin::discover", found, "plugin.json 被扫到");
+
+        // 拉起一个"一启动就退"的进程（当前 exe --plugin 会因为连不上管道而退出）。
+        // 宿主的 JobObject 侧不该受影响。
+        let _ = ph.ensure_running("selftest");
+        let started = ph.slot("selftest").map(|s| s.pid != 0).unwrap_or(false);
+        h.check("plugin::spawn", started, "插件进程已拉起");
+
+        // 等它自己死掉，然后 tick：必须被判成"没了"，且宿主继续活着。
+        //
+        // **只 tick 一次、不 ensure_all**：真实运行时 `tick` 之后会拉起重启，
+        // 那会让这个自检变成"反复拉起崩溃进程"的循环。自检要验的是
+        // "识别出崩溃"这一步，不是"重启"那一步（重启由单测覆盖）。
+        std::thread::sleep(std::time::Duration::from_millis(2500));
+        let _ = ph.tick();
+        let st = ph.slot("selftest").map(|s| s.state).unwrap_or(crate::plugin::PluginState::Failed);
+        let gone = matches!(
+            st,
+            crate::plugin::PluginState::Stopped | crate::plugin::PluginState::Failed
+        );
+        h.check(
+            "plugin::crash_isolated",
+            gone,
+            &format!("插件退出后宿主存活，状态 = {}", st.as_str()),
+        );
+
+        // 重启次数必须有上限，否则一启动就崩的插件会把宿主变成进程工厂。
+        let crashes = ph.slot("selftest").map(|s| s.crashes).unwrap_or(0);
+        h.check("plugin::crash_counted", crashes >= 1, &format!("崩溃被记了 {crashes} 次"));
+
+        // 停下来清理
+        let _ = ph.set_enabled("selftest", false);
+        ph.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     println!("\n通过 {}/{} 项", h.passed, h.passed + h.failed);
     if h.failed == 0 {
         0

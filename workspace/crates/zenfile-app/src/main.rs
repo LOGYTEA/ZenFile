@@ -17,6 +17,7 @@ mod icon_theme;
 mod icons;
 mod menu;
 mod openwith;
+mod plugin_host;
 mod rename;
 mod paint;
 mod props;
@@ -128,6 +129,28 @@ fn app_selftest() -> i32 {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // ---------------------------------------------------------------- 插件进程（第65轮）
+    //
+    // **必须在所有窗口 / 托盘 / 单实例逻辑之前 return**。
+    //
+    // 插件是"同一个 exe 的另一个进程"：`ZenFile.exe --plugin <id>`。
+    // 它绝不能走后面的窗口创建、单实例互斥、托盘注册 —— 那些是**宿主**
+    // 的职责。漏掉任何一条的后果：
+    //   * 走到单实例转交 → 插件把 id 当路径递给宿主然后自己退出；
+    //   * 走到托盘注册 → 每个插件在系统托盘挂一个图标；
+    //   * 走到窗口创建 → 插件弹出第二个文件管理器窗口。
+    //
+    // 所以这里的第一件事就是把 `--plugin` 摘出来，其余参数一概不看。
+    if let Some(id) = args
+        .iter()
+        .position(|a| a == "--plugin")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+    {
+        let code = crate::plugin_host::run_plugin_process(&id, &args);
+        std::process::exit(code);
+    }
 
     if args.iter().any(|a| a == "--selftest" || a == "--self-test") {
         // Windows 子系统下 CRT 的 stdout 是空的，先把父进程的控制台挂回来
@@ -361,6 +384,11 @@ fn spawn_window(
     // 只能注册一次 —— 同一个线程里对同一个 ID 注册第二次会失败。
     if primary {
         register_hotkeys(app, hwnd);
+        // 插件（第65轮）：只在本进程**第一个**窗口发现插件。
+        //
+        // 每个窗口都 discover 一次会开出 4 个插件进程（开 4 个窗口 = 4 份），
+        // 而插件是进程级的共享资源，不该按窗口数复制。
+        app.discover_plugins();
     }
 
     unsafe {
@@ -963,6 +991,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 paint::tick_busy_strip(hwnd, app);
             } else if wparam.0 == TIMER_DRAIN {
                 let app = &mut *app_ptr;
+                // 插件状态机（第65轮）：查进程存活 + 心跳超时，该重启的重启。
+                //
+                // 挂在 100ms 这只定时器上而不是新建一只：心跳超时是 5 秒，
+                // 100ms 的检查频率绰绰有余，省一只定时器。
+                //
+                // **这一步不能省**：省了的话插件崩溃宿主完全不知道，面板上
+                // 会永远显示"运行中"，而插件早就没了。
+                if app.tick_plugins() {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
                 app.drain();
                 // 搜索框防抖到期：这一跳才真的去搜（见 App::tick_search）
                 if app.tick_search() {
@@ -1857,13 +1895,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                         let _ = InvalidateRect(Some(hwnd), None, true);
                     }
                     Some(settings::Hit::Row(action)) if action >= 1000 => {
-                        // 插件行：动作编号 1000 + 模块下标
-                        let idx = (action - 1000) as usize;
-                        let key = app.cfg.modules.keys().nth(idx).cloned();
-                        if let Some(k) = key {
-                            let on = app.cfg.modules.get(&k).map(|m| m.enabled).unwrap_or(false);
-                            app.set_module_enabled(&k, !on);
-                        }
+                        // 插件行：动作编号 1000 + **当前槽位下标**（第65轮）。
+                        //
+                        // 之前这里是 `app.cfg.modules.keys().nth(idx)` —— 那份
+                        // 配置从来没人填过内容，所以这个开关点下去**永远什么
+                        // 都不发生**，而面板上显示的是编出来的 `fm-{id}.exe`。
+                        // 现在按运行时槽位反查真实 id，再切 `app.plugins`。
+                        settings::plugin_toggle(app, (action - 1000) as usize);
+                        let _ = InvalidateRect(Some(hwnd), None, true);
                     }
                     Some(settings::Hit::Row(action)) => {
                         if matches!(action, paint::SET_THEME | paint::SET_UNIT | paint::SET_VIEW) {
