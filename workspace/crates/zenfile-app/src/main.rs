@@ -15,6 +15,7 @@ mod coldlg;
 mod fmtprev;
 mod icon_theme;
 mod anim_clock;
+mod icon_spec_design;
 mod icons;
 mod icon_spec;
 mod menu;
