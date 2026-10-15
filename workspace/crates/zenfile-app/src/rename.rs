@@ -13,7 +13,7 @@
 //!
 //! ## 名字怎么改
 //!
-//! 规则部分在 `fm_core::bulk`（纯函数、有自检），这里只管收参数、调 `plan`、
+//! 规则部分在 `zenfile_core::bulk`（纯函数、有自检），这里只管收参数、调 `plan`、
 //! 判冲突、画预览。冲突（新名互撞 / 撞到没参与改名的文件）会让「重命名」按钮
 //! 变灰，和资源管理器一致。
 
@@ -109,8 +109,8 @@ impl Bulk {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default()
     }
-    fn rule(&self) -> fm_core::bulk::Rule {
-        use fm_core::bulk::Rule;
+    fn rule(&self) -> zenfile_core::bulk::Rule {
+        use zenfile_core::bulk::Rule;
         let p1 = text_of(self.edits[0]);
         let p2 = text_of(self.edits[1]);
         let num = |d: i32| text_of(self.edits[2]).parse::<i32>().unwrap_or(d);
@@ -445,8 +445,8 @@ fn layout_edits(st: &mut Bulk) {
 fn recompute(st: &mut Bulk) {
     let names: Vec<String> = (0..st.items.len()).map(|i| st.old_name(i)).collect();
     let rule = st.rule();
-    let news = fm_core::bulk::plan(&names, &rule, st.keep_ext);
-    let mut conflict = fm_core::bulk::duplicates(&news);
+    let news = zenfile_core::bulk::plan(&names, &rule, st.keep_ext);
+    let mut conflict = zenfile_core::bulk::duplicates(&news);
 
     // 撞到目录里没参与改名的文件也算冲突：NTFS 不允许同名
     let mut taken: HashSet<String> = HashSet::new();
@@ -665,7 +665,7 @@ fn apply(st: &mut Bulk) {
     if pairs.is_empty() {
         return;
     }
-    match fm_core::ops::rename_items(owner, &pairs) {
+    match zenfile_core::ops::rename_items(owner, &pairs) {
         Ok(()) => {
             unsafe {
                 (*st.app).reload();

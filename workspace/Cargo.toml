@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/fm-core", "crates/fm-app", "crates/fm-taskmgr"]
+members = ["crates/zenfile-core", "crates/zenfile-app", "crates/zenfile-taskmgr"]
 resolver = "2"
 
 [workspace.package]
@@ -7,11 +7,11 @@ resolver = "2"
 version = "0.3.0"
 edition = "2021"
 rust-version = "1.85"
-authors = ["FileManager Team"]
+authors = ["ZenFile Team"]
 license = "Apache-2.0"
 
 [workspace.dependencies]
-fm-core = { path = "crates/fm-core" }
+zenfile-core = { path = "crates/zenfile-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

@@ -98,21 +98,21 @@ pub fn open(app: &mut crate::app::App) {
         let vis = app.visible_cols();
         let mut rows: Vec<Row> = Vec::new();
         for id in &vis {
-            let locked = id == fm_core::columns::C_NAME;
+            let locked = id == zenfile_core::columns::C_NAME;
             rows.push(Row {
                 id: id.clone(),
-                label: fm_core::columns::label_of(id),
+                label: zenfile_core::columns::label_of(id),
                 on: true,
                 locked,
             });
         }
-        for id in fm_core::columns::COL_ALL {
+        for id in zenfile_core::columns::COL_ALL {
             if !vis.iter().any(|x| x == id) {
                 rows.push(Row {
                     id: (*id).to_string(),
-                    label: fm_core::columns::label_of(id),
+                    label: zenfile_core::columns::label_of(id),
                     on: false,
-                    locked: *id == fm_core::columns::C_NAME,
+                    locked: *id == zenfile_core::columns::C_NAME,
                 });
             }
         }

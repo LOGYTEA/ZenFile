@@ -5,17 +5,17 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
-use fm_core::clipboard::{self, ClipMode};
-use fm_core::config::Config;
-use fm_core::engine::{self, EngineMsg, SearchRequest};
-use fm_core::ops::{
+use zenfile_core::clipboard::{self, ClipMode};
+use zenfile_core::config::Config;
+use zenfile_core::engine::{self, EngineMsg, SearchRequest};
+use zenfile_core::ops::{
     copy_items, delete_items, move_items, new_file, new_folder, rename_item, transfer_async,
     ComGuard, SharedStats, TransferKind,
 };
-use fm_core::paths;
-use fm_core::process::ProcessTree;
-use fm_core::types::{filter_entries, FileEntry, FileKind, SortKey, SortSpec, ViewMode};
-use fm_core::watch::{DirWatcher, WatchMsg};
+use zenfile_core::paths;
+use zenfile_core::process::ProcessTree;
+use zenfile_core::types::{filter_entries, FileEntry, FileKind, SortKey, SortSpec, ViewMode};
+use zenfile_core::watch::{DirWatcher, WatchMsg};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, IsWindow};
@@ -66,7 +66,7 @@ pub fn is_virtual(p: &Path) -> bool {
 /// 顺序即分区：首页用平铺布局渲染时，靠 `paths::is_drive_root` 把这两段分开，
 /// 所以这里必须保证驱动器排在最后。
 pub fn home_entries() -> Vec<FileEntry> {
-    use fm_core::types::FileKind;
+    use zenfile_core::types::FileKind;
     let profile = std::env::var("USERPROFILE").unwrap_or_default();
     let mut out: Vec<FileEntry> = Vec::new();
 
@@ -103,7 +103,7 @@ pub fn home_entries() -> Vec<FileEntry> {
         }
     }
 
-    for d in fm_core::drives::list() {
+    for d in zenfile_core::drives::list() {
         // 名字跟着资源管理器走：有卷标用卷标，没有就用类型名。
         // 之前这里写死成"本地磁盘"，于是 U 盘、光驱、网络盘全叫本地磁盘。
         out.push(mk(&d.display_name(), d.root.clone()));
@@ -149,7 +149,7 @@ fn today_days() -> i64 {
 
 impl ColFilter {
     /// 这一项是不是通过了筛选。
-    pub fn matches(&self, e: &fm_core::FileEntry) -> bool {
+    pub fn matches(&self, e: &zenfile_core::FileEntry) -> bool {
         match self {
             ColFilter::Name(b) => {
                 let c = e.name.chars().next().unwrap_or(' ').to_ascii_uppercase();
@@ -508,7 +508,7 @@ pub struct App {
     ///
     /// 取代了原来的 `SharedStats`（那是 `ops::transfer_async` 的，只给一个
     /// 百分比，没有"已处理文件/剩余/已用时间/预计剩余"，也没有取消）。
-    pub xfer: Option<fm_core::transfer::Transfer>,
+    pub xfer: Option<zenfile_core::transfer::Transfer>,
     /// 后台文件操作的回执通道。worker 干完把错误串（成功则是空串）丢进来，
     /// UI 线程在 `WM_APP_IO_DONE` 里统一收口。
     pub io_tx: Sender<String>,
@@ -531,7 +531,7 @@ pub struct App {
     ///
     /// 主页容量条 / 导航窗格树 / 属性窗口共用这一份，避免各处各自猜类型。
     /// 只在"进入主页 + 定时兜底 + 设备插拔"三种时机重取，避免每帧做磁盘 IO。
-    pub drives: HashMap<String, fm_core::drives::DriveInfo>,
+    pub drives: HashMap<String, zenfile_core::drives::DriveInfo>,
     /// 上一次刷新驱动器清单的时刻（用于 WM_TIMER 里的节流）。
     pub drives_stamp: Option<std::time::Instant>,
     /// 导航窗格里**处于展开状态**的节点 key。
@@ -667,7 +667,7 @@ pub struct App {
     /// 回收站是逐盘直读 `$Recycle.Bin` 的：盘多或者垃圾多的时候能到几百毫秒，
     /// 放在 UI 线程里做就是"点一下回收站卡一下"。所以和目录枚举一样丢后台，
     /// 结果由 `WM_APP_RECYCLE` 收口。
-    pub recycle_rx: Option<Receiver<Vec<fm_core::recycle::Item>>>,
+    pub recycle_rx: Option<Receiver<Vec<zenfile_core::recycle::Item>>>,
     /// 回收站枚举的世代号。切走又切回来时，上一趟的迟到结果要丢掉，
     /// 否则会把别的视图的显示数据顶掉。
     pub recycle_gen: u64,
@@ -684,7 +684,7 @@ pub struct App {
     pub hover_recycle: Option<usize>,
     /// 回收站顶部三个按钮的悬停位：0=无，1=还原，2=彻底删除，3=清空回收站。
     pub hover_recycle_btn: u8,
-    pub recycle_items: Vec<fm_core::recycle::Item>,
+    pub recycle_items: Vec<zenfile_core::recycle::Item>,
     /// 回收站里被选中的项（按 `$R` 实体名索引）。
     pub recycle_sel: HashSet<String>,
     /// 设置页里鼠标悬停的行（存的是该行的动作编号，行位置会随开关文案变化）。
@@ -748,7 +748,7 @@ pub struct App {
     /// 「界面 / 右键菜单」的排布（顺序 + 被收进「更多」的那些）。
     pub ui_settings: crate::settings::Settings,
     /// 文件名索引（Everything 式秒搜）。整卷一份，常驻内存。
-    pub index: Option<std::sync::Arc<fm_core::index::Index>>,
+    pub index: Option<std::sync::Arc<zenfile_core::index::Index>>,
     /// `index` 属于哪个卷根（`C:\`）。换了卷要重新载入。
     pub index_root: Option<String>,
     /// 索引当前在干什么：给状态栏/列表顶上那行提示用。
@@ -960,7 +960,7 @@ pub const SEARCH_DEBOUNCE_TICKS: u8 = 2;
 pub enum IndexMsg {
     /// 建索引过程中周期性回报已扫条目数
     Progress(usize),
-    Ready(std::sync::Arc<fm_core::index::Index>),
+    Ready(std::sync::Arc<zenfile_core::index::Index>),
     Failed(String),
 }
 
@@ -1093,7 +1093,7 @@ fn path_segments(path: &Path) -> Vec<PathBuf> {
 }
 
 /// 取某个驱动器的完整信息（类型 / 卷标 / 容量），供首页容量条与导航窗格使用。
-pub fn drive_of<'a>(app: &'a App, path: &Path) -> Option<&'a fm_core::drives::DriveInfo> {
+pub fn drive_of<'a>(app: &'a App, path: &Path) -> Option<&'a zenfile_core::drives::DriveInfo> {
     let key = path.to_string_lossy().to_uppercase();
     app.drives.get(&key)
 }
@@ -1171,7 +1171,7 @@ pub const SIDEBAR_THISPC: &str = "thispc";
 
 /// 一级常用文件夹。顺序照抄资源管理器左侧的上半段。
 fn user_folders() -> Vec<(&'static str, String)> {
-    use fm_core::paths::known_folder;
+    use zenfile_core::paths::known_folder;
     [
         ("主文件夹", ""),
         ("桌面", "Desktop"),
@@ -1390,8 +1390,8 @@ impl App {
         // （资源管理器搜索结果视图同样如此，且此时"选择列"是禁用的）。
         if self.tab().search_root.is_some() {
             let mut v = self.saved_visible_cols();
-            if !v.iter().any(|x| x == fm_core::columns::C_PATH) {
-                v.insert(1, fm_core::columns::C_PATH.to_string());
+            if !v.iter().any(|x| x == zenfile_core::columns::C_PATH) {
+                v.insert(1, zenfile_core::columns::C_PATH.to_string());
             }
             return v;
         }
@@ -1401,20 +1401,20 @@ impl App {
     /// 磁盘上的列序列（不含搜索态注入的「位置」列）。
     fn saved_visible_cols(&self) -> Vec<String> {
         if self.tab().home || self.tab().settings || self.tab().recycle {
-            return fm_core::columns::default_visible();
+            return zenfile_core::columns::default_visible();
         }
         let key = norm_key(&self.tab().path);
         if !key.is_empty() {
             if let Some(v) = crate::sysview::system_columns(&self.tab().path) {
-                return fm_core::columns::normalize_visible(&v);
+                return zenfile_core::columns::normalize_visible(&v);
             }
             if let Some(l) = self.cfg.files.view.col_layouts.get(&key) {
                 if !l.visible.is_empty() {
-                    return fm_core::columns::normalize_visible(&l.visible);
+                    return zenfile_core::columns::normalize_visible(&l.visible);
                 }
             }
         }
-        fm_core::columns::default_visible()
+        zenfile_core::columns::default_visible()
     }
 
     /// 某列在当前目录的宽度（DIP）。
@@ -1436,16 +1436,16 @@ impl App {
         // 旧的三段固定宽度（用户在这轮之前拖过的）映射到同名列，
         // 否则升级后列宽会全体跳回默认值 —— 那是"我的设置被重置了"。
         let legacy = match id {
-            fm_core::columns::C_NAME => self.cfg.files.view.col_name_w,
-            fm_core::columns::C_DATE_MOD => self.cfg.files.view.col_date_w,
-            fm_core::columns::C_TYPE => self.cfg.files.view.col_kind_w,
-            fm_core::columns::C_SIZE => self.cfg.files.view.col_size_w,
+            zenfile_core::columns::C_NAME => self.cfg.files.view.col_name_w,
+            zenfile_core::columns::C_DATE_MOD => self.cfg.files.view.col_date_w,
+            zenfile_core::columns::C_TYPE => self.cfg.files.view.col_kind_w,
+            zenfile_core::columns::C_SIZE => self.cfg.files.view.col_size_w,
             _ => 0,
         };
         if legacy > 0 {
             return legacy as i32;
         }
-        fm_core::columns::default_width(id) as i32
+        zenfile_core::columns::default_width(id) as i32
     }
 
     /// 改一列的宽度：写 bag（让资源管理器也认）+ 写本目录配置（兜底）。
@@ -1462,7 +1462,7 @@ impl App {
 
     /// 新的一列宽度（第33轮按列 id 存）。同时写 bag 与本目录配置。
     pub fn set_col_width_by_id(&mut self, id: &str, w: i32) {
-        let w = (w.max(fm_core::columns::W_MIN as i32) as u32).min(fm_core::columns::W_MAX);
+        let w = (w.max(zenfile_core::columns::W_MIN as i32) as u32).min(zenfile_core::columns::W_MAX);
         if self.tab().home || self.tab().settings || self.tab().recycle {
             return;
         }
@@ -1483,13 +1483,13 @@ impl App {
                 norm_key(&path): { "widths": { id: w } }
             }}}
         });
-        let _ = fm_core::config::Config::save_user_patch(&patch);
+        let _ = zenfile_core::config::Config::save_user_patch(&patch);
         self.invalidate();
     }
 
     /// 设置某列在当前目录是否可见（名称列不可隐藏，与资源管理器一致）。
     pub fn set_col_visible(&mut self, id: &str, visible: bool) {
-        if id == fm_core::columns::C_NAME || self.tab().home {
+        if id == zenfile_core::columns::C_NAME || self.tab().home {
             return;
         }
         let mut v = self.saved_visible_cols();
@@ -1500,13 +1500,13 @@ impl App {
                 v.push(id.to_string());
             }
         }
-        v = fm_core::columns::normalize_visible(&v);
+        v = zenfile_core::columns::normalize_visible(&v);
         self.apply_visible_cols(&v);
     }
 
     /// 应用一整套列序列：写 bag + 写本目录配置 + 重画。
     pub fn apply_visible_cols(&mut self, visible: &[String]) {
-        let v = fm_core::columns::normalize_visible(visible);
+        let v = zenfile_core::columns::normalize_visible(visible);
         let path = self.tab().path.clone();
         if !self.tab().home && !self.tab().settings && !self.tab().recycle {
             crate::sysview::write_system_columns(&path, &v);
@@ -1521,7 +1521,7 @@ impl App {
             let patch = serde_json::json!({
                 "files": { "view": { "col_layouts": { key.clone(): { "visible": v } } } }
             });
-            let _ = fm_core::config::Config::save_user_patch(&patch);
+            let _ = zenfile_core::config::Config::save_user_patch(&patch);
         }
         self.invalidate();
     }
@@ -1540,19 +1540,19 @@ impl App {
         let show_ext = self.cfg.files.view.show_extensions;
         let take = self.tab().visible.len().min(200);
         for (i, id) in cols.iter().enumerate() {
-            if id == fm_core::columns::C_SIZE {
+            if id == zenfile_core::columns::C_SIZE {
                 // 大小列固定 80：内容全是 "12.3 MB"，按它算也还是那个宽度
                 self.set_col_width_by_id(id, 80);
                 continue;
             }
             // 表头文字本身是下限
-            let mut maxw = text_width_units(fm_core::columns::label_of(id));
+            let mut maxw = text_width_units(zenfile_core::columns::label_of(id));
             for k in 0..take {
                 let Some(ei) = self.tab().visible.get(k).and_then(|x| self.tab().entries.get(*x))
                 else {
                     continue;
                 };
-                let s = match fm_core::columns::cell(id, ei, show_ext) {
+                let s = match zenfile_core::columns::cell(id, ei, show_ext) {
                     Some(s) => s,
                     None => continue,
                 };
@@ -1562,12 +1562,12 @@ impl App {
                 }
             }
             // 名称列额外给图标与缩进留位
-            if id == fm_core::columns::C_NAME {
+            if id == zenfile_core::columns::C_NAME {
                 maxw += 40;
             }
             let w = maxw
-                .max(fm_core::columns::W_MIN as i32)
-                .min(fm_core::columns::W_MAX as i32);
+                .max(zenfile_core::columns::W_MIN as i32)
+                .min(zenfile_core::columns::W_MAX as i32);
             self.set_col_width_by_id(id, w);
             let _ = i;
             let _ = i;
@@ -2032,24 +2032,24 @@ impl App {
             }
             patch["ui"]["radius"] = serde_json::Value::Object(m);
         }
-        let _ = fm_core::config::Config::save_user_patch(&patch);
+        let _ = zenfile_core::config::Config::save_user_patch(&patch);
     }
 
     /// 改「选中行首竖线」的形状并写回用户层（设置-交互页）。
     ///
     /// 每次改都把整个 sel_bar 对象深合并进去 —— save_user_patch 是 deep_merge，
     /// 单字段 patch 也行，整体写更不容易漏状态。
-    pub fn set_sel_bar(&mut self, f: impl FnOnce(&mut fm_core::config::SelBarConfig)) {
+    pub fn set_sel_bar(&mut self, f: impl FnOnce(&mut zenfile_core::config::SelBarConfig)) {
         f(&mut self.cfg.ui.sel_bar);
-        let _ = fm_core::config::Config::save_user_patch(&serde_json::json!({
+        let _ = zenfile_core::config::Config::save_user_patch(&serde_json::json!({
             "ui": { "sel_bar": self.cfg.ui.sel_bar }
         }));
     }
 
     /// 改「动画」开关并写回用户层（设置-交互页）。
-    pub fn set_anim(&mut self, f: impl FnOnce(&mut fm_core::config::AnimConfig)) {
+    pub fn set_anim(&mut self, f: impl FnOnce(&mut zenfile_core::config::AnimConfig)) {
         f(&mut self.cfg.ui.anim);
-        let _ = fm_core::config::Config::save_user_patch(&serde_json::json!({
+        let _ = zenfile_core::config::Config::save_user_patch(&serde_json::json!({
             "ui": { "anim": self.cfg.ui.anim }
         }));
     }
@@ -2467,7 +2467,7 @@ impl App {
     pub fn navigate(&mut self, path: PathBuf) {
         // 入口就把 verbatim 前缀剥掉：调用方可能传的是 canonicalize 的结果
         // （带 `\\?\`），那个前缀会让目录枚举返回空列表。
-        let path = fm_core::paths::strip_verbatim(&path);
+        let path = zenfile_core::paths::strip_verbatim(&path);
         // "跟随展开到当前文件夹"：默认关。开着的时候把当前路径的所有祖先展开，
         // 让导航窗格始终显示"我在哪"。逐层读目录清单是同步的，所以这个开关
         // 关着的时候绝不会有任何额外 IO。
@@ -2682,7 +2682,7 @@ impl App {
     /// 一次 `drives::list()` 会对每个盘符做 3 次 syscall，量级很小但不该每帧跑。
     pub fn refresh_drives(&mut self) {
         self.drives.clear();
-        for d in fm_core::drives::list() {
+        for d in zenfile_core::drives::list() {
             let key = d.root.to_uppercase();
             self.drives.insert(key, d);
         }
@@ -2826,7 +2826,7 @@ impl App {
     pub fn run_search(&mut self, live: bool) {
         let q = self.tab().filter.trim().to_string();
         let cur = self.tab().path.clone();
-        let Some(root) = fm_core::index::volume_root(&cur) else {
+        let Some(root) = zenfile_core::index::volume_root(&cur) else {
             // UNC / 拿不到卷根：退回"当前子树递归"，行为跟以前一样
             let tab = self.tab_mut();
             tab.search_root = Some(tab.path.clone());
@@ -2933,7 +2933,7 @@ impl App {
         // 只判断缓存文件在不在，**绝不能在这里 Index::load()** ——
         // 那是在 UI 线程上把几十 MB 的缓存整个反序列化一遍（实测 70ms，
         // 盘更大时更久），用户按下回车那一下界面就是卡住的。
-        let has_cache = fm_core::index::Index::cache_path(root)
+        let has_cache = zenfile_core::index::Index::cache_path(root)
             .map(|p| p.exists())
             .unwrap_or(false);
         self.index_state = if has_cache {
@@ -2944,13 +2944,13 @@ impl App {
         let root_s = root.to_string();
         std::thread::spawn(move || {
             // 有缓存：直接反序列化，比遍历快两个数量级
-            if let Some(idx) = fm_core::index::Index::load(&root_s) {
+            if let Some(idx) = zenfile_core::index::Index::load(&root_s) {
                 let _ = tx.send(IndexMsg::Ready(std::sync::Arc::new(idx)));
                 return;
             }
             // 没有：遍历一遍。中途回报条数，好让界面上有可见的进度
             let last = std::cell::Cell::new(0usize);
-            let idx = fm_core::index::Index::build(&root_s, &cancel, Some(&|n: usize| {
+            let idx = zenfile_core::index::Index::build(&root_s, &cancel, Some(&|n: usize| {
                 if n >= last.get() + 20_000 {
                     last.set(n);
                     let _ = tx.send(IndexMsg::Progress(n));
@@ -2966,7 +2966,7 @@ impl App {
     }
 
     /// 用索引里的结果替换当前标签的内容。
-    pub fn apply_index_hits(&mut self, idx: &fm_core::index::Index, q: &str) {
+    pub fn apply_index_hits(&mut self, idx: &zenfile_core::index::Index, q: &str) {
         let limit = self.cfg.files.navigation.search_limit.max(50);
         let t0 = std::time::Instant::now();
         let hits = idx.query(q, limit);
@@ -3217,7 +3217,7 @@ impl App {
         let mode = self.tab().view_mode;
         let count = self.tab().visible.len();
         let content = match mode {
-            fm_core::ViewMode::LargeIcons | fm_core::ViewMode::MediumIcons => {
+            zenfile_core::ViewMode::LargeIcons | zenfile_core::ViewMode::MediumIcons => {
                 let g = crate::paint::icon_grid(l, &metrics, mode);
                 crate::paint::grid_content_h(&g, count)
             }
@@ -3248,7 +3248,7 @@ impl App {
         let ai = p.active.min(p.tabs.len() - 1);
         let tab = &mut p.tabs[ai];
         let content = match tab.view_mode {
-            fm_core::ViewMode::LargeIcons | fm_core::ViewMode::MediumIcons => {
+            zenfile_core::ViewMode::LargeIcons | zenfile_core::ViewMode::MediumIcons => {
                 let g = crate::paint::icon_grid(pl, &metrics, tab.view_mode);
                 crate::paint::grid_content_h(&g, tab.visible.len())
             }
@@ -3450,7 +3450,7 @@ impl App {
             .iter()
             .map(|(k, v)| (k.clone(), serde_json::Value::String(view_name(*v).to_string())))
             .collect();
-        if let Err(e) = fm_core::config::Config::save_user_patch(&serde_json::json!({
+        if let Err(e) = zenfile_core::config::Config::save_user_patch(&serde_json::json!({
             "files": { "view": { "overrides": map } }
         })) {
             eprintln!("保存视图覆盖失败: {e}");
@@ -3485,7 +3485,7 @@ impl App {
     }
 
     /// 把选中项（或焦点项）的完整路径以文本形式放进剪贴板
-    pub fn copy_paths_text(&mut self) -> Result<(), fm_core::Error> {
+    pub fn copy_paths_text(&mut self) -> Result<(), zenfile_core::Error> {
         let paths = self.tab().selected_paths();
         if paths.is_empty() {
             return Ok(());
@@ -3515,7 +3515,7 @@ impl App {
     pub fn launch_file(&self, path: &Path) {
         use windows::Win32::UI::Shell::ShellExecuteW;
         // ShellExecute 同样不接受 verbatim 前缀
-        let path = fm_core::paths::strip_verbatim(path);
+        let path = zenfile_core::paths::strip_verbatim(path);
         unsafe {
             let file = windows::core::HSTRING::from(path.to_string_lossy().as_ref());
             let _ = ShellExecuteW(
@@ -3681,9 +3681,9 @@ impl App {
                 // 会把 WndProc 重入进 `&mut App`；而且只给百分比，拿不到
                 // "已处理/剩余/已用/预计剩余"）。
                 let kind = if mode == ClipMode::Move {
-                    fm_core::transfer::Kind::Move
+                    zenfile_core::transfer::Kind::Move
                 } else {
-                    fm_core::transfer::Kind::Copy
+                    zenfile_core::transfer::Kind::Copy
                 };
                 self.start_transfer(kind, dest, files);
                 self.invalidate();
@@ -3715,7 +3715,7 @@ impl App {
     /// 这里要的是能随时读到进度、能取消的句柄。
     pub fn start_transfer(
         &mut self,
-        kind: fm_core::transfer::Kind,
+        kind: zenfile_core::transfer::Kind,
         dest: PathBuf,
         items: Vec<PathBuf>,
     ) {
@@ -3729,7 +3729,7 @@ impl App {
             return;
         }
         let threads = self.cfg.files.operations.worker_threads.clamp(2, 32);
-        let t = fm_core::transfer::start(kind, &dest, items, threads);
+        let t = zenfile_core::transfer::start(kind, &dest, items, threads);
         crate::progress::open(kind, &dest, t.stats.clone(), t.cancel.clone(), self.hwnd);
         self.xfer = Some(t);
     }
@@ -3772,7 +3772,7 @@ impl App {
     /// 把我们的窗口 disable 掉（那才是真的"卡死"）。
     fn spawn_io<F>(&mut self, label: &str, job: F)
     where
-        F: FnOnce() -> fm_core::Result<()> + Send + 'static,
+        F: FnOnce() -> zenfile_core::Result<()> + Send + 'static,
     {
         let tx = self.io_tx.clone();
         let hwnd_raw = self.hwnd.0 as usize;
@@ -3828,7 +3828,7 @@ impl App {
             let _guard = ComGuard::init();
             // 分盘回调：扫完一个盘就发一批，界面能边扫边显示，
             // 不用等最后一个盘扫完才出第一条（几万条时要等好几秒）。
-            fm_core::recycle::list_streaming(|batch| {
+            zenfile_core::recycle::list_streaming(|batch| {
                 let _ = tx.send(batch);
                 unsafe {
                     windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -3957,9 +3957,9 @@ impl App {
         // `IFileOperation`，它的模态循环把 WndProc 重入进 `&mut App`，
         // 表现为"拖完一松手就僵住"）。
         let kind = if mode == ClipMode::Move {
-            fm_core::transfer::Kind::Move
+            zenfile_core::transfer::Kind::Move
         } else {
-            fm_core::transfer::Kind::Copy
+            zenfile_core::transfer::Kind::Copy
         };
         self.start_transfer(kind, dest, items);
         self.invalidate();
@@ -3968,9 +3968,9 @@ impl App {
     /// 拖拽到另一个标签页不适用时的替代：粘贴到指定目录（供外部调用）。
     pub fn paste_into(&mut self, dest: &Path, files: Vec<PathBuf>, mode: ClipMode) {
         let kind = if mode == ClipMode::Move {
-            fm_core::transfer::Kind::Move
+            zenfile_core::transfer::Kind::Move
         } else {
-            fm_core::transfer::Kind::Copy
+            zenfile_core::transfer::Kind::Copy
         };
         self.start_transfer(kind, dest.to_path_buf(), files);
     }
@@ -4243,10 +4243,10 @@ impl App {
             Command::ViewIcons => self.set_view(ViewMode::LargeIcons),
             Command::ViewList => self.set_view(ViewMode::List),
             Command::ViewDetails => self.set_view(ViewMode::Details),
-            Command::SortByName => self.sort_column(fm_core::SortKey::Name),
-            Command::SortByModified => self.sort_column(fm_core::SortKey::Modified),
-            Command::SortByType => self.sort_column(fm_core::SortKey::Type),
-            Command::SortBySize => self.sort_column(fm_core::SortKey::Size),
+            Command::SortByName => self.sort_column(zenfile_core::SortKey::Name),
+            Command::SortByModified => self.sort_column(zenfile_core::SortKey::Modified),
+            Command::SortByType => self.sort_column(zenfile_core::SortKey::Type),
+            Command::SortBySize => self.sort_column(zenfile_core::SortKey::Size),
             // 只改方向：点"递减顺序"时不该把列也一起换掉（资源管理器同理）
             Command::SortAscending => self.set_sort_direction(false),
             Command::SortDescending => self.set_sort_direction(true),
@@ -4344,7 +4344,7 @@ impl App {
     }
 
     pub fn persist_view_pref(&self) {
-        if let Err(e) = fm_core::config::Config::save_user_patch(&serde_json::json!({
+        if let Err(e) = zenfile_core::config::Config::save_user_patch(&serde_json::json!({
             "files": {
                 "view": {
                     "show_hidden": self.cfg.files.view.show_hidden,
@@ -4366,7 +4366,7 @@ impl App {
 
     /// 拖过导航窗格分隔线之后把宽度记下来。
     pub fn persist_sidebar_width(&self) {
-        if let Err(e) = fm_core::config::Config::save_user_patch(&serde_json::json!({
+        if let Err(e) = zenfile_core::config::Config::save_user_patch(&serde_json::json!({
             "ui": { "sidebar_width": self.cfg.ui.sidebar_width }
         })) {
             eprintln!("保存导航窗格宽度失败: {e}");
@@ -4386,7 +4386,7 @@ impl App {
     /// 循环切换在只有两三个选项时还能用，选项一多（大小单位 7 档）就得连点
     /// 好几下才能到想要的那一档，而且不知道点下去会变成什么。下拉菜单一次看全。
     pub fn set_size_unit(&mut self, idx: usize) {
-        let u = fm_core::SizeUnit::ALL.get(idx).copied().unwrap_or(fm_core::SizeUnit::Auto);
+        let u = zenfile_core::SizeUnit::ALL.get(idx).copied().unwrap_or(zenfile_core::SizeUnit::Auto);
         self.cfg.files.view.size_unit = u.name().to_string();
         self.persist_view_pref();
         self.invalidate();
@@ -4396,7 +4396,7 @@ impl App {
         let next = if dark { "dark" } else { "light" };
         self.cfg.core.theme = next.to_string();
         self.theme = if dark { theme::dark() } else { theme::light() };
-        let _ = fm_core::config::Config::save_user_patch(&serde_json::json!({
+        let _ = zenfile_core::config::Config::save_user_patch(&serde_json::json!({
             "core": { "theme": next }
         }));
         // 主题切换后图标系统若接管需重烘（optimized 套随明暗刷新缓存键）。
@@ -4416,7 +4416,7 @@ impl App {
     }
 
     fn persist_icon_prefs(&self) {
-        if let Err(e) = fm_core::config::Config::save_user_patch(&serde_json::json!({
+        if let Err(e) = zenfile_core::config::Config::save_user_patch(&serde_json::json!({
             "ui": { "icon_theme": self.cfg.ui.icon_theme }
         })) {
             eprintln!("保存图标偏好失败: {e}");
@@ -4438,9 +4438,9 @@ impl App {
     }
 
     pub fn cycle_size_unit(&mut self) {
-        let cur = fm_core::SizeUnit::parse(&self.cfg.files.view.size_unit);
-        let i = fm_core::SizeUnit::ALL.iter().position(|u| *u == cur).unwrap_or(0);
-        let next = fm_core::SizeUnit::ALL[(i + 1) % fm_core::SizeUnit::ALL.len()];
+        let cur = zenfile_core::SizeUnit::parse(&self.cfg.files.view.size_unit);
+        let i = zenfile_core::SizeUnit::ALL.iter().position(|u| *u == cur).unwrap_or(0);
+        let next = zenfile_core::SizeUnit::ALL[(i + 1) % zenfile_core::SizeUnit::ALL.len()];
         self.cfg.files.view.size_unit = next.name().to_string();
         self.persist_view_pref();
         self.invalidate();
@@ -4451,7 +4451,7 @@ impl App {
         let next = if self.cfg.core.theme == "light" { "dark" } else { "light" };
         self.cfg.core.theme = next.to_string();
         self.theme = if next == "light" { theme::light() } else { theme::dark() };
-        let _ = fm_core::config::Config::save_user_patch(&serde_json::json!({
+        let _ = zenfile_core::config::Config::save_user_patch(&serde_json::json!({
             "core": { "theme": next }
         }));
         // 主题切换后图标系统若接管需重烘（同 set_theme）。
@@ -4505,7 +4505,7 @@ impl App {
 
     /// 还原回收站里选中的项。
     pub fn restore_recycle(&mut self) {
-        let picked: Vec<fm_core::recycle::Item> = self
+        let picked: Vec<zenfile_core::recycle::Item> = self
             .recycle_items
             .iter()
             .filter(|it| self.recycle_sel.contains(&it.id))
@@ -4514,14 +4514,14 @@ impl App {
         if picked.is_empty() {
             return;
         }
-        let n = fm_core::recycle::restore(&picked);
+        let n = zenfile_core::recycle::restore(&picked);
         report(self.hwnd, &format!("已还原 {n} 项"));
         self.reload();
     }
 
     /// 彻底删除回收站里选中的项。
     pub fn purge_recycle(&mut self) {
-        let picked: Vec<fm_core::recycle::Item> = self
+        let picked: Vec<zenfile_core::recycle::Item> = self
             .recycle_items
             .iter()
             .filter(|it| self.recycle_sel.contains(&it.id))
@@ -4533,7 +4533,7 @@ impl App {
         if !confirm(self.hwnd, &format!("彻底删除这 {} 项？此操作不可撤销。", picked.len())) {
             return;
         }
-        let n = fm_core::recycle::remove(&picked);
+        let n = zenfile_core::recycle::remove(&picked);
         report(self.hwnd, &format!("已彻底删除 {n} 项"));
         self.reload();
     }
@@ -4543,7 +4543,7 @@ impl App {
         if !confirm(self.hwnd, "清空回收站？此操作不可撤销。") {
             return;
         }
-        let _ = fm_core::recycle::empty();
+        let _ = zenfile_core::recycle::empty();
         self.reload();
     }
 
@@ -4585,7 +4585,7 @@ impl App {
 
     /// 只把 UI 开关写回 settings.user.json，不覆盖其它字段。
     pub fn persist_ui_pref(&self) {
-        if let Err(e) = fm_core::config::Config::save_user_patch(&serde_json::json!({
+        if let Err(e) = zenfile_core::config::Config::save_user_patch(&serde_json::json!({
             "ui": {
                 "sidebar_visible": self.cfg.ui.sidebar_visible,
                 "statusbar_visible": self.cfg.ui.statusbar_visible,
@@ -4670,7 +4670,7 @@ impl App {
         if let Some(m) = self.cfg.modules.get_mut(id) {
             m.enabled = on;
         }
-        let _ = fm_core::config::Config::save_user_patch(&serde_json::json!({
+        let _ = zenfile_core::config::Config::save_user_patch(&serde_json::json!({
             "modules": { id: { "enabled": on } }
         }));
         self.invalidate();
@@ -4793,7 +4793,7 @@ impl App {
             None => String::new(),
             Some(p) => {
                 let s = p.to_string_lossy().to_string();
-                if fm_core::index::volume_root(p).as_deref() == Some(s.as_str()) {
+                if zenfile_core::index::volume_root(p).as_deref() == Some(s.as_str()) {
                     // 把命中数与耗时摆出来：这既是"秒搜"的证据，也方便一眼看出
                     // 是索引查的还是临时兜的。
                     if self.search_ms > 0.0 {
@@ -4856,7 +4856,7 @@ impl App {
                     .map(|e| e.path())
                     .collect();
                 v.sort_by(|a, b| {
-                    fm_core::natural::natural_cmp(
+                    zenfile_core::natural::natural_cmp(
                         &a.file_name().unwrap_or_default().to_string_lossy(),
                         &b.file_name().unwrap_or_default().to_string_lossy(),
                     )
@@ -5119,7 +5119,7 @@ impl App {
                 t.home,
                 t.recycle,
                 t.settings,
-                fm_core::paths::strip_verbatim(&t.path).to_path_buf(),
+                zenfile_core::paths::strip_verbatim(&t.path).to_path_buf(),
             )
         };
         // 搜索态判定：过滤词非空且确实处于搜索结果视图（边打字边筛的
@@ -5237,10 +5237,10 @@ fn sort_rows(app: &App) -> Vec<menu::MenuEntry> {
     let key = app.tab().sort.key;
     let desc = app.tab().sort.descending;
     vec![
-        pick_row("名称", Command::SortByName, key == fm_core::SortKey::Name),
-        pick_row("修改日期", Command::SortByModified, key == fm_core::SortKey::Modified),
-        pick_row("类型", Command::SortByType, key == fm_core::SortKey::Type),
-        pick_row("大小", Command::SortBySize, key == fm_core::SortKey::Size),
+        pick_row("名称", Command::SortByName, key == zenfile_core::SortKey::Name),
+        pick_row("修改日期", Command::SortByModified, key == zenfile_core::SortKey::Modified),
+        pick_row("类型", Command::SortByType, key == zenfile_core::SortKey::Type),
+        pick_row("大小", Command::SortBySize, key == zenfile_core::SortKey::Size),
         menu::MenuEntry::sep(),
         pick_row("递增顺序", Command::SortAscending, !desc),
         pick_row("递减顺序", Command::SortDescending, desc),
@@ -5251,9 +5251,9 @@ fn sort_rows(app: &App) -> Vec<menu::MenuEntry> {
 fn view_rows(app: &App) -> Vec<menu::MenuEntry> {
     let mode = app.tab().view_mode;
     vec![
-        pick_row("大图标", Command::ViewIcons, mode == fm_core::ViewMode::LargeIcons),
-        pick_row("列表", Command::ViewList, mode == fm_core::ViewMode::List),
-        pick_row("详细信息", Command::ViewDetails, mode == fm_core::ViewMode::Details),
+        pick_row("大图标", Command::ViewIcons, mode == zenfile_core::ViewMode::LargeIcons),
+        pick_row("列表", Command::ViewList, mode == zenfile_core::ViewMode::List),
+        pick_row("详细信息", Command::ViewDetails, mode == zenfile_core::ViewMode::Details),
     ]
 }
 
@@ -5583,11 +5583,11 @@ fn is_wide(c: char) -> bool {
 }
 
 pub fn human(bytes: u64) -> String {
-    fm_core::SizeUnit::Auto.format(bytes)
+    zenfile_core::SizeUnit::Auto.format(bytes)
 }
 
 /// 按用户选定的单位格式化（设置页里的"大小单位"）。
-pub fn human_unit(bytes: u64, unit: fm_core::SizeUnit) -> String {
+pub fn human_unit(bytes: u64, unit: zenfile_core::SizeUnit) -> String {
     unit.format(bytes)
 }
 
@@ -5634,7 +5634,7 @@ fn parse_view(s: &str) -> ViewMode {
 
 /// 归一化成"视图覆盖表"的键：小写、去掉 `\\?\`、去掉尾斜杠。
 fn norm_key(p: &Path) -> String {
-    let s = fm_core::paths::strip_verbatim(p).to_string_lossy().replace('/', "\\");
+    let s = zenfile_core::paths::strip_verbatim(p).to_string_lossy().replace('/', "\\");
     let s = s.trim_end_matches('\\').to_lowercase();
     s.to_string()
 }

@@ -1,5 +1,5 @@
 [package]
-name = "fm-app"
+name = "zenfile-app"
 description = "ZenFile 资源管理器主体进程：自绘外壳 + 文件视图"
 version.workspace = true
 edition.workspace = true
@@ -12,7 +12,7 @@ name = "ZenFile"
 path = "src/main.rs"
 
 [dependencies]
-fm-core = { workspace = true }
+zenfile-core = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 windows.workspace = true

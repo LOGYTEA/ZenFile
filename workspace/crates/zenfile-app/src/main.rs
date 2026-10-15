@@ -1,4 +1,4 @@
-//! fm-app 主体进程入口。
+//! zenfile-app 主体进程入口。
 //!
 //! 职责边界（技术方案 §3.1 / §3.6）：
 //!   - 只有本进程注册托盘与开机自启；
@@ -57,9 +57,9 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 
 use app::{init_com, App};
-use fm_core::config;
-use fm_core::hotkey;
-use fm_core::paths::Target;
+use zenfile_core::config;
+use zenfile_core::hotkey;
+use zenfile_core::paths::Target;
 
 /// App 实例的全局裸指针。WndProc 与子控件回调需要通过它访问状态；
 /// 全程单线程 UI，因此不存在数据竞争。
@@ -105,11 +105,11 @@ const HOTKEY_MAIN: i32 = 1;
 /// 系统双击时限之上一点点：低于它是"连着两下"（= 打开），高于它算"两次慢速单击"（= 改名）。
 const DOUBLE_CLICK_MS: u64 = 500;
 
-/// fm-app 自己的自检项（`fm-core::selftest` 碰不到 UI 层这边的模块）。
+/// zenfile-app 自己的自检项（`zenfile-core::selftest` 碰不到 UI 层这边的模块）。
 fn app_selftest() -> i32 {
     let cases = crate::sysview::selftest();
     let mut pass = 0usize;
-    println!("\n—— fm-app 附加自检 ——");
+    println!("\n—— zenfile-app 附加自检 ——");
     for (name, ok, detail) in &cases {
         if *ok {
             pass += 1;
@@ -132,7 +132,7 @@ fn main() {
     if args.iter().any(|a| a == "--selftest" || a == "--self-test") {
         // Windows 子系统下 CRT 的 stdout 是空的，先把父进程的控制台挂回来
         unsafe { attach_console() };
-        let rc = fm_core::selftest::run();
+        let rc = zenfile_core::selftest::run();
         let rc2 = app_selftest();
         std::process::exit(if rc != 0 || rc2 != 0 { 1 } else { 0 });
     }
@@ -141,7 +141,7 @@ fn main() {
         println!(
             "{APP_TITLE} {APP_VERSION} (pkg {} / protocol {})",
             env!("CARGO_PKG_VERSION"),
-            fm_core::PROTOCOL_VERSION
+            zenfile_core::PROTOCOL_VERSION
         );
         return;
     }
@@ -181,15 +181,15 @@ fn main() {
     // COM 必须在 STA（§2 / §7.1）：上下文菜单与 IFileOperation 的前置条件。
     init_com();
 
-    let cfg = match (|| -> fm_core::Result<fm_core::config::Config> {
+    let cfg = match (|| -> zenfile_core::Result<zenfile_core::config::Config> {
         let dir = config::app_dir()?;
         std::fs::create_dir_all(&dir)?;
-        fm_core::config::Config::load(&dir)
+        zenfile_core::config::Config::load(&dir)
     })() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("配置加载失败：{e}，使用默认值");
-            fm_core::config::Config::defaults().unwrap()
+            zenfile_core::config::Config::defaults().unwrap()
         }
     };
 
@@ -282,7 +282,7 @@ fn main() {
 /// 在同一线程里注册两次会失败），托盘由隐藏的托盘宿主窗口负责，与这里无关。
 fn spawn_window(
     instance: Option<HINSTANCE>,
-    cfg: fm_core::config::Config,
+    cfg: zenfile_core::config::Config,
     start: PathBuf,
     primary: bool,
     show: bool,
@@ -431,14 +431,14 @@ fn persist_window_rect(hwnd: HWND, force: bool) {
             return;
         }
         let r = wp.rcNormalPosition;
-        let wc = fm_core::config::WindowConfig {
+        let wc = zenfile_core::config::WindowConfig {
             x: r.left,
             y: r.top,
             w: r.right - r.left,
             h: r.bottom - r.top,
             maximized: max,
         };
-        let _ = fm_core::config::Config::save_user_patch(&serde_json::json!({
+        let _ = zenfile_core::config::Config::save_user_patch(&serde_json::json!({
             "ui": { "window": wc }
         }));
     }
@@ -483,7 +483,7 @@ pub fn new_window(path: PathBuf) {
     let instance = unsafe { GetModuleHandleW(PCWSTR::null()).ok().map(|m| HINSTANCE(m.0)) };
     let cfg = match app_ref_opt() {
         Some(a) => a.cfg.clone(),
-        None => match fm_core::config::Config::defaults() {
+        None => match zenfile_core::config::Config::defaults() {
             Ok(c) => c,
             Err(_) => return,
         },
@@ -572,7 +572,7 @@ unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                     .map(|m| HINSTANCE(m.0));
                 let cfg = app_ref_opt()
                     .map(|a| a.cfg.clone())
-                    .unwrap_or_else(|| fm_core::config::Config::defaults().unwrap());
+                    .unwrap_or_else(|| zenfile_core::config::Config::defaults().unwrap());
                 if let Some(h) = spawn_window(instance, cfg, p, false, true) {
                     let _ = ShowWindow(h, SW_SHOW);
                     let _ = SetForegroundWindow(h);
@@ -591,7 +591,7 @@ unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                             .map(|m| HINSTANCE(m.0));
                         let cfg = app_ref_opt()
                             .map(|a| a.cfg.clone())
-                            .unwrap_or_else(|| fm_core::config::Config::defaults().unwrap());
+                            .unwrap_or_else(|| zenfile_core::config::Config::defaults().unwrap());
                         if let Some(h) =
                             spawn_window(instance, cfg, PathBuf::from(app::HOME_PATH), false, true)
                         {
@@ -1327,7 +1327,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             // 状态栏布局切换按钮悬停
             let hover_view = if app.cfg.ui.statusbar_visible {
                 match paint::status_view_hit(&l, &app.metrics, x, y) {
-                    Some(fm_core::ViewMode::LargeIcons) => 1u8,
+                    Some(zenfile_core::ViewMode::LargeIcons) => 1u8,
                     Some(_) => 2u8,
                     None => 0u8,
                 }
@@ -1997,7 +1997,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             }
             let header_h = header_height(app);
             let view_top = pl.view.top + header_h;
-            if y >= pl.view.top && y < view_top && app.tab().view_mode == fm_core::ViewMode::Details {
+            if y >= pl.view.top && y < view_top && app.tab().view_mode == zenfile_core::ViewMode::Details {
                 // 先判列最右端那个「筛选」小三角：它压在列里，先判整列的话
                 // 点三角永远只会变成"再排一次序"。
                 if let Some(col) = paint::header_col_hit(app, &pl, x, y) {
@@ -2370,7 +2370,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             } else {
                 // 表头右键 = 排序/筛选菜单，不是文件右键。放在取 target 之前
                 // 拦下来，否则它会落进"清空选中 + 弹目录菜单"那条路。
-                if app.tab().view_mode == fm_core::ViewMode::Details
+                if app.tab().view_mode == zenfile_core::ViewMode::Details
                     && y >= pl.view.top
                     && y < view_top
                     && x >= pl.view.left
@@ -2517,7 +2517,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     mod_down(0x10, "shift+", &mut acc);
                     acc.push_str(name);
                     app.cfg.core.hotkeys.insert(act.clone(), acc.clone());
-                    let _ = fm_core::config::Config::save_user_patch(&serde_json::json!({
+                    let _ = zenfile_core::config::Config::save_user_patch(&serde_json::json!({
                         "core": { "hotkeys": { act: acc } }
                     }));
                     app.hotkey_capture = None;
@@ -2606,7 +2606,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
 fn view_row_at(app: &App, l: &paint::Layout, x: i32, y: i32, view_top: i32) -> Option<usize> {
     let tab = app.tab();
     let mode = tab.view_mode;
-    if matches!(mode, fm_core::ViewMode::LargeIcons | fm_core::ViewMode::MediumIcons) {
+    if matches!(mode, zenfile_core::ViewMode::LargeIcons | zenfile_core::ViewMode::MediumIcons) {
         let g = paint::icon_grid(l, &app.metrics, mode);
         paint::grid_hit(&g, l, x, y, view_top, tab.scroll, tab.visible.len())
     } else {
@@ -2615,7 +2615,7 @@ fn view_row_at(app: &App, l: &paint::Layout, x: i32, y: i32, view_top: i32) -> O
         // 视觉上行背景现在**铺满整行**（见 paint 那边的注释），所以不能再用
         // item_rect 的 right 判（它是 l.view.right，恒真 = 判断从来没生效过 ——
         // 用户"说过几遍"的那条）。改用**列区右沿**：最后一列（大小）结束处。
-        if mode == fm_core::ViewMode::Details {
+        if mode == zenfile_core::ViewMode::Details {
             let icon_size = (16.0 * app.metrics.scale) as i32;
             // 列区右沿 = 最后一列右沿（与行高亮/表头分隔线同源，第32轮 #1）
             let boxes = paint::col_boxes(app, l, icon_size);
@@ -2786,7 +2786,7 @@ fn drop_target_at(app: &mut App, l: &paint::Layout, x: i32, y: i32) -> Option<ap
     None
 }
 
-/// 目录栏最右侧「批量重命名 ▾」的下拉：五种模式，各对应 `fm_core::bulk` 一条规则。
+/// 目录栏最右侧「批量重命名 ▾」的下拉：五种模式，各对应 `zenfile_core::bulk` 一条规则。
 ///
 /// 菜单定位在按钮**正下方**左对齐 —— 下拉菜单的通行摆法，别从鼠标位置弹。
 fn show_bulk_rename_menu(hwnd: HWND, app: &mut App, l: &paint::Layout) {
@@ -3017,7 +3017,7 @@ fn select_marquee_into(app: &mut App, l: &paint::Layout, origin: (i32, i32), cur
 
 /// 详细信息视图表头的高度；其它视图没有表头。
 fn header_height(app: &App) -> i32 {
-    if app.tab().view_mode == fm_core::ViewMode::Details {
+    if app.tab().view_mode == zenfile_core::ViewMode::Details {
         (26.0 * app.metrics.scale) as i32
     } else {
         0
@@ -3118,8 +3118,8 @@ fn show_setting_dropdown(hwnd: HWND, app: &mut App, l: &paint::Layout, action: u
             ]
         }
         paint::SET_UNIT => {
-            let cur = fm_core::SizeUnit::parse(&app.cfg.files.view.size_unit);
-            fm_core::SizeUnit::ALL
+            let cur = zenfile_core::SizeUnit::parse(&app.cfg.files.view.size_unit);
+            zenfile_core::SizeUnit::ALL
                 .iter()
                 .enumerate()
                 .map(|(i, u)| {
@@ -3285,16 +3285,16 @@ fn header_choose_columns_rows(app: &App) -> Vec<menu::MenuEntry> {
     let locked = app.tab().search_root.is_some();
     // 名称恒在、恒显、不可点 —— 与 Explorer 一致（没有任何列表能没有"名称"）
     // 只内联**前 8 个**常用列；其余 13 个走「其他(M)...」对话框（滚动列出）。
-    for id in fm_core::columns::COL_ALL.iter().take(8) {
+    for id in zenfile_core::columns::COL_ALL.iter().take(8) {
         let on = app.is_col_visible(id);
         // 选中态 = 右键菜单同款行首橙色竖线（`selected`），悬停时让位给蓝色
         // 悬停条（渲染层的既有规则），与「查看 → 详细信息」一套语言。
         let e = menu::MenuEntry::item(
-            fm_core::columns::label_of(id),
+            zenfile_core::columns::label_of(id),
             menu::Command::ToggleColumn((*id).to_string()),
         )
         .with_selected(on);
-        if *id == fm_core::columns::C_NAME || locked {
+        if *id == zenfile_core::columns::C_NAME || locked {
             v.push(e.with_disabled(true));
         } else {
             v.push(e);
@@ -3334,25 +3334,25 @@ fn show_header_context_menu(hwnd: HWND, app: &mut App, _l: &paint::Layout, _col:
 /// 筛选/排序这两套老逻辑还是按语义号组织的，先转过去。
 fn header_sem_of(id: &str) -> u8 {
     match id {
-        fm_core::columns::C_NAME => 0,
-        fm_core::columns::C_DATE_MOD
-        | fm_core::columns::C_DATE_CREATED
-        | fm_core::columns::C_DATE_ACCESSED => 1,
-        fm_core::columns::C_TYPE => 2,
-        fm_core::columns::C_SIZE => 3,
+        zenfile_core::columns::C_NAME => 0,
+        zenfile_core::columns::C_DATE_MOD
+        | zenfile_core::columns::C_DATE_CREATED
+        | zenfile_core::columns::C_DATE_ACCESSED => 1,
+        zenfile_core::columns::C_TYPE => 2,
+        zenfile_core::columns::C_SIZE => 3,
         _ => 4,
     }
 }
 
 /// 列 id → SortKey（不可排序的列返回 None）。
-fn sort_key_of_col(id: &str) -> Option<fm_core::SortKey> {
+fn sort_key_of_col(id: &str) -> Option<zenfile_core::SortKey> {
     match id {
-        fm_core::columns::C_NAME => Some(fm_core::SortKey::Name),
-        fm_core::columns::C_DATE_MOD
-        | fm_core::columns::C_DATE_CREATED
-        | fm_core::columns::C_DATE_ACCESSED => Some(fm_core::SortKey::Modified),
-        fm_core::columns::C_TYPE => Some(fm_core::SortKey::Type),
-        fm_core::columns::C_SIZE => Some(fm_core::SortKey::Size),
+        zenfile_core::columns::C_NAME => Some(zenfile_core::SortKey::Name),
+        zenfile_core::columns::C_DATE_MOD
+        | zenfile_core::columns::C_DATE_CREATED
+        | zenfile_core::columns::C_DATE_ACCESSED => Some(zenfile_core::SortKey::Modified),
+        zenfile_core::columns::C_TYPE => Some(zenfile_core::SortKey::Type),
+        zenfile_core::columns::C_SIZE => Some(zenfile_core::SortKey::Size),
         _ => None,
     }
 }
@@ -3640,12 +3640,12 @@ fn header_click(app: &mut App, l: &paint::Layout, x: i32) {
         return;
     };
     let key = match id {
-        fm_core::columns::C_NAME => Some(fm_core::SortKey::Name),
-        fm_core::columns::C_DATE_MOD
-        | fm_core::columns::C_DATE_CREATED
-        | fm_core::columns::C_DATE_ACCESSED => Some(fm_core::SortKey::Modified),
-        fm_core::columns::C_TYPE => Some(fm_core::SortKey::Type),
-        fm_core::columns::C_SIZE => Some(fm_core::SortKey::Size),
+        zenfile_core::columns::C_NAME => Some(zenfile_core::SortKey::Name),
+        zenfile_core::columns::C_DATE_MOD
+        | zenfile_core::columns::C_DATE_CREATED
+        | zenfile_core::columns::C_DATE_ACCESSED => Some(zenfile_core::SortKey::Modified),
+        zenfile_core::columns::C_TYPE => Some(zenfile_core::SortKey::Type),
+        zenfile_core::columns::C_SIZE => Some(zenfile_core::SortKey::Size),
         _ => None,
     };
     if let Some(k) = key {
@@ -3705,8 +3705,8 @@ fn handle_key(app: &mut App, key: i32) {
     let alt = unsafe { GetKeyState(0x12) < 0 };
     match () {
         _ if ctrl && !shift && key == 0x41 => app.select_all(),
-        _ if ctrl && key == 0x43 => app.clipboard_write(fm_core::clipboard::ClipMode::Copy),
-        _ if ctrl && key == 0x58 => app.clipboard_write(fm_core::clipboard::ClipMode::Move),
+        _ if ctrl && key == 0x43 => app.clipboard_write(zenfile_core::clipboard::ClipMode::Copy),
+        _ if ctrl && key == 0x58 => app.clipboard_write(zenfile_core::clipboard::ClipMode::Move),
         // 必须带 !shift：否则 Ctrl+Shift+V（循环视图）会被这一条截胡 ——
         // match 是按书写顺序匹配的，粘贴排在前面就永远轮不到下面那行。
         _ if ctrl && !shift && key == 0x56 => app.paste(),
@@ -3739,10 +3739,10 @@ fn handle_key(app: &mut App, key: i32) {
         // 属性 Alt+Enter
         _ if alt && key == 0x0D => app.run_command(menu::Command::Properties),
         // Ctrl+1..4 直接切视图
-        _ if ctrl && !shift && key == 0x31 => app.set_view(fm_core::ViewMode::Details),
-        _ if ctrl && !shift && key == 0x32 => app.set_view(fm_core::ViewMode::List),
-        _ if ctrl && !shift && key == 0x33 => app.set_view(fm_core::ViewMode::MediumIcons),
-        _ if ctrl && !shift && key == 0x34 => app.set_view(fm_core::ViewMode::LargeIcons),
+        _ if ctrl && !shift && key == 0x31 => app.set_view(zenfile_core::ViewMode::Details),
+        _ if ctrl && !shift && key == 0x32 => app.set_view(zenfile_core::ViewMode::List),
+        _ if ctrl && !shift && key == 0x33 => app.set_view(zenfile_core::ViewMode::MediumIcons),
+        _ if ctrl && !shift && key == 0x34 => app.set_view(zenfile_core::ViewMode::LargeIcons),
         _ if key == 0x70 => app.reload(),
         _ if key == 0x71 => app.begin_rename(),
         _ if key == 0x2E && !shift => app.delete_selected(false),
@@ -3774,7 +3774,7 @@ pub(crate) fn on_address_enter() {
     let cwd = app.tab().path.clone();
     // 回车之后地址栏要收回面包屑 —— 不收回的话它会一直挂在屏幕上挡着路径
     paint::end_address_edit(app, true);
-    match fm_core::paths::resolve(&text, &cwd) {
+    match zenfile_core::paths::resolve(&text, &cwd) {
         Ok(Target::Navigate(p)) => {
             if p.is_dir() {
                 app.navigate(p.clone());

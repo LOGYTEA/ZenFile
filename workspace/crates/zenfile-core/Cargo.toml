@@ -1,5 +1,5 @@
 [package]
-name = "fm-core"
+name = "zenfile-core"
 description = "UI 无关的原生资源管理内核：目录引擎、文件操作、配置模型、IPC 协议、进程树"
 version.workspace = true
 edition.workspace = true

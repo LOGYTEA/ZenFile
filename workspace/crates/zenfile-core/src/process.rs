@@ -1,8 +1,8 @@
 //! 子进程模型与关机/启动管理（技术方案 §3 / §11）。
 //!
 //! 任务管理器的树状折叠依赖父子进程关系，因此：
-//!   1. 所有模块只能由 app.exe 用 CreateProcess 启动；
-//!   2. app.exe 常驻，否则子进程会升为顶层孤儿且再也折不回去；
+//!   1. 所有模块只能由 ZenFile.exe 用 CreateProcess 启动；
+//!   2. ZenFile.exe 常驻，否则子进程会升为顶层孤儿且再也折不回去；
 //!   3. 子进程不得注册托盘 / 自启 / 显示主窗口。
 
 use std::ffi::{c_void, OsStr};
@@ -95,7 +95,7 @@ impl ProcessTree {
         Ok(pid)
     }
 
-    /// 退出顺序（§3.6 写死，绝不能让 app.exe 先退）：
+    /// 退出顺序（§3.6 写死，绝不能让 ZenFile.exe 先退）：
     ///   1. 友好通知 shutdown（本实现通过 Job 反 Providing）
     pub fn shutdown_all(&mut self) {
         for child in self.children.drain(..) {

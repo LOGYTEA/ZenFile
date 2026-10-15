@@ -1,6 +1,6 @@
 //! 文件名索引基准：回答"为啥实现不了秒搜"。
 //!
-//! 用法：`cargo run --release -p fm-core --example idxbench -- C:\`
+//! 用法：`cargo run --release -p zenfile-core --example idxbench -- C:\`
 //!
 //! 依次测四件事，全程打印毫秒数：
 //!   1. 建索引（冷启动，没有缓存时第一次搜索要付的代价）
@@ -26,11 +26,11 @@ fn main() {
     let cancel = AtomicBool::new(false);
 
     // 0) 已有缓存的话先报一下大小与条数
-    if let Some(p) = fm_core::index::Index::cache_path(&root) {
+    if let Some(p) = zenfile_core::index::Index::cache_path(&root) {
         if let Ok(md) = std::fs::metadata(&p) {
             println!("\n[0] 现有缓存 {} 字节", md.len());
             let t = Instant::now();
-            if let Some(idx) = fm_core::index::Index::load(&root) {
+            if let Some(idx) = zenfile_core::index::Index::load(&root) {
                 println!("    载入 {} 条，{:>8.1} ms", idx.len(), ms(t));
             }
         } else {
@@ -40,7 +40,7 @@ fn main() {
 
     // 1) 建索引
     let t = Instant::now();
-    let idx = fm_core::index::Index::build(&root, &cancel, Some(&|n: usize| {
+    let idx = zenfile_core::index::Index::build(&root, &cancel, Some(&|n: usize| {
         if n % 200_000 < 1000 {
             print!("\r[1] 建索引 ... {n} 条   ");
             let _ = std::io::Write::flush(&mut std::io::stdout());
@@ -72,7 +72,7 @@ fn main() {
 
     // 3) 反序列化（第二次搜索的真实代价）
     let t = Instant::now();
-    let back = fm_core::index::Index::load(&root);
+    let back = zenfile_core::index::Index::load(&root);
     let load_ms = ms(t);
     println!(
         "[3] 载入缓存 {} 条，{:>8.1} ms",

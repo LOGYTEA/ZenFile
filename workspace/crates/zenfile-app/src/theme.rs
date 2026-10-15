@@ -125,12 +125,12 @@ impl Metrics {
         }
     }
 
-    pub fn row_height_for(&self, mode: fm_core::ViewMode) -> i32 {
+    pub fn row_height_for(&self, mode: zenfile_core::ViewMode) -> i32 {
         ((match mode {
             // 21px 是资源管理器详细信息/列表视图的实测行距
-            fm_core::ViewMode::Details | fm_core::ViewMode::List => 21.0,
-            fm_core::ViewMode::MediumIcons => 88.0,
-            fm_core::ViewMode::LargeIcons => 128.0,
+            zenfile_core::ViewMode::Details | zenfile_core::ViewMode::List => 21.0,
+            zenfile_core::ViewMode::MediumIcons => 88.0,
+            zenfile_core::ViewMode::LargeIcons => 128.0,
         }) * self.scale)
             .round() as i32
     }

@@ -149,7 +149,7 @@ pub fn cell(id: &str, e: &crate::types::FileEntry, show_ext: bool) -> Option<Str
             if e.is_dir() {
                 None
             } else {
-                // **只给原始字节数**，不带单位 —— fm-app 有按配置选单位
+                // **只给原始字节数**，不带单位 —— zenfile-app 有按配置选单位
                 // （kb/mb/gb/bytes）的 `human_unit`，两边各格式化一次会对不上。
                 Some(e.size.to_string())
             }
@@ -408,7 +408,7 @@ fn alloc_of(path: &std::path::Path) -> Option<String> {
         if bytes == 0 {
             return None;
         }
-        // **只给原始字节数**，单位由 fm-app 的 human_unit 统一格式化
+        // **只给原始字节数**，单位由 zenfile-app 的 human_unit 统一格式化
         Some(bytes.to_string())
     }
 }

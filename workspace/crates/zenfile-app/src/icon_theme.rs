@@ -81,7 +81,7 @@ pub fn set_theme(theme: &str, dark: bool) {
         let next = if theme == "optimized" {
             // 已知文件夹表：切到主题的第一帧就要用，先解析好。
             KNOWN.clear();
-            use fm_core::paths::known_folder;
+            use zenfile_core::paths::known_folder;
             let mut push = |name: &str, kind: Kind| {
                 if let Some(p) = known_folder(name) {
                     KNOWN.push((norm_path(&p), kind));

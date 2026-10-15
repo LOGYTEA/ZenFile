@@ -424,7 +424,7 @@ plus_cx = None
 import re as _re
 _tabw = None
 try:
-    src = open(r"C:\Users\Administrator\Desktop\project\File\workspace\crates\fm-app\src\paint.rs",
+    src = open(r"C:\Users\Administrator\Desktop\project\File\workspace\crates\zenfile-app\src\paint.rs",
                encoding="utf-8").read()
     m = _re.search(r"pub const TAB_W: i32 = (\d+)", src)
     if m:

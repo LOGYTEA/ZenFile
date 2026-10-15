@@ -2965,7 +2965,7 @@ fn paint_about(app: &App, hdc: HDC, g: &Geom, th: Theme, s: f32) {
     );
     y += (44.0 * s2).round() as i32;
 
-    let cfg_dir = fm_core::config::app_dir()
+    let cfg_dir = zenfile_core::config::app_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| "（不可用）".to_string());
     let idx_dir = std::env::var_os("LOCALAPPDATA")

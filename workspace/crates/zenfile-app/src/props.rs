@@ -147,13 +147,13 @@ struct Props {
 
     tab: Tab,
     /// 安全页：切过去才读，避免每个属性窗口都白读一次 ACL
-    sec: Option<fm_core::acl::Security>,
+    sec: Option<zenfile_core::acl::Security>,
     /// 安全页里选中的 ACE 行
     sec_sel: usize,
     /// ACE 列表的滚动位置
     sec_scroll: usize,
     /// 自定义页：`desktop.ini` 的当前内容（落盘前的编辑态）
-    ini: fm_core::folder_ini::FolderIni,
+    ini: zenfile_core::folder_ini::FolderIni,
     /// 自定义页：模板下标
     type_index: usize,
     /// 自定义页：是否把模板应用到子文件夹
@@ -349,9 +349,9 @@ pub fn open(app_ptr: *mut App, path: PathBuf) {
 
     // 自定义页的初值：现在盘上是什么样，页上就先显示什么样
     let ini = if is_dir {
-        fm_core::folder_ini::read(&path)
+        zenfile_core::folder_ini::read(&path)
     } else {
-        fm_core::folder_ini::FolderIni::default()
+        zenfile_core::folder_ini::FolderIni::default()
     };
     let type_index = ini.type_index();
 
@@ -750,9 +750,9 @@ unsafe extern "system" fn props_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
         }
         WM_COMBO_PICK => {
             let i = wparam.0;
-            if i < fm_core::folder_ini::FOLDER_TYPES.len() {
+            if i < zenfile_core::folder_ini::FOLDER_TYPES.len() {
                 state.type_index = i;
-                let (_, key, res) = fm_core::folder_ini::FOLDER_TYPES[i];
+                let (_, key, res) = zenfile_core::folder_ini::FOLDER_TYPES[i];
                 state.ini.folder_type = Some(key.to_string());
                 state.ini.icon_resource = res.map(|s| s.to_string());
                 let _ = InvalidateRect(Some(hwnd), None, false);
@@ -783,7 +783,7 @@ unsafe extern "system" fn props_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                 Hit::Tab(t) => {
                     state.tab = t;
                     if t == Tab::Security && state.sec.is_none() {
-                        state.sec = Some(fm_core::acl::read(&state.path));
+                        state.sec = Some(zenfile_core::acl::read(&state.path));
                     }
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
@@ -796,7 +796,7 @@ unsafe extern "system" fn props_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                     let r = state.type_combo_rect();
                     let mut pt = POINT { x: r.left, y: r.bottom };
                     let _ = ClientToScreen(hwnd, &mut pt);
-                    let labels: Vec<String> = fm_core::folder_ini::FOLDER_TYPES
+                    let labels: Vec<String> = zenfile_core::folder_ini::FOLDER_TYPES
                         .iter()
                         .map(|(n, _, _)| (*n).to_string())
                         .collect();
@@ -823,7 +823,7 @@ unsafe extern "system" fn props_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                             state.type_index = 2;
                             state.ini.folder_type = Some("Pictures".to_string());
                             state.ini.icon_resource =
-                                fm_core::folder_ini::FOLDER_TYPES[2].2.map(|s| s.to_string());
+                                zenfile_core::folder_ini::FOLDER_TYPES[2].2.map(|s| s.to_string());
                         }
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
@@ -985,7 +985,7 @@ fn toggle_attr(state: &mut Props, index: usize, hwnd: HWND) {
 /// `desktop.ini` —— 少了这一步，"改了图标但没变化"。
 fn apply_custom(state: &mut Props, hwnd: HWND) {
     let dir = state.path.clone();
-    if fm_core::folder_ini::write(&dir, &state.ini).unwrap_or(false) {
+    if zenfile_core::folder_ini::write(&dir, &state.ini).unwrap_or(false) {
         let wide: Vec<u16> = dir
             .to_string_lossy()
             .encode_utf16()
@@ -1028,7 +1028,7 @@ fn apply_custom(state: &mut Props, hwnd: HWND) {
             if depth > 2000 {
                 break;
             }
-            let _ = fm_core::folder_ini::write(&d, &ini);
+            let _ = zenfile_core::folder_ini::write(&d, &ini);
             if let Ok(rd) = std::fs::read_dir(&d) {
                 for e in rd.flatten() {
                     if e.path().is_dir() {
@@ -1478,7 +1478,7 @@ unsafe fn paint_custom(hdc: HDC, s: &Props) {
     fill(hdc, &RECT { left: cb.left, top: cb.bottom - 1, right: cb.right, bottom: cb.bottom }, t.border);
     fill(hdc, &RECT { left: cb.left, top: cb.top, right: cb.left + 1, bottom: cb.bottom }, t.border);
     fill(hdc, &RECT { left: cb.right - 1, top: cb.top, right: cb.right, bottom: cb.bottom }, t.border);
-    let name = fm_core::folder_ini::FOLDER_TYPES
+    let name = zenfile_core::folder_ini::FOLDER_TYPES
         .get(s.type_index)
         .map(|(n, _, _)| *n)
         .unwrap_or("常规项");

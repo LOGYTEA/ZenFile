@@ -7,7 +7,7 @@
 //!   * 它是**模态**的，会在自己的循环里泵消息，把 WndProc 重入进来。
 //!
 //! 这里就是一个 WS_POPUP + 自绘：标题栏那一条在 `WM_NCHITTEST` 里返回
-//! `HTCAPTION`（系统因此能拖窗口），100ms 一跳读 `fm_core::transfer::Stats`。
+//! `HTCAPTION`（系统因此能拖窗口），100ms 一跳读 `zenfile_core::transfer::Stats`。
 
 use std::cell::Cell;
 
@@ -32,9 +32,9 @@ const HOLD_MS: u64 = 900;
 /// 当前这个弹窗的状态。同一时刻只显示一个传输，所以放全局就够。
 struct Prog {
     hwnd: HWND,
-    stats: fm_core::transfer::Shared,
+    stats: zenfile_core::transfer::Shared,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    kind: fm_core::transfer::Kind,
+    kind: zenfile_core::transfer::Kind,
     /// 目标目录（画在"到"那一行）
     dest: String,
     /// 完成/取消之后开始计时的那一刻
@@ -53,9 +53,9 @@ thread_local! {
 
 /// 打开进度窗。已经在显示就先关掉旧的。
 pub fn open(
-    kind: fm_core::transfer::Kind,
+    kind: zenfile_core::transfer::Kind,
     dest: &std::path::Path,
-    stats: fm_core::transfer::Shared,
+    stats: zenfile_core::transfer::Shared,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     owner: HWND,
 ) {
@@ -79,7 +79,7 @@ pub fn open(
             let _ = GetWindowRect(owner, &mut or);
             ((or.left + or.right) / 2, (or.top + or.bottom) / 2)
         };
-        let title = HSTRING::from(if kind == fm_core::transfer::Kind::Move {
+        let title = HSTRING::from(if kind == zenfile_core::transfer::Kind::Move {
             "正在移动"
         } else {
             "正在复制"
@@ -341,7 +341,7 @@ fn paint(hwnd: HWND, hdc: HDC) {
             } else {
                 "已完成"
             }
-        } else if p.kind == fm_core::transfer::Kind::Move {
+        } else if p.kind == zenfile_core::transfer::Kind::Move {
             "正在移动…"
         } else {
             "正在复制…"
@@ -425,10 +425,10 @@ fn paint(hwnd: HWND, hdc: HDC) {
         let rows: [String; 4] = [
             format!("已处理文件：{} / {}", st.files_done, st.files_total),
             format!("剩余文件：{}", st.files_left()),
-            format!("已用时间：{}", fm_core::transfer::fmt_duration(st.elapsed_ms)),
+            format!("已用时间：{}", zenfile_core::transfer::fmt_duration(st.elapsed_ms)),
             format!(
                 "预计剩余：{}",
-                if done { "—".to_string() } else { fm_core::transfer::fmt_eta(st.eta_ms) }
+                if done { "—".to_string() } else { zenfile_core::transfer::fmt_eta(st.eta_ms) }
             ),
         ];
         for (i, t) in rows.iter().enumerate() {
@@ -449,7 +449,7 @@ fn paint(hwnd: HWND, hdc: HDC) {
         } else {
             format!(
                 "{} / 秒",
-                crate::app::human_unit(st.speed as u64, fm_core::SizeUnit::Auto)
+                crate::app::human_unit(st.speed as u64, zenfile_core::SizeUnit::Auto)
             )
         };
         let sr = RECT { left: px(16.0, s), top: y, right: w - px(16.0, s), bottom: y + px(20.0, s) };

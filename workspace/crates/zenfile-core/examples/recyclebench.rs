@@ -1,7 +1,7 @@
 //! 回收站加载基准：把"枚举 / 打开读 $I / 解析"三段时间分开量，
 //! 看清楚 4.6 万项到底慢在哪一步。
 //!
-//! `cargo run --release -p fm-core --example recyclebench`
+//! `cargo run --release -p zenfile-core --example recyclebench`
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -46,7 +46,7 @@ fn enumerate(root: &Path, sid: &Option<String>) -> (Vec<(Vec<u16>, PathBuf, Path
 fn main() {
     let t_all = Instant::now();
     let t = Instant::now();
-    let items = fm_core::recycle::list();
+    let items = zenfile_core::recycle::list();
     let total = ms(t);
     println!("[全部] {} 项，{:.0} ms（{:.1} 项/ms）", items.len(), total, items.len() as f64 / total);
 

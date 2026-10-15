@@ -583,8 +583,8 @@ pub struct IconGrid {
     pub pad: i32,
 }
 
-pub fn icon_grid(l: &Layout, m: &Metrics, mode: fm_core::ViewMode) -> IconGrid {
-    let icon = if mode == fm_core::ViewMode::LargeIcons { 96.0 } else { 48.0 };
+pub fn icon_grid(l: &Layout, m: &Metrics, mode: zenfile_core::ViewMode) -> IconGrid {
+    let icon = if mode == zenfile_core::ViewMode::LargeIcons { 96.0 } else { 48.0 };
     let tile_w = ((icon + 48.0) * m.scale).round() as i32;
     let tile_h = m.row_height_for(mode);
     let pad = (12.0 * m.scale).round() as i32;
@@ -653,7 +653,7 @@ pub fn grid_hit(
 pub fn item_rect(app: &App, l: &Layout, index: usize, view_top: i32) -> RECT {
     let tab = app.tab();
     let mode = tab.view_mode;
-    if matches!(mode, fm_core::ViewMode::LargeIcons | fm_core::ViewMode::MediumIcons) {
+    if matches!(mode, zenfile_core::ViewMode::LargeIcons | zenfile_core::ViewMode::MediumIcons) {
         let g = icon_grid(l, &app.metrics, mode);
         let cols = g.cols.max(1);
         let col = (index as i32) % cols;
@@ -1296,7 +1296,7 @@ fn marquee_rect_from(origin: (i32, i32), cur: (i32, i32)) -> RECT {
 }
 
 fn header_height_of(app: &App) -> i32 {
-    if app.tab().view_mode == fm_core::ViewMode::Details {
+    if app.tab().view_mode == zenfile_core::ViewMode::Details {
         (26.0 * app.metrics.scale) as i32
     } else {
         0
@@ -2951,7 +2951,7 @@ pub fn sidebar_split_rect(l: &Layout) -> RECT {
 /// 返回 `(列下标, x)`。下标是**当前可见列的顺序**（第33轮列可增删改序），
 /// 拖列宽/命中都按这个下标走，不再有"0=名称 1=日期 2=类型 3=大小"的硬编码。
 pub fn header_splits(app: &App, l: &Layout) -> Vec<(usize, i32)> {
-    if app.tab().view_mode != fm_core::ViewMode::Details {
+    if app.tab().view_mode != zenfile_core::ViewMode::Details {
         return Vec::new();
     }
     // 详细信息视图的图标恒为 16（与 paint_view 里同一套取值）
@@ -2970,7 +2970,7 @@ pub fn header_splits(app: &App, l: &Layout) -> Vec<(usize, i32)> {
 /// 绘制与命中共用 `detail_cols` 同一份列几何。表头的"筛选下拉"和右键菜单都
 /// 靠它定位：各自去数一遍列的话，拖过一次列宽就对不上了。
 pub fn header_col_hit(app: &App, l: &Layout, x: i32, y: i32) -> Option<usize> {
-    if app.tab().view_mode != fm_core::ViewMode::Details {
+    if app.tab().view_mode != zenfile_core::ViewMode::Details {
         return None;
     }
     let header_h = (26.0 * app.metrics.scale) as i32;
@@ -3042,7 +3042,7 @@ pub fn split_hit(app: &App, l: &Layout, x: i32, y: i32) -> Option<crate::app::Sp
     }
     // 列分隔线只在"详细信息"下存在 —— 别的布局压根没有表头（名称/大小那一行），
     // 不判模式的话，网格视图顶部 26px 里也会莫名冒出可拖的列边界。
-    if app.tab().view_mode != fm_core::ViewMode::Details {
+    if app.tab().view_mode != zenfile_core::ViewMode::Details {
         return None;
     }
     let header_h = (26.0 * app.metrics.scale) as i32;
@@ -3201,7 +3201,7 @@ pub fn home_layout(app: &App, view: &RECT) -> (Vec<HomeGroup>, Vec<HomeTile>) {
 
     // 第一段：常用文件夹（非盘符根）
     let mut i = 0usize;
-    while i < entries.len() && !fm_core::paths::is_drive_root(&entries[i].path) {
+    while i < entries.len() && !zenfile_core::paths::is_drive_root(&entries[i].path) {
         i += 1;
     }
     let (quick, drives) = entries.split_at(i);
@@ -3500,18 +3500,18 @@ pub fn col_boxes(app: &App, l: &Layout, icon_size: i32) -> Vec<ColBox> {
     let mut out: Vec<ColBox> = Vec::new();
     let mut x = l.view.left;
     for id in app.visible_cols() {
-        let idc: &'static str = fm_core::columns::COL_ALL
+        let idc: &'static str = zenfile_core::columns::COL_ALL
             .iter()
             .copied()
             .find(|c| *c == id)
             .unwrap_or("name");
-        let w = if searching && idc == fm_core::columns::C_NAME {
+        let w = if searching && idc == zenfile_core::columns::C_NAME {
             // 搜索态名称列收窄给「位置」列腾地方（照资源管理器）
             ((app.col_width(idc).min(190) as f32 * s) as i32)
         } else {
             ((app.col_width(idc) as f32 * s) as i32)
         };
-        if idc == fm_core::columns::C_NAME {
+        if idc == zenfile_core::columns::C_NAME {
             x = l.view.left + text_pad + icon_size + icon_gap;
         }
         out.push(ColBox { id: idc, x, w });
@@ -3552,11 +3552,11 @@ pub fn detail_cols(app: &App, l: &Layout, icon_size: i32) -> DetailCols {
     let get = |id: &str| -> (i32, i32) {
         col_box_of(&boxes, id).map(|b| (b.x, b.w)).unwrap_or((0, 0))
     };
-    let (name, name_w) = get(fm_core::columns::C_NAME);
-    let (path, path_w) = get(fm_core::columns::C_PATH);
-    let (date, date_w) = get(fm_core::columns::C_DATE_MOD);
-    let (kind, kind_w) = get(fm_core::columns::C_TYPE);
-    let (size, size_w) = get(fm_core::columns::C_SIZE);
+    let (name, name_w) = get(zenfile_core::columns::C_NAME);
+    let (path, path_w) = get(zenfile_core::columns::C_PATH);
+    let (date, date_w) = get(zenfile_core::columns::C_DATE_MOD);
+    let (kind, kind_w) = get(zenfile_core::columns::C_TYPE);
+    let (size, size_w) = get(zenfile_core::columns::C_SIZE);
     DetailCols {
         name,
         path: if path_w > 0 { Some(path) } else { None },
@@ -3654,9 +3654,9 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
         // 内容区从 157 起）→ 相对宽度 274 / 144 / 120 / 80，图标左边距 21。
         let text_pad = (21.0 * app.metrics.scale) as i32;
         let icon_gap = (3.0 * app.metrics.scale) as i32;
-        let large_icon = matches!(mode, fm_core::ViewMode::MediumIcons | fm_core::ViewMode::LargeIcons);
+        let large_icon = matches!(mode, zenfile_core::ViewMode::MediumIcons | zenfile_core::ViewMode::LargeIcons);
         let icon_size = if large_icon {
-            if mode == fm_core::ViewMode::LargeIcons {
+            if mode == zenfile_core::ViewMode::LargeIcons {
                 (96.0 * app.metrics.scale) as i32
             } else {
                 (48.0 * app.metrics.scale) as i32
@@ -3666,7 +3666,7 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
         };
         // 列几何：算**一次**，行循环与表头循环共用（第33轮：列可显示/隐藏/排序）
         let boxes = col_boxes(app, l, icon_size);
-        let col_name = col_box_of(&boxes, fm_core::columns::C_NAME).map(|b| b.x).unwrap_or(l.view.left);
+        let col_name = col_box_of(&boxes, zenfile_core::columns::C_NAME).map(|b| b.x).unwrap_or(l.view.left);
         let col_date = 0;
         let col_type = 0;
         let col_size = 0;
@@ -3685,7 +3685,7 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
             })
             .unwrap_or_default();
         let header_h = (26.0 * app.metrics.scale) as i32;
-        let list_top = l.view.top + if mode == fm_core::ViewMode::Details { header_h } else { 0 };
+        let list_top = l.view.top + if mode == zenfile_core::ViewMode::Details { header_h } else { 0 };
         let view_h = l.view.bottom - list_top;
         let scroll = app.tab().scroll;
 
@@ -3728,7 +3728,7 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
                     e.is_dir(),
                     e.is_hidden(),
                     e.is_system(),
-                    fm_core::columns::is_cache_dir(&e.name) && e.is_dir(),
+                    zenfile_core::columns::is_cache_dir(&e.name) && e.is_dir(),
                 )
             }) else {
                 icon_handles.push(HICON(std::ptr::null_mut()));
@@ -3835,7 +3835,7 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
                 //
                 // 列表视图没有列分隔，整行就该整行可点可画（行式列表的语义）。
                 None => {
-                    let w = if mode == fm_core::ViewMode::Details {
+                    let w = if mode == zenfile_core::ViewMode::Details {
                         // 列区右沿 = 最后一列的 x+w（表头分隔线同源，第32轮 #1）
                         let icon_size = (16.0 * app.metrics.scale) as i32;
                         let boxes = col_boxes(app, l, icon_size);
@@ -3890,13 +3890,13 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
             // 第57轮：图标动画后的实际尺寸 + 让图标**中心不动**的偏移量
             let isz = icon_draw_size(app, &ekey, icon_size, large_icon);
             let ioff = (isz - icon_size) / 2;
-            if mode == fm_core::ViewMode::Details {
+            if mode == zenfile_core::ViewMode::Details {
                 // 名称列特殊：左边要让出图标位，所以 x 由 col_boxes 给
                 draw_item_icon(app, hdc, icon, thumb, col_name - icon_size - icon_gap - ioff, y + (row_h - icon_size) / 2 - ioff, isz, alpha);
                 // 名称列文字：右沿 = 名称列自己的右沿（隐藏了「位置」列时
                 // 就是下一列的左沿）。必须带 DT_END_ELLIPSIS：名字长了不省略
                 // 就会一路画到下一列上（长文件名压在"修改日期"上面）。
-                if let Some(nb) = col_box_of(&boxes, fm_core::columns::C_NAME) {
+                if let Some(nb) = col_box_of(&boxes, zenfile_core::columns::C_NAME) {
                     let dim = dim_text.get(k).copied().unwrap_or(false);
                     if dim && !selected {
                         SetTextColor(hdc, t.text_dim);
@@ -3918,25 +3918,25 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
                 let cell = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS;
                 let show_ext = app.cfg.files.view.show_extensions;
                 for b in &boxes {
-                    if b.id == fm_core::columns::C_NAME {
+                    if b.id == zenfile_core::columns::C_NAME {
                         continue;
                     }
                     let txt = match b.id {
                         // 大小列：目录恒空（画 `—`），文件用格式化后的值
-                        fm_core::columns::C_SIZE => {
+                        zenfile_core::columns::C_SIZE => {
                             if entry.is_dir() {
                                 "—".to_string()
                             } else {
                                 size_texts.get(k).cloned().unwrap_or_default()
                             }
                         }
-                        fm_core::columns::C_TYPE => entry.type_label(),
-                        fm_core::columns::C_PATH => entry
+                        zenfile_core::columns::C_TYPE => entry.type_label(),
+                        zenfile_core::columns::C_PATH => entry
                             .path
                             .parent()
                             .map(|p| p.to_string_lossy().to_string())
                             .unwrap_or_default(),
-                        _ => match fm_core::columns::cell(b.id, entry, show_ext) {
+                        _ => match zenfile_core::columns::cell(b.id, entry, show_ext) {
                             Some(s) => s,
                             None => "—".to_string(),
                         },
@@ -3944,7 +3944,7 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
                     let mut cx = b.x;
                     // 搜索态「位置」列靠右对齐更像资源管理器，其余左对齐
                     let mut fl = cell;
-                    if b.id == fm_core::columns::C_SIZE {
+                    if b.id == zenfile_core::columns::C_SIZE {
                         fl = DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS;
                     }
                     let _ = &mut cx;
@@ -3955,7 +3955,7 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
                         fl,
                     );
                 }
-            } else if mode == fm_core::ViewMode::List {
+            } else if mode == zenfile_core::ViewMode::List {
                 let ix = l.view.left + text_pad;
                 draw_item_icon(app, hdc, icon, thumb, ix - ioff, y + (row_h - icon_size) / 2 - ioff, isz, alpha);
                 let name_r = RECT { left: ix + icon_size + 8, top: y, right: l.view.right, bottom: y + row_h };
@@ -4001,7 +4001,7 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
         }
 
         // 表头**最后**画，且底色不透明：滚动时条目绝不会压到它上面
-        if mode == fm_core::ViewMode::Details {
+        if mode == zenfile_core::ViewMode::Details {
             let hb = CreateSolidBrush(t.window_bg);
             let hr = RECT { left: l.view.left, top: l.view.top, right: l.view.right, bottom: l.view.top + header_h };
             let _ = FillRect(hdc, &hr, hb);
@@ -4012,19 +4012,19 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
             // 表头也走**当前可见列**（第33轮）：列名与列几何同一来源，
             // 隐藏掉的列这里不会露出一个空标题。
             for (ci, b) in boxes.iter().enumerate() {
-                let label: &str = fm_core::columns::label_of(b.id);
+                let label: &str = zenfile_core::columns::label_of(b.id);
                 // 列名一律**夹在自己那一列的宽度里**：不夹的话列宽拖窄之后，
                 // 列名会一路画到右边那一列的头上（"列拖不动/看着乱"的观感来源）。
                 let right = (b.x + b.w).min(l.view.right);
                 let rr = RECT { left: b.x, top: l.view.top, right: right.max(b.x), bottom: l.view.top + header_h };
                 // 只有可排序的列才有排序箭头；作者/标记这类列点了没反应
-                let key: Option<fm_core::SortKey> = match b.id {
-                    fm_core::columns::C_NAME => Some(fm_core::SortKey::Name),
-                    fm_core::columns::C_DATE_MOD
-                    | fm_core::columns::C_DATE_CREATED
-                    | fm_core::columns::C_DATE_ACCESSED => Some(fm_core::SortKey::Modified),
-                    fm_core::columns::C_TYPE => Some(fm_core::SortKey::Type),
-                    fm_core::columns::C_SIZE => Some(fm_core::SortKey::Size),
+                let key: Option<zenfile_core::SortKey> = match b.id {
+                    zenfile_core::columns::C_NAME => Some(zenfile_core::SortKey::Name),
+                    zenfile_core::columns::C_DATE_MOD
+                    | zenfile_core::columns::C_DATE_CREATED
+                    | zenfile_core::columns::C_DATE_ACCESSED => Some(zenfile_core::SortKey::Modified),
+                    zenfile_core::columns::C_TYPE => Some(zenfile_core::SortKey::Type),
+                    zenfile_core::columns::C_SIZE => Some(zenfile_core::SortKey::Size),
                     _ => None,
                 };
                 let active = key.map(|k| sort.key == k).unwrap_or(false);
@@ -4726,7 +4726,7 @@ pub fn recycle_button_hit(app: &App, l: &Layout, x: i32, y: i32) -> u8 {
     0
 }
 
-fn size_of(e: &fm_core::FileEntry) -> String {
+fn size_of(e: &zenfile_core::FileEntry) -> String {
     if e.is_dir() {
         String::new()
     } else {
@@ -4790,13 +4790,13 @@ pub fn status_view_left(l: &Layout, m: &Metrics) -> i32 {
 }
 
 /// 命中状态栏的布局切换按钮，返回被点到的按钮对应的视图模式。
-pub fn status_view_hit(l: &Layout, m: &Metrics, x: i32, y: i32) -> Option<fm_core::ViewMode> {
+pub fn status_view_hit(l: &Layout, m: &Metrics, x: i32, y: i32) -> Option<zenfile_core::ViewMode> {
     let (icons, details) = status_view_rects(l, m);
     if x >= icons.left && x <= icons.right && y >= icons.top && y <= icons.bottom {
-        return Some(fm_core::ViewMode::LargeIcons);
+        return Some(zenfile_core::ViewMode::LargeIcons);
     }
     if x >= details.left && x <= details.right && y >= details.top && y <= details.bottom {
-        return Some(fm_core::ViewMode::Details);
+        return Some(zenfile_core::ViewMode::Details);
     }
     None
 }
@@ -4867,7 +4867,7 @@ fn paint_view_switch(app: &App, hdc: HDC, l: &Layout) {
     let t = &app.theme;
     let (icons, details) = status_view_rects(l, &app.metrics);
     let cur = app.tab().view_mode;
-    let is_details = matches!(cur, fm_core::ViewMode::Details);
+    let is_details = matches!(cur, zenfile_core::ViewMode::Details);
     unsafe {
         for (i, (r, active, grid)) in [(icons, !is_details, true), (details, is_details, false)].iter().enumerate() {
             let hovered = app.hover_view_btn == (i as u8) + 1;
@@ -5186,7 +5186,7 @@ pub fn create_rename_editor(app: &mut App, select_stem: bool) {
     let row_h = app.metrics.row_height_for(app.tab().view_mode);
     let font = ui_font(app.metrics.scale);
     let l = layout_for(app);
-    let header_h = if app.tab().view_mode == fm_core::ViewMode::Details {
+    let header_h = if app.tab().view_mode == zenfile_core::ViewMode::Details {
         (26.0 * app.metrics.scale) as i32
     } else {
         0
@@ -5195,7 +5195,7 @@ pub fn create_rename_editor(app: &mut App, select_stem: bool) {
     // 编辑框宽度跟着名字长度走，但**最长不得超过"名称"这一列的右沿**：
     // 以前写死 300px，短名字后面拖一条空框、长名字又顶出列外压到"修改日期"上。
     let x = l.view.left + (30.0 * app.metrics.scale) as i32;
-    let max_right = if app.tab().view_mode == fm_core::ViewMode::Details {
+    let max_right = if app.tab().view_mode == zenfile_core::ViewMode::Details {
         let cols = detail_cols(app, &l, (16.0 * app.metrics.scale) as i32);
         (cols.name + cols.name_w).min(l.view.right)
     } else {
@@ -5431,7 +5431,7 @@ pub fn sync_address(app: &App) {
     } else {
         // 路径进过 canonicalize 之后会带上 `\\?\` 前缀（Win32 长路径约定）。
         // 它是给 API 看的，不是给人看的 —— 直接显示在地址栏会很怪。
-        fm_core::paths::strip_verbatim(&app.tab().path)
+        zenfile_core::paths::strip_verbatim(&app.tab().path)
             .to_string_lossy()
             .to_string()
     };

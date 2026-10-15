@@ -1,4 +1,4 @@
-//! fm-core —— 与 UI 框架无关的原生资源管理内核。
+//! zenfile-core —— 与 UI 框架无关的原生资源管理内核。
 //!
 //! 分层职责：
 //!   types     : 与视图无关的领域数据结构（§ Thoughts 借鉴 EdenExplorer 的状态边界）

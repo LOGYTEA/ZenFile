@@ -1,5 +1,5 @@
 [package]
-name = "fm-taskmgr"
+name = "zenfile-taskmgr"
 description = "ZenFile 任务管理器模块（子进程示例，验证 §3 进程树折叠）"
 version.workspace = true
 edition.workspace = true
@@ -8,8 +8,8 @@ authors.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "fm-taskmgr"
+name = "zenfile-taskmgr"
 path = "src/main.rs"
 
 [dependencies]
-fm-core = { workspace = true }
+zenfile-core = { workspace = true }

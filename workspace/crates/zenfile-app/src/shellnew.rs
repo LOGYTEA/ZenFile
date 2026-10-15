@@ -216,10 +216,10 @@ fn wide_from_bytes(b: &[u8]) -> String {
 ///   * `NullFile`  → 空文件（txt、rtf 多数是这种）
 ///   * `Data`      → 把注册表里那段二进制原样写进去（bmp 之类靠它给个空位图）
 ///   * `FileName`  → 把系统模板文件拷过来（Office/WPS 的空白文档走这条路）
-pub fn create(dir: &Path, ext: &str) -> fm_core::Result<PathBuf> {
+pub fn create(dir: &Path, ext: &str) -> zenfile_core::Result<PathBuf> {
     // 跟资源管理器一样命名：ItemName 给什么就叫什么（"新建文本文档.txt"）
     let stem = item_name(ext).unwrap_or_else(|| format!("新建{}", type_name(ext)));
-    let path = fm_core::paths::unique_name(dir, &stem, ext);
+    let path = zenfile_core::paths::unique_name(dir, &stem, ext);
     let bytes: Vec<u8> = if read_value(ext, "NullFile").is_some() {
         Vec::new()
     } else if let Some((_, b)) = read_value(ext, "Data") {
@@ -241,7 +241,7 @@ pub fn create(dir: &Path, ext: &str) -> fm_core::Result<PathBuf> {
     } else {
         Vec::new()
     };
-    std::fs::write(&path, &bytes).map_err(fm_core::Error::Io)?;
+    std::fs::write(&path, &bytes).map_err(zenfile_core::Error::Io)?;
     Ok(path)
 }
 

@@ -1,5 +1,5 @@
 //! 无头自检：不需要显示器即可验证内核各层是否可用。
-//! 通过 `fm-app.exe --selftest` 触发，用于 CI 与发布前冒烟。
+//! 通过 `ZenFile.exe --selftest` 触发，用于 CI 与发布前冒烟。
 
 use std::path::PathBuf;
 use std::sync::mpsc::channel;
@@ -34,7 +34,7 @@ impl Harness {
 
 pub fn run() -> i32 {
     let mut h = Harness { passed: 0, failed: 0 };
-    println!("fm-core 无头自检\n");
+    println!("zenfile-core 无头自检\n");
 
     // 1. 自然排序
     let order = natural_cmp("file2", "file10");

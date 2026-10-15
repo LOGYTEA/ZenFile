@@ -43,66 +43,66 @@ const VID_TILES: &str = "{65F125E5-7BE1-4810-BA9D-D271C8432CE3}";
 /// 写回时用的 FolderType：Generic（资源管理器对普通文件夹就是它）
 const FOLDER_TYPE_GENERIC: &str = "{5C4F28B5-F869-4E84-8E60-F11DB97C5CC7}";
 
-fn vid_of(mode: fm_core::ViewMode) -> &'static str {
+fn vid_of(mode: zenfile_core::ViewMode) -> &'static str {
     match mode {
-        fm_core::ViewMode::Details => VID_DETAILS,
-        fm_core::ViewMode::List => VID_LIST,
+        zenfile_core::ViewMode::Details => VID_DETAILS,
+        zenfile_core::ViewMode::List => VID_LIST,
         // 中图标 ↔ 资源管理器"平铺"最接近：都是 48px 带文字的格子
-        fm_core::ViewMode::MediumIcons => VID_TILES,
-        fm_core::ViewMode::LargeIcons => VID_ICONS,
+        zenfile_core::ViewMode::MediumIcons => VID_TILES,
+        zenfile_core::ViewMode::LargeIcons => VID_ICONS,
     }
 }
 
 /// `Mode`（老式视图号）：1=大图标 3=列表 4=详细信息 6=平铺
-fn mode_id(mode: fm_core::ViewMode) -> u32 {
+fn mode_id(mode: zenfile_core::ViewMode) -> u32 {
     match mode {
-        fm_core::ViewMode::Details => 4,
-        fm_core::ViewMode::List => 3,
-        fm_core::ViewMode::MediumIcons => 6,
-        fm_core::ViewMode::LargeIcons => 1,
+        zenfile_core::ViewMode::Details => 4,
+        zenfile_core::ViewMode::List => 3,
+        zenfile_core::ViewMode::MediumIcons => 6,
+        zenfile_core::ViewMode::LargeIcons => 1,
     }
 }
 
 /// `LogicalViewMode`：1=详细信息 2=平铺 3=图标 4=列表
-fn logical_id(mode: fm_core::ViewMode) -> u32 {
+fn logical_id(mode: zenfile_core::ViewMode) -> u32 {
     match mode {
-        fm_core::ViewMode::Details => 1,
-        fm_core::ViewMode::MediumIcons => 2,
-        fm_core::ViewMode::LargeIcons => 3,
-        fm_core::ViewMode::List => 4,
+        zenfile_core::ViewMode::Details => 1,
+        zenfile_core::ViewMode::MediumIcons => 2,
+        zenfile_core::ViewMode::LargeIcons => 3,
+        zenfile_core::ViewMode::List => 4,
     }
 }
 
-fn icon_size(mode: fm_core::ViewMode) -> u32 {
+fn icon_size(mode: zenfile_core::ViewMode) -> u32 {
     match mode {
-        fm_core::ViewMode::Details | fm_core::ViewMode::List => 16,
-        fm_core::ViewMode::MediumIcons => 48,
-        fm_core::ViewMode::LargeIcons => 96,
+        zenfile_core::ViewMode::Details | zenfile_core::ViewMode::List => 16,
+        zenfile_core::ViewMode::MediumIcons => 48,
+        zenfile_core::ViewMode::LargeIcons => 96,
     }
 }
 
-fn vid_to_mode(vid: &str) -> Option<fm_core::ViewMode> {
+fn vid_to_mode(vid: &str) -> Option<zenfile_core::ViewMode> {
     let v = vid.trim().to_lowercase();
     if v == VID_DETAILS.to_lowercase() {
-        Some(fm_core::ViewMode::Details)
+        Some(zenfile_core::ViewMode::Details)
     } else if v == VID_ICONS.to_lowercase() {
-        Some(fm_core::ViewMode::LargeIcons)
+        Some(zenfile_core::ViewMode::LargeIcons)
     } else if v == VID_LIST.to_lowercase() {
-        Some(fm_core::ViewMode::List)
+        Some(zenfile_core::ViewMode::List)
     } else if v == VID_TILES.to_lowercase() {
-        Some(fm_core::ViewMode::MediumIcons)
+        Some(zenfile_core::ViewMode::MediumIcons)
     } else {
         None
     }
 }
 
 /// 老式 `Mode` 号的兜底（有些 bag 只有 Mode 没有 Vid）
-fn mode_id_to_mode(id: u32) -> Option<fm_core::ViewMode> {
+fn mode_id_to_mode(id: u32) -> Option<zenfile_core::ViewMode> {
     match id {
-        4 => Some(fm_core::ViewMode::Details),
-        3 => Some(fm_core::ViewMode::List),
-        1 => Some(fm_core::ViewMode::LargeIcons),
-        6 => Some(fm_core::ViewMode::MediumIcons),
+        4 => Some(zenfile_core::ViewMode::Details),
+        3 => Some(zenfile_core::ViewMode::List),
+        1 => Some(zenfile_core::ViewMode::LargeIcons),
+        6 => Some(zenfile_core::ViewMode::MediumIcons),
         _ => None,
     }
 }
@@ -455,7 +455,7 @@ fn slot_for(path: &Path) -> Option<(String, u32)> {
 // ---------------------------------------------------------------- 对外接口
 
 /// 资源管理器给这个文件夹记的视图。找不到（没去过 / 解析不出来）就返回 None。
-pub fn system_view(path: &Path) -> Option<fm_core::ViewMode> {
+pub fn system_view(path: &Path) -> Option<zenfile_core::ViewMode> {
     let (_, slot) = slot_for(path)?;
     for root in ROOTS {
         let base = format!("{root}\\Bags\\{slot}\\Shell");
@@ -518,7 +518,7 @@ unsafe fn subkey_names_of(path: &str) -> Vec<String> {
 /// 只写**已经存在的** bag：BagMRU 节点要按 Shell 的 ITEMIDLIST 格式新建，
 /// 自己捏一个出来风险太大（Explorer 读不懂就会把整棵树判坏）。
 /// 资源管理器没去过的文件夹这里会返回 false，上层就该退回只改自己的配置。
-pub fn write_system_view(path: &Path, mode: fm_core::ViewMode) -> bool {
+pub fn write_system_view(path: &Path, mode: zenfile_core::ViewMode) -> bool {
     let Some((_, slot)) = slot_for(path) else {
         return false;
     };
@@ -579,7 +579,7 @@ pub fn write_system_view(path: &Path, mode: fm_core::ViewMode) -> bool {
     false
 }
 
-unsafe fn write_all(h: HKEY, mode: fm_core::ViewMode) {
+unsafe fn write_all(h: HKEY, mode: zenfile_core::ViewMode) {
     let _ = set_str(h, "Vid", vid_of(mode));
     let _ = set_dword(h, "Mode", mode_id(mode));
     let _ = set_dword(h, "LogicalViewMode", logical_id(mode));
@@ -602,7 +602,7 @@ unsafe fn write_all(h: HKEY, mode: fm_core::ViewMode) {
 
 /// 我们支持的列 ↔ Explorer 内部名。**必须一字不差**，
 /// 差一个字母 Explorer 就认不出这一列（列会消失而不是显示错名字）。
-/// 我们的 id 本来就是照 Explorer 的内部名取的（见 fm_core::columns）。
+/// 我们的 id 本来就是照 Explorer 的内部名取的（见 zenfile_core::columns）。
 
 fn bag_keys(path: &Path) -> Option<(String, Vec<String>)> {
     let (_, slot) = slot_for(path)?;
@@ -786,11 +786,11 @@ pub fn debug_vid_roundtrip() -> bool {
     vid_to_mode("{00000000-0000-0000-0000-000000000000}").is_none()
 }
 
-const ALL_MODES: [fm_core::ViewMode; 4] = [
-    fm_core::ViewMode::Details,
-    fm_core::ViewMode::List,
-    fm_core::ViewMode::LargeIcons,
-    fm_core::ViewMode::MediumIcons,
+const ALL_MODES: [zenfile_core::ViewMode; 4] = [
+    zenfile_core::ViewMode::Details,
+    zenfile_core::ViewMode::List,
+    zenfile_core::ViewMode::LargeIcons,
+    zenfile_core::ViewMode::MediumIcons,
 ];
 
 /// 自检用：老式 `Mode` 号 ↔ ViewMode 也要自洽。
@@ -912,10 +912,10 @@ pub fn debug_roundtrip() -> (bool, String) {
     };
     let path = PathBuf::from(&p);
     let before = system_view(&path);
-    let target = if before == Some(fm_core::ViewMode::Details) {
-        fm_core::ViewMode::LargeIcons
+    let target = if before == Some(zenfile_core::ViewMode::Details) {
+        zenfile_core::ViewMode::LargeIcons
     } else {
-        fm_core::ViewMode::Details
+        zenfile_core::ViewMode::Details
     };
     if !write_system_view(&path, target) {
         return (false, format!("{p}: 写入失败"));
