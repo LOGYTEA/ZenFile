@@ -628,55 +628,152 @@ fn draw_ui(kind: Ui, cv: &mut Cv, col: [u8; 3]) {
             cv.stroke(19.0, 16.0, 13.0, 22.0, hw, cap, col);
         }
         Ui::ViewGrid => {
-            // 2×2 空心方格。
+            // **1×2 竖排**两格（不是 2×2），且**直角**（`r = 0`）。
             //
-            // **格间距按笔画直径算**（`row_gap`）。之前写死 `gap=3`，描边
-            // 加粗到 1.6px 后净空只剩 `3 - 3.3 < 0` —— 四格连成一片格子纸。
-            // 格子边长也从总外接框里扣出来，保证整体仍在 4..28 内。
-            let g = d::row_gap(hw);
-            let s = (span - g) / 2.0;   // 两格 + 一缝 = 外接框宽
-            let r = d::corner(s, hw) * 0.7;
-            for gx in [min, min + s + g] {
-                for gy in [min, min + s + g] {
-                    cv.ring_rrect(gx, gy, s, s, hw, r, col);
-                }
+            // # 为什么从 2×2 改成 1×2（第71轮）
+            //
+            // `ViewGrid` 是 `Xs` 档（10px），`hw = 2.5*10/13 = 1.923` 单位
+            // → 描边直径 `2*hw = 3.85` 单位 = **1.20px**。2×2 排布下格边长
+            // `s = (span - row_gap)/2 = 8.15` 单位 = **2.55px**，
+            // **stroke/cell = 47.2%** —— 格子几乎没有空腔，四格挤得像格子纸。
+            //
+            // 1×2 竖排把格宽拉大到 `span * 0.55 = 13.2` 单位（4.12px），
+            // 行距仍走 `row_gap(hw)`，于是：
+            // * 每格空腔 `s - 2*hw = 4.31` 单位 = **1.35px**（>1px，看得出是空心的）
+            // * 相邻两格净空 `g - 2*hw = 3.85` 单位 = **1.20px**（>1 单位，不粘连）
+            //
+            // 选竖排而不是缩小 2×2 的格边长：格边长一旦压到 2*hw + 1px，
+            // 整格就只剩一圈描边（实测 2×2 缩格方案 stroke/cell 反而升到
+            // **61.6%**，比原来更糟）。竖排把"格"从两个方向同时放大，是
+            // 10px 下唯一能同时留出空腔与格缝的排布。
+            //
+            // 行距 `g` 先走 `row_gap(hw)`（不写死），再**夹到两格都装得下的上界**
+            // `span - 4*hw - sep`：每格至少留 `2*hw` 的墨迹、两格之间留
+            // `2*hw + sep` 的净空。`stroke_hw` 随边长增长而 `BOX` 固定，
+            // 没有这道夹紧时 175%/200% DPI 下两格会粘连成一块。
+            //
+            // # 为什么直角而不是圆角
+            //
+            // `Xs` 档下 `d::corner(s, hw)` 算出来远小于 1 设计单位 —— 渲不出
+            // 圆角，只会在角点留下比边中更实的一小块（QA 实测角/边比 **1.40**，
+            // 角比边还实）。与其留一个渲染不出来的假圆角，不如**显式取 0**：
+            // 直角在 10px 下比"看不见的圆角"更诚实。
+            let sep = 1.0f32; // 两格之间要求的最小墨迹净空（设计单位）
+            let w = span * 0.55;
+            let x = c - w / 2.0;
+            let g = d::row_gap(hw).min(span - 4.0 * hw - sep).max(2.0 * hw);
+            let s = (span - g) / 2.0;
+            for gy in [min, min + s + g] {
+                cv.ring_rrect(x, gy, w, s, hw, 0.0, col);
             }
         }
         Ui::ViewList => {
-            // 表头条（实心圆角条）+ 两行 + 一条列分隔线。
-            // 行距同样**按笔画直径算**（`row_gap`），理由同 hamburger。
-            let g = d::row_gap(hw);
-            cv.fill([min, min, max, min + 4.0], col, move |x, y| {
-                sd_rrect(x, y, min, min, span, 4.0, hw * 0.9)
+            // 表头条（实心圆角条，**厚度 = 一个笔画直径**）+ 两行 + 一条列分隔线。
+            //
+            // # 三段共用一个行距，全部由 `off` 表达
+            //
+            // 行距走 `row_gap(hw)` 不写死。`off` 还要**夹到 `span/2 - hw`** ——
+            // `stroke_hw` 随边长线性增长而 `BOX` 是固定的 24 单位，边长越大
+            // `off` 越容易把最外那行的**墨迹**顶出框外（第71轮 QA 实测：分隔线
+            // 终点 `29.46 > BOX_MAX 28`，越界 1.46 单位）。
+            let cl = 1.5f32;                           // 墨迹到墨迹的最小净空
+            let off = d::row_gap(hw).min(span / 2.0 - hw);
+            let bar = 2.0 * hw;                        // 表头条厚度 = 一个笔画直径
+            let (y0, y1, y2) = (c - off, c, c + off);
+            let (bx, by, bw, bh, br) = (min, y0 - bar / 2.0, span, bar, hw * 0.9);
+            cv.fill([bx, by, bx + bw, by + bh], col, move |x, y| {
+                sd_rrect(x, y, bx, by, bw, bh, br)
             });
-            for y in [c + g * 0.5, c + g * 1.5] {
-                cv.stroke(min, y, max, y, hw, cap, col);
+            // 两行行线：右端**收在分隔线左侧**并留出 `cl` 净空。
+            // 原来行线拉到 `max`、分隔线从中间穿过，两者横竖相交粘成一个块
+            // （QA 实测 8×8 blob = 27px）。
+            let dx = min + span * 0.66;                // 分隔线 x（不再写死 20.0）
+            let xe = dx - 2.0 * hw - cl;
+            for y in [y1, y2] {
+                cv.stroke(min, y, xe, y, hw, cap, col);
             }
-            // 列分隔线：从表头条下方到最后一行下方。**必须止于最后一行的
-            // 中心**（再多伸 1 单位就贴上行线，13px 下又粘连）。
-            cv.stroke(20.0, min + 6.0, 20.0, c + g * 1.5 + hw, hw, cap, col);
+            // 分隔线：两端都按**墨迹**收口 —— 终点 `+hw <= BOX_MAX`，
+            // 与末行行线的墨迹净空 `cl = 1.5 > 1` 单位。
+            let dtop = y0 + bar / 2.0 + hw + cl;
+            let dend = y2 - 2.0 * hw - cl;
+            if dend - dtop >= 2.0 * hw {
+                cv.stroke(dx, dtop, dx, dend, hw, cap, col);
+            }
         }
         Ui::Gear => {
-            // 齿轮：环 + 4 枚径向齿 + 中心空心。
+            // 齿轮 = **圆环 + 4 枚斜对角齿**，**没有中心孔**。
             //
-            // 齿数从 6 降到 **4**：6 枚齿在 13px 档每枚只有 2px，
-            // 挤成一团毛边；4 枚能数清"这是齿轮"。
+            // # 为什么去掉中心孔（第71轮：这是"必然糊死"的根因）
+            //
+            // 上一版是「环 `r_in=7.0` + 4 齿 + 中心环 `r=2.6`」。`Gear` 是 `Md` 档
+            // （15px），`hw = 2.5*15/13 = 2.885`：
+            //
+            // * 中心孔的**内**半径 = `2.6 - hw` = **-0.285 → 负数**，孔被填满
+            // * 环的**内**半径 = `7.0 - hw` = 4.115
+            // * 两者重叠 1.37 单位 → 圆心到半径 4.115 **全是实心**
+            // * 外径 `2*(10.5 + hw)` = 26.77 > `BOX` 跨度 24 → 超出 2.77 单位
+            //
+            // QA 实测整个字形是 9×9 实心块，齿/环/中心孔全部糊死。
+            //
+            // # 齿数：4 枚（不是 3 枚）
+            //
+            // 齿按 45° 斜对角放（`FRAC_PI_4` 起始），与圆角语言一致。齿尖要顶到
+            // `BOX` 边，径向上要除以 `cos(45°) = 0.7071`：
+            //
+            // ```text
+            //   r_out = (span/2 - hw) / cos(45°) = 9.115 / 0.7071 = 12.891
+            // ```
+            //
+            // `r_ring` 的可用区间：下界 `hw + 1`（内孔要有 ≥1 单位净半径），
+            // 上界 `r_out - 2*hw`（齿要能伸出环外至少一整个直径，否则看不见）：
+            //
+            // ```text
+            //   r_ring ∈ [3.885, 7.122]  →  取 span*0.25 = 6.0
+            //   齿长 = r_out - (r_ring + hw) = 4.01 单位 = 1.88px
+            // ```
+            //
+            // **3 枚**的算法：均匀分布时最坏齿与主轴夹角 60°（`cos = 0.5`），
+            // `r_out = 9.115/0.5 = 18.23`，齿长能到 9.35 单位 —— **比 4 枚更长**。
+            // 但 120° 间隔在 15px 下与"三叉戟"难以区分，且齿落在主轴上、
+            // 与全套字形的斜对角语言不一致。4 枚的 1.88px 齿长已接近
+            // `2*hw = 2.70px`，足以读出"这是齿轮"，所以选 **4 枚**。
+            //
+            // 齿**根**必须起自 `r_ring + hw`（环的墨迹外缘）而不是 `r_ring`，
+            // 否则齿与环之间的缝会被描边吃掉。
+            //
+            // # 半径按边长自适应
+            //
+            // `hw` 随边长线性增长而 `BOX` 固定，半径不能写死成 `span*0.25`：
+            // 边长变大时那个常量会让内孔被重新填满（第71轮在 200% DPI 上复现）。
+            // 下面先按齿长反解出 `r_ring` 的上界再夹紧 —— 边长变大时环会
+            // **自动缩小**给齿让位；只有连内孔 1 单位都保不住时才退化为
+            // **只画环**，宁可少画齿也不糊死。
+            let lim = span / 2.0 - hw;                    // 墨迹不出框的最大中心距
+            let diag = std::f32::consts::FRAC_1_SQRT_2;   // cos(45°)
+            let r_out = lim / diag;                      // 4 枚斜齿的最坏角是 45°
+            let r_floor = hw + 1.0;                      // 内孔 ≥ 1 单位
+            // 齿的中心线长度 = `r_out - (r_ring + hw)`，要 ≥ `span*0.06`
+            // 才看得见。反解出允许的 `r_ring` 上界，再和 `span*0.25` 取小 ——
+            // 于是边长变大时环会**自动缩小**给齿让位，而不是把齿丢掉。
+            let t_min = span * 0.06;
+            let r_ring = (span * 0.25).min(r_out - hw - t_min);
+            let teeth = r_ring >= r_floor;
+            let r_ring = r_ring.max(r_floor).min(lim);
             let (cx, cy) = (c, c);
-            let (r_in, r_out) = (7.0f32, 10.5f32);
-            cv.ring_circle(cx, cy, r_in, hw, col);
-            for k in 0..4 {
-                let a = k as f32 * std::f32::consts::FRAC_PI_2
-                    + std::f32::consts::FRAC_PI_4;
-                let (s2, c2) = a.sin_cos();
-                cv.stroke(
-                    cx + r_in * c2, cy + r_in * s2,
-                    cx + r_out * c2, cy + r_out * s2,
-                    hw, cap, col,
-                );
+            cv.ring_circle(cx, cy, r_ring, hw, col);
+            if teeth {
+                let r_root = r_ring + hw;                // 齿根 = 环的墨迹外缘
+                for k in 0..4 {
+                    let a = k as f32 * std::f32::consts::FRAC_PI_2
+                        + std::f32::consts::FRAC_PI_4;
+                    let (s2, c2) = a.sin_cos();
+                    cv.stroke(
+                        cx + r_root * c2, cy + r_root * s2,
+                        cx + r_out * c2, cy + r_out * s2,
+                        hw, cap, col,
+                    );
+                }
             }
-            // 中心轴：空心圆（不是实心点）—— 实心点在 13px 下就是一个糊掉的
-            // 黑点，与"简约线条"冲突。
-            cv.ring_circle(cx, cy, 2.6f32, hw, col);
         }
     }
 }

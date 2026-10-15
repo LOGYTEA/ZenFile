@@ -2620,7 +2620,12 @@ fn paint_bulk_button(app: &App, hdc: HDC, l: &Layout) {
             right: r.right,
             bottom: r.bottom - (2.0 * s) as i32,
         };
-        if !draw_ui_icon(hdc, crate::icon_theme::Ui::ChevronDown, &ar, (11.0 * s).round() as i32, t.text_dim) {
+        // 第71轮：尺寸改走 `icon_spec::size_of` —— 之前这里是硬编码
+        // `(11.0 * s)`，而 `ChevronDown` 在 `icon_spec.rs` 里归 `Xs`(10px) 档，
+        // 同一个字形因此有**两套尺寸来源**（10 档 vs 11 裸数字），
+        // 改档位时这里会静默不跟着变。
+        let chev_sz = crate::icon_spec::size_of(crate::icon_theme::Ui::ChevronDown, s);
+        if !draw_ui_icon(hdc, crate::icon_theme::Ui::ChevronDown, &ar, chev_sz, t.text_dim) {
             let small = caret_font(s);
             let os = SelectObject(hdc, small.into());
             SetTextColor(hdc, t.text_dim);
