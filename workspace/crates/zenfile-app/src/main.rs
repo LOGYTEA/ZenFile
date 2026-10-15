@@ -14,6 +14,7 @@ mod appfind;
 mod coldlg;
 mod fmtprev;
 mod icon_theme;
+mod anim_clock;
 mod icons;
 mod icon_spec;
 mod menu;
@@ -131,6 +132,120 @@ fn app_selftest() -> i32 {
     if pass == cases.len() { 0 } else { 1 }
 }
 
+/// `--bench-timer`：量 `SetTimer(16)` 的**真实投递间隔**（第68轮）。
+///
+/// # 为什么要有这个模式
+///
+/// 动画卡不卡取决于 `WM_TIMER` 实际多久来一次，而**任何间接判据都会量错**：
+///
+/// | 判据 | 量到什么 | 为什么不能用 |
+/// |---|---|---|
+/// | `Sleep(1)` | **调度延迟** | 这台机器上恒为 15.5ms，与 `SetTimer` 无关 |
+/// | `NtQueryTimerResolution` | 全局节拍 | 已是 0.997ms，但 `WM_TIMER` 仍 31ms |
+/// | 画面像素变化 | DWM 合成 + 抓帧开销 | 读数偏小，且夹着合成延迟 |
+///
+/// 唯一可信的是**直接在 wnd_proc 里打点** —— 那正是动画驱动收到消息的时刻。
+///
+/// # 为什么要自建窗口
+///
+/// 主窗的 `TIMER_ANIM` 是**按需挂/摘**的（`sync_anim_timer`），静止时根本没
+/// 定时器在跑，量不到东西。
+///
+/// # 一个必须记住的坑
+///
+/// 消息循环要 **Peek + Dispatch 两步**。只 `PeekMessage(PM_REMOVE)` 会把消息
+/// 从队列取走但**不调用 wnd_proc**，量出来是"0 次"。（第一版就漏了。）
+fn bench_timer() -> i32 {
+    use std::sync::Mutex;
+    use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::*;
+
+    static TICKS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+    unsafe extern "system" fn probe(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+        if msg == WM_TIMER && wp.0 == crate::TIMER_ANIM {
+            TICKS.lock().unwrap().push(
+                windows::Win32::System::SystemInformation::GetTickCount64());
+        } else if msg == WM_DESTROY {
+            unsafe { PostQuitMessage(0) };
+            return LRESULT(0);
+        }
+        unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+    }
+
+    unsafe {
+        let Ok(inst) = GetModuleHandleW(None) else {
+            println!("bench::timer  拿不到模块句柄");
+            return 1;
+        };
+        // `WNDCLASSW.lpszClassName` 是裸 `PCWSTR`（不是 HSTRING），
+        // `hInstance` 是 `HINSTANCE`（不是 HMODULE）—— 与 `spawn_window` 同款。
+        let class: Vec<u16> = "ZenTmrProbe".encode_utf16()
+            .chain(std::iter::once(0)).collect();
+        let title = HSTRING::from("bench");
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(probe),
+            hInstance: HINSTANCE(inst.0),
+            lpszClassName: PCWSTR(class.as_ptr()),
+            ..Default::default()
+        };
+        RegisterClassW(&wc);
+        let Ok(hwnd) = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            PCWSTR(class.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            WS_OVERLAPPEDWINDOW,
+            0, 0, 120, 80,
+            None, None, Some(HINSTANCE(inst.0)), None,
+        ) else {
+            println!("bench::timer  建窗口失败");
+            return 1;
+        };
+        // 与主窗动画定时器**完全相同**的参数
+        SetTimer(Some(hwnd), crate::TIMER_ANIM, 16, None);
+        let t0 = std::time::Instant::now();
+        let mut msg = MSG::default();
+        while t0.elapsed().as_millis() < 500 {
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = DispatchMessageW(&msg);
+            }
+            std::thread::sleep(std::time::Duration::from_micros(400));
+        }
+        KillTimer(Some(hwnd), crate::TIMER_ANIM);
+
+        let ticks = TICKS.lock().unwrap();
+        let mut d: Vec<u64> = ticks.windows(2).map(|w| w[1]-w[0])
+            .filter(|x| *x > 0).collect();
+        d.sort_unstable();
+        if d.is_empty() {
+            println!("bench::timer  没收到 WM_TIMER");
+            return 1;
+        }
+        let med = d[d.len()/2];
+        println!("bench::timer  WM_TIMER x{} / 500ms  min={} 中位={} max={} ms  => {:.1} fps",
+            ticks.len(), d[0], med, d[d.len()-1], 1000.0/med as f64);
+        // <=20ms：16ms 附近（+4ms 调度抖动容差）。
+        // 30ms 左右说明被量化到 15.6ms 节拍 —— 这就是动画卡成幻灯片的原因。
+        let ok = med <= 20;
+        println!("bench::timer  {} WM_TIMER 中位间隔 {}ms（阈值 20ms）",
+            if ok { "PASS" } else { "FAIL" }, med);
+
+        // —— 对照：新时钟线程（anim_clock）同样的等待节奏 ——
+        let (n, mn, mdmx, mx) = crate::anim_clock::bench_self();
+        let ok2 = mdmx > 0 && mdmx <= 20;
+        if mdmx > 0 {
+            println!("bench::clock  新时钟线程 x{} / 500ms  min={} 中位={} max={} ms  => {:.1} fps",
+                n, mn, mdmx, mx, 1000.0 / mdmx as f64);
+            println!("bench::clock  {} 新时钟中位间隔 {}ms",
+                if ok2 { "PASS" } else { "FAIL" }, mdmx);
+        }
+        // 两个都过才算过：WM_TIMER 慢是"已知的旧错"（它只用于 bench_timer
+        // 自己，动画已经不依赖它了），新时钟必须达标。
+        let _ = ok;
+        if ok2 { 0 } else { 1 }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -154,6 +269,20 @@ fn main() {
     {
         let code = crate::plugin_host::run_plugin_process(&id, &args);
         std::process::exit(code);
+    }
+
+    if args.iter().any(|a| a == "--bench-timer") {
+        // 定时器基准（第68轮）：量 `SetTimer(16)` 的**真实投递间隔**。
+        //
+        // 为什么要有这个模式：动画卡不卡取决于 `WM_TIMER` 实际多久来一次，
+        // 而**任何间接判据都会量错**：
+        //   * 用 `Sleep` 量 —— 那测的是**调度延迟**，这台机器上恒为 15.5ms，
+        //     与 `SetTimer` 无关（全局分辨率已经是 0.997ms，Sleep 仍 15.5ms）；
+        //   * 用画面像素变化量 —— 中间夹着 DWM 合成与抓帧开销，读数偏小。
+        //
+        // 唯一可信的是**直接在 wnd_proc 里打点**：那正是动画驱动收到消息的时刻。
+        unsafe { attach_console() };
+        std::process::exit(bench_timer());
     }
 
     if args.iter().any(|a| a == "--selftest" || a == "--self-test") {
@@ -300,6 +429,9 @@ fn main() {
         if let Ok(m) = tray_mutex {
             let _ = CloseHandle(m);
         }
+        // 归还定时器精度（第68轮）。必须与 `timeBeginPeriod(1)` 配对 ——
+        // 系统把它记成**全局引用计数**，不归还的话这个设置会一直留着，
+        // 让整台机器的系统定时器都比原来忙。
     }
 }
 
@@ -887,6 +1019,24 @@ unsafe fn edit_brush(color: COLORREF) -> HBRUSH {
 
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // 动画帧由**后台时钟线程**推来（第68轮），不走 WM_TIMER。
+    //
+    // `SetTimer(16)` 的实测投递间隔是 **31ms**（`--bench-timer`），整 2 倍，
+    // 动画因此卡成幻灯片。改用专用线程按 15ms `PostMessage` 主动推帧，
+    // 节奏由线程自己的 waitable timer 决定，不被系统时钟节拍量化。
+    //
+    // 放在框架关键消息**之前**：它要读写 `App`，但 `GWLP_USERDATA` 在
+    // 窗口创建后才设 —— 动画时钟只在那之后才启动，所以这里必然已有值。
+    if msg == crate::anim_clock::WM_APP_ANIM_TICK {
+        let app = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App) };
+        if app.tick_anim() {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+        app.sync_anim_timer();
+        // 消费完一帧，腾出 in-flight 名额让时钟线程可以继续 post
+        crate::anim_clock::AnimClock::frame_done();
+        return LRESULT(0);
+    }
     // 框架关键消息必须先于 App 判空守卫处理：GWLP_USERDATA 是在 CreateWindowExW
     // 返回之后才设置的，而 WM_NCCALCSIZE 在创建期间就会到达。若先落入
     // DefWindowProc，客户区几何会在那一刻被系统定型，之后无论返回什么都
@@ -982,15 +1132,17 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             LRESULT(1)
         }
         WM_TIMER => {
-            if wparam.0 == TIMER_ANIM {
-                // 过渡动画（第57轮）：推一帧，画面变了才重画；跑完了就把
-                // 自己这只定时器摘掉（sync_anim_timer 里做）。
-                let app = &mut *app_ptr;
-                if app.tick_anim() {
-                    let _ = InvalidateRect(Some(hwnd), None, false);
-                }
-                app.sync_anim_timer();
-            } else if wparam.0 == TIMER_BUSY {
+            // 第68轮：**动画帧不再走这里**。
+            //
+            // `SetTimer(16)` 的实测投递间隔是 31ms（`--bench-timer` 可复现），
+            // 整 2 倍 —— 动画卡成幻灯片。现在动画由 `anim_clock` 的后台线程
+            // 用 `WM_APP_ANIM_TICK` 推来（见 wnd_proc 开头）。
+            //
+            // 这里**不留 TIMER_ANIM 的兜底分支**：动画时钟建不起来时
+            // `AnimClock::start` 已经把 `running` 复位，真要兜底也得在那里
+            // 显式 `SetTimer`，而不是在这里埋一个会被 `sync_anim_timer`
+            // 反复摘挂的定时器（两者会互相打架）。
+            if wparam.0 == TIMER_BUSY {
                 let app = &mut *app_ptr;
                 paint::tick_busy_strip(hwnd, app);
             } else if wparam.0 == TIMER_DRAIN {

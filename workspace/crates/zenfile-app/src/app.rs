@@ -2296,21 +2296,28 @@ impl App {
     /// 按"还有没有动画"起 / 停定时器。状态没变就不动它 —— 每帧都 SetTimer
     /// 会把 16ms 周期一直往后推，动画直接卡住不动。
     pub fn sync_anim_timer(&mut self) {
+        // 第68轮：不再用 `SetTimer`，改启停 `anim_clock` 的后台线程。
+        //
+        // 原因（`--bench-timer` 实测）：`SetTimer(16)` 的真实投递间隔是
+        // **31ms**，整 2 倍。`WM_TIMER` 会被量化到系统时钟节拍，且优先级
+        // 最低、忙时还被合并 —— 实测动画帧率只有 8~15fps，就是用户说的
+        // "有种只有 15 帧的感觉"。改 `SetTimer` 的参数（16/10/8）都没用，
+        // 它们全都被量化到同一个节拍。
+        //
+        // 后台线程用 waitable timer 按 15ms 主动 `PostMessage`，节奏由线程
+        // 自己的等待决定，不经过节拍量化。
         let on = self.anim_active();
         if on == self.anim_timer_on.get() {
             return;
         }
-        unsafe {
-            use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
-            if on {
-                // 刚挂上：把"上一帧时刻"对齐到此刻，首拍 dt 才不会是
-                // 一段很长的空闲间隔（否则第一帧会瞬间跳一大步）。
-                self.anim_last
-                    .set(windows::Win32::System::SystemInformation::GetTickCount64());
-                let _ = SetTimer(Some(self.hwnd), crate::TIMER_ANIM, 16, None);
-            } else {
-                let _ = KillTimer(Some(self.hwnd), crate::TIMER_ANIM);
-            }
+        if on {
+            // 刚挂上：把"上一帧时刻"对齐到此刻，首拍 dt 才不会是一段很长的
+            // 空闲间隔（否则第一帧会瞬间跳一大步）。
+            self.anim_last
+                .set(unsafe { windows::Win32::System::SystemInformation::GetTickCount64() });
+            crate::anim_clock::AnimClock::start(self.hwnd);
+        } else {
+            crate::anim_clock::AnimClock::stop();
         }
         self.anim_timer_on.set(on);
     }
