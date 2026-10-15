@@ -2334,6 +2334,47 @@ impl App {
         self.plugins.discover(&dir);
         zenfile_core::plugin::ensure_all(&mut self.plugins);
         let _ = DONE.set(());
+        self.log_plugins("discover");
+    }
+
+    /// 把插件现状写进 `$TEMP\zenfile_plugins.log`。
+    ///
+    /// Windows subsystem 下 `eprintln!` / stderr 拿不到（`--selftest` 要靠
+    /// `attach_console` 才能看见，普通启动连那个都没有）—— 排查插件问题时
+    /// 唯一可靠的办法就是写文件。
+    pub fn log_plugins(&self, tag: &str) {
+        use std::io::Write;
+        let path = std::env::temp_dir().join("zenfile_plugins.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let exe = std::env::current_exe().unwrap_or_default();
+            let dir = zenfile_core::plugin::plugins_dir_for(&exe);
+            let _ = writeln!(
+                f,
+                "[{}] exe={} plugins_dir={} exists={} 槽位数={}",
+                tag,
+                exe.display(),
+                dir.display(),
+                dir.exists(),
+                self.plugins.slots().count()
+            );
+            for s in self.plugins.slots() {
+                let _ = writeln!(
+                    f,
+                    "  - id={} name={:?} state={} pid={} wanted={} crashes={} err={:?}",
+                    s.manifest.id,
+                    s.manifest.name,
+                    s.state.as_str(),
+                    s.pid,
+                    s.wanted,
+                    s.crashes,
+                    s.error
+                );
+            }
+        }
     }
 
     /// 推进插件状态机。返回 true = 有插件状态变了，调用方该重画。
