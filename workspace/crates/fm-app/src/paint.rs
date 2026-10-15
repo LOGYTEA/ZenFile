@@ -1843,35 +1843,70 @@ fn pad_rect_width(r: &RECT, pad: i32) -> RECT {
     RECT { left: r.left + pad, top: r.top, right: r.right - pad, bottom: r.bottom }
 }
 
+/// 标题栏按键的**悬停底色块**：一个固定的圆角小方块，不再铺满整条标题栏。
+///
+/// 第62轮用户报"悬停上去效果是全部占满标题栏"。改之前每个键的命中区就是
+/// 整条 `44×title_h` 的竖条，`FillRect` 铺满整列 —— 悬停时一整块 44×34
+/// 全变色，视觉上像标题栏被劈掉一条。
+///
+/// 现在把"命中区"和"底色块"分开：**命中区仍按原来的竖条算**（点哪儿都算点
+/// 到这个键上，不能因为底色变小了就把边角处的点击丢掉），但底色块改成按
+/// `CAPTION_HOVER_GAP` 收到固定尺寸后在命中区里居中的圆角矩形，资源管理器
+/// 就是这个观感。
+///
+/// 尺寸取 `title_h - 10`（上下各留 5px）—— 标题栏才 34px，留 10px 刚好
+/// 是一个"浮在标题栏上的小块"，不顶到边框。
+const CAPTION_HOVER_GAP: i32 = 5;
+
 /// 标题栏按钮（最小化/最大化/关闭）。`which`：1=最小化，2=最大化，3=关闭。
+///
+/// **底色走 `fill_radius` + `title.button`**，和侧栏折叠开关、更多菜单键
+/// 同一批绘制函数 —— 那两个键第33轮就已经是"悬停浮出圆角块"了，只有三大
+/// 金刚键还停在铺满标题栏的老写法上，现在三者终于一致。颜色一个没动。
 fn draw_caption_button(app: &App, hdc: HDC, r: &RECT, which: u8) {
     let t = &app.theme;
     unsafe {
         let hovered = app.hover_caption == which;
         let pressed = app.pressed_caption == which;
-        let bg = if which == 3 && hovered {
-            t.danger
-        } else if pressed {
-            t.surface
-        } else if hovered {
-            t.hover_bg
-        } else {
-            t.title_bg
-        };
-        let b = CreateSolidBrush(bg);
-        FillRect(hdc, r, b);
-        let _ = DeleteObject(b.into());
+        if hovered || pressed {
+            let bg = if which == 3 && hovered {
+                t.danger
+            } else if pressed {
+                t.surface
+            } else {
+                t.hover_bg
+            };
+            fill_radius(app, hdc, "title.button", &caption_hover_rect(r), bg, None);
+        }
+        // 字形仍按**整条命中区**居中：视觉上仍是标题栏正中那个符号，
+        // 只有底色块缩小了，不该顺手把符号也挪走。
         draw_caption_glyph(app, hdc, r, which);
     }
 }
 
+/// 底色块在命中区里居中的矩形，高度收到 `title_h - 2*CAPTION_HOVER_GAP`。
+///
+/// **宽高都钳成同一个值**（正方形）—— 资源管理器的关闭键底色就是正方块，
+/// 压扁的长条看着像"一块贴在边上的补丁"。
+fn caption_hover_rect(r: &RECT) -> RECT {
+    let g = CAPTION_HOVER_GAP;
+    let h = (r.bottom - r.top - g * 2).max(1);
+    let cy = (r.top + r.bottom) / 2;
+    let left = (r.left + r.right) / 2;
+    let x = left - h / 2;
+    RECT { left: x, top: cy - h / 2, right: x + h, bottom: cy - h / 2 + h }
+}
+
 /// 标题栏自有按钮（侧栏开关 / 更多菜单）：带悬停底色，观感对齐资源管理器。
 ///
-/// **「更多」这个键是常驻带底色的**（第33轮用户要求"永远自己就带一层白色
-/// 背景"）：它是主菜单入口，不是那种"鼠标划过去才显出来"的次要控件 ——
-/// 之前只在 hover 时给底色，看上去跟旁边的窗口键不属于同一排，也让人
-/// 怀疑"那里到底有没有东西"。所以只有**侧栏折叠开关**保持"平时透明、
-/// hover 才亮"，两个键的语义本来就不同（一个折叠面板，一个开菜单）。
+/// **「更多」这个键是主菜单入口**，第33轮用户要求"永远自己就带一层白色背景"，
+/// 但第62轮那条要求把"背景"重新定义了一遍：**不是铺满整条标题栏的竖条，
+/// 而是一个固定大小的圆角块**。原来这层底色直接铺满 44×34 的整条命中区，
+/// 悬停时（而更多键是常驻的）等于标题栏上永远糊着一块 44 宽的色条。
+/// 现在底色块和三大金刚键走**同一个** `caption_hover_rect`，四个键彻底一致。
+///
+/// 「侧栏折叠开关」保持"平时透明、hover 才亮"（它真的是那种次要控件），
+/// 但亮起来的形状同样跟着改小。
 fn draw_chrome_button(app: &App, hdc: HDC, r: &RECT, glyph: ChromeGlyph, hover: bool) {
     let t = &app.theme;
     unsafe {
@@ -1884,7 +1919,8 @@ fn draw_chrome_button(app: &App, hdc: HDC, r: &RECT, glyph: ChromeGlyph, hover: 
         // 第36轮只把 `t.surface` 换回 `t.chrome_bg`，等于没去掉）。
         // 真正的透明就是**不调 FillRect**，只画图标。
         if hover {
-            fill_radius(app, hdc, "title.button", r, t.hover_bg, None);
+            // 第62轮：底色块收成固定大小，不再占满整条标题栏。
+            fill_radius(app, hdc, "title.button", &caption_hover_rect(r), t.hover_bg, None);
         }
         draw_chrome_glyph(app, hdc, r, glyph);
     }
