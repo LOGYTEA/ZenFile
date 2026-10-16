@@ -12,10 +12,13 @@ use windows::Win32::Graphics::Gdi::{
     GetTextExtentPoint32W, GetTextMetricsW, IntersectClipRect, InvalidateRect, LineTo, MoveToEx,
     PS_SOLID, Rectangle,
     TEXTMETRICW,
-    ReleaseDC, RestoreDC, RoundRect, SaveDC, SelectObject, SetBkMode, SetTextColor, DT_CENTER,
+    ReleaseDC, RestoreDC, RoundRect, SaveDC, SelectClipRgn, SelectObject, SetBkMode, SetTextColor,
+    DT_CENTER,
     DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DRAW_TEXT_FORMAT,
     FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FONT_QUALITY, GetStockObject, HBITMAP,
-    HDC, HFONT, NULL_BRUSH, NULL_PEN, Polygon, SRCCOPY, TRANSPARENT, RGN_AND,
+    HDC, HGDIOBJ, HFONT, NULL_BRUSH, NULL_PEN, Polygon, SetBkColor, SRCCOPY, OPAQUE, TRANSPARENT,
+    RGN_AND,
+    BLACK_PEN, SYSTEM_FONT, WHITE_BRUSH,
 };
 use windows::Win32::Foundation::POINT;
 use windows::Win32::System::SystemInformation::GetTickCount64;
@@ -676,6 +679,212 @@ pub fn grid_content_h(g: &IconGrid, count: usize) -> i32 {
 
 // ---------------------------------------------------------------- 绘制
 
+/// 第74轮：一张**按窗口尺寸缓存复用**的全窗口离屏位图。
+///
+/// 之前每个 `WM_PAINT` 都重新 `CreateCompatibleDC` + `CreateCompatibleBitmap`
+/// 一张**整窗大小**的 DDB，画完 `BitBlt` 上屏就 `DeleteObject` + `DeleteDC`。
+/// 实测（第73轮埋点，静态重绘路径）这两步合计约 **1.15 ms/帧**，而画在位图上
+/// 的内容只有几 ms —— 也就是说每帧有相当大一块开销纯粹花在"申请 / 归还 GDI
+/// 内存"上，与要画什么无关。窗口尺寸不变时这张位图**完全可复用**：里面每一帧
+/// 都会被 `FillRect` 整个铺满一遍（第 4 步 `sub_fill` 一个字没删），所以不会
+/// 有上一帧的残影。
+///
+/// 字段与生命周期：
+///
+/// * `dc` —— 内存 DC，**整个窗口生命周期内一直存在**，每帧 `SelectObject`
+///   换一张位图进去，画完换回 `old_bmp`。
+/// * `bmp` —— 当前这张全窗口 DDB；`w` / `h` 记着它是按什么尺寸建的。
+/// * `old_bmp` —— `dc` 上"换走 `bmp` 之前选中的那个 GDI 对象"（建 DC 时系统
+///   给的 1x1 单色库存位图）。画完一帧把它换回去，好让 `bmp` 处于"未被选中"
+///   的状态 —— 删一个正被选中的 GDI 对象是不允许的，而销毁走的正是这条路。
+///   它是**库存对象，不能 `DeleteObject`**，销毁时只换回、不删。
+///
+/// `Default` 出来的实例是"空的"，可以直接挂在 `App` 上。
+#[derive(Clone, Copy)]
+pub struct BackSurface {
+    /// 内存 DC。空 = 还没建。
+    pub dc: HDC,
+    /// 当前选在这张 DC 上的离屏位图。
+    pub bmp: HBITMAP,
+    /// 换走 `bmp` 之前 DC 上选中的对象（建 DC 时是库存 1x1 单色位图）。
+    pub old_bmp: HGDIOBJ,
+    /// `bmp` 的宽度（像素）。
+    pub w: i32,
+    /// `bmp` 的高度（像素）。
+    pub h: i32,
+}
+
+impl Default for BackSurface {
+    fn default() -> Self {
+        Self {
+            dc: HDC(std::ptr::null_mut()),
+            bmp: HBITMAP(std::ptr::null_mut()),
+            old_bmp: HGDIOBJ(std::ptr::null_mut()),
+            w: 0,
+            h: 0,
+        }
+    }
+}
+
+impl BackSurface {
+    /// 现在这张位图能不能直接给 `width x height` 用。
+    #[inline]
+    fn matches(&self, width: i32, height: i32) -> bool {
+        !self.dc.is_invalid()
+            && !self.bmp.is_invalid()
+            && self.w == width
+            && self.h == height
+    }
+
+    /// 销毁位图与 DC（幂等：空实例直接返回，重复调用安全）。
+    ///
+    /// `unsafe`：内部调 GDI。
+    pub unsafe fn destroy(&mut self) {
+        if !self.dc.is_invalid() {
+            // 只有位图是我们自己建的才 DeleteObject：`old_bmp` 是库存对象，
+            // 释放它会让整个进程后面所有 DC 的默认位图变成野指针。
+            if !self.bmp.is_invalid() {
+                // 先把位图从 DC 上摘下来再删：删一个正选中的 GDI 对象不会失败，
+                // 但 DC 会留下一句"选中了已删对象"的记录，之后 SelectObject
+                // 会失败（返回 0），整窗就再也画不出东西了。
+                SelectObject(self.dc, self.old_bmp);
+                let _ = DeleteObject(self.bmp.into());
+            }
+            let _ = DeleteDC(self.dc);
+        }
+        *self = Self::default();
+    }
+}
+
+/// 第74轮：销毁主窗口那张缓存的全窗口离屏位图。
+///
+/// `WM_SIZE` / `WM_DPICHANGED` / `WM_DISPLAYCHANGE` / `WM_DESTROY` 都要显式调它 ——
+/// 等下一帧 lazy 重建的话，**旧的大图会被一直占着**（最大化之后再也不动的话，
+/// 一张 4K 位图能挂在进程里到关窗口为止）。
+pub fn invalidate_back_surface(app: &mut App) {
+    unsafe { app.back_surface.destroy() };
+}
+
+/// 第74轮：诊断开关。设了 `ZENFILE_SURF_DEBUG=1` 就把"这一帧是新建还是复用
+/// 离屏位图"打到 stderr。
+///
+/// 用 `OnceLock` **缓存一次**而不是每帧 `env::var_os` —— 后者每帧都要进
+/// 一次环境块加锁 + 分配，而这一段是要被测量的热路径。
+fn surf_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ZENFILE_SURF_DEBUG").is_some())
+}
+
+/// 第74轮：这一帧要用的离屏 DC（**位图已经选在上面，可以直接画**）。
+///
+/// * 尺寸没变 → 复用缓存那张，只补一次 `SelectObject` + 状态复位；
+/// * 尺寸变了 → 先把旧图按"先销毁再建"处理，再按新尺寸建；
+/// * 宽或高为 0（最小化时 `GetClientRect` 就是 0x0）→ **建都不建**，返回
+///   `None` 让 `paint()` 整帧跳过。`CreateCompatibleBitmap(0, h)` 会失败，
+///   拿到的 `HBITMAP` 是空句柄，往 DC 里一选整窗就再也没法画东西了。
+///
+/// 副作用：`app.back_surface` 被就地改成这一帧该用的那一张（新建或复用）。
+fn acquire_back_surface(
+    app: &mut App,
+    hdc: HDC,
+    width: i32,
+    height: i32,
+) -> Option<HDC> {
+    if width <= 0 || height <= 0 {
+        // 最小化：这一帧什么都不画。也顺手把旧图放掉 —— 最小化期间客户区是
+        // 0x0，继续攥着一张全尺寸图纯属白占内存。
+        invalidate_back_surface(app);
+        return None;
+    }
+    let dbg = surf_debug();
+    if !app.back_surface.matches(width, height) {
+        // 尺寸对不上：旧的按"先销毁再建"处理（不要在这张旧图上接着画）。
+        // 不这么做的话，从 800x600 拖到 4K 的路上进程里会同时挂着几十张
+        // 不同尺寸的整窗位图。
+        unsafe { app.back_surface.destroy() };
+        unsafe {
+            let dc = CreateCompatibleDC(Some(hdc));
+            if !dc.is_invalid() {
+                let bmp = CreateCompatibleBitmap(hdc, width, height);
+                if bmp.is_invalid() {
+                    // 位图没建出来就把 DC 一起收掉，绝不留下"有 DC 没位图"的
+                    // 半截状态（否则这里就漏一个 DC）。
+                    let _ = DeleteDC(dc);
+                } else {
+                    let old_bmp = SelectObject(dc, bmp.into());
+                    app.back_surface =
+                        BackSurface { dc, bmp, old_bmp, w: width, h: height };
+                }
+            }
+        }
+        if dbg {
+            eprintln!("[surf] CREATE {width}x{height} ok={}", app.back_surface.dc.is_invalid());
+        }
+    } else if dbg {
+        eprintln!("[surf] reuse {width}x{height}");
+    }
+    if app.back_surface.dc.is_invalid() {
+        return None;
+    }
+    let dc = app.back_surface.dc;
+    unsafe {
+        // **复用路径的关键动作**：把缓存位图选到 DC 上。
+        //
+        // 上一帧末尾 `release_back_surface` 已经把位图摘回 `old_bmp` 了
+        // （不摘的话 `destroy()` 里"先换回再删"的顺序对不上），所以这里
+        // **必须重新选一次** —— 少了这一句，DC 上选着的是建 DC 时系统给的
+        // 1x1 单色库存位图，整窗画上去的东西全被裁成左上角一个像素，
+        // 而 `BitBlt` 依然"成功"（画面全黑，但没有任何报错）。
+        SelectObject(dc, app.back_surface.bmp.into());
+        // 复用路径的第二件必做事：把 DC 拨回"刚建出来"的状态。DC 上还留着
+        // 上一帧的字体/笔/刷/`SetBkMode`/文字色，以及 `SaveDC`/`RestoreDC`
+        // 没能复位时收窄过的裁剪区 —— 新建 DC 时这些全是系统默认值，
+        // 所以"新建"和"复用"并不天然等价。
+        //
+        // 顺带一个好处：`reset_surface_dc` 排在 `FillRect` 之前，于是
+        // `fill` 这一步量到的不再是"顺带把 DC 拨回去"的时间，而是纯粹的
+        // 整窗铺色，两种路径的 `fill` 数字从此可比。
+        reset_surface_dc(dc);
+    }
+    Some(dc)
+}
+
+/// 第74轮：把这一帧留在缓存 DC 上的位图摘下来（画完、`BitBlt` 之后调用）。
+///
+/// **只摘不删**：位图还在 `app.back_surface` 里，下一帧尺寸不变就能接着用。
+/// 摘的动作不能省 —— DC 上选中一张位图时它不能被删除，而 `destroy()` 里
+/// 是"换回 `old_bmp` 再删"的顺序，两边必须对得上。
+#[inline]
+fn release_back_surface(app: &mut App) {
+    if !app.back_surface.dc.is_invalid() && !app.back_surface.bmp.is_invalid() {
+        unsafe {
+            SelectObject(app.back_surface.dc, app.back_surface.old_bmp);
+        }
+    }
+}
+
+/// 把缓存 DC 重置成一张"干净的白底、默认字体黑笔、无裁剪"的画布。
+///
+/// 见 `acquire_back_surface` 里那段说明：复用位图之后 DC 上会**留着上一帧
+/// 的绘图状态**，新建 DC 时这些全是系统默认值，所以每帧都要显式拨回去。
+///
+/// 选 `GetStockObject` 的那几个对象**不能删**：它们属于 GDI，不归我们管。
+/// `WHITE_BRUSH` / `BLACK_PEN` / `SYSTEM_FONT` 正是 `CreateCompatibleDC`
+/// 刚建出来时 DC 上默认选中的那三个。
+fn reset_surface_dc(dc: HDC) {
+    unsafe {
+        let _ = SelectObject(dc, GetStockObject(WHITE_BRUSH));
+        let _ = SelectObject(dc, GetStockObject(BLACK_PEN));
+        let _ = SelectObject(dc, GetStockObject(SYSTEM_FONT));
+        // `SelectClipRgn(None)` 把裁剪区恢复成整个 DC —— 上一帧
+        // `IntersectClipRect` 收窄过的区域必须在这里松开。
+        let _ = SelectClipRgn(dc, None);
+        SetBkMode(dc, OPAQUE);
+        SetBkColor(dc, COLORREF(0x00FF_FFFF));
+        SetTextColor(dc, COLORREF(0x0000_0000));
+    }
+}
+
 pub fn paint(app: &mut App, hdc: HDC, width: i32, height: i32) {
     use crate::anim_clock as ac;
     // 第70轮埋点：`begin_anim_frame` 前打点。
@@ -685,11 +894,24 @@ pub fn paint(app: &mut App, hdc: HDC, width: i32, height: i32) {
     app.begin_anim_frame();
     ac::trace_sub_end(ac::SUB_BEGIN_ANIM);
     unsafe {
-        // ---- 建离屏表面：每帧一张全窗口位图 ----
+        // ---- 取离屏表面：尺寸不变就复用缓存那张（第74轮）----
+        //
+        // `sub_create_surface` 现在的内容 = 尺寸判等 + （变了才走的）重建
+        // + 一次 `SelectObject` + DC 状态复位。尺寸不变时它不再申请/归还
+        // 任何 GDI 内存，基线里那 0.2~0.9 ms 就此消失。
         ac::trace_sub_begin(ac::SUB_CREATE_SURFACE);
-        let mem = CreateCompatibleDC(Some(hdc));
-        let bmp = CreateCompatibleBitmap(hdc, width, height);
-        let old_bmp = SelectObject(mem, bmp.into());
+        let Some(mem) = acquire_back_surface(app, hdc, width, height) else {
+            // 客户区是 0x0（最小化）：整帧不画，直接返回。
+            //
+            // 剩下那些子步骤**故意一个打点都不写**：`anim_clock` 的约定是
+            // "`sub_begin[i] == 0` 才算这一步没跑"（`sub_end[i] == 0` 还要
+            // 兼容 QPC 读失败）。留 0 就等于如实告诉分析脚本"这一帧的
+            // create_surface 之后的步骤全部没执行"，正好是我们想表达的。
+            //
+            // `begin_anim_frame` 已经在上面跑过了 —— 它与窗口尺寸无关，
+            // 而且这一帧确实推进了一次动画状态，不能因为"没画面"就跳过。
+            return;
+        };
         ac::trace_sub_end(ac::SUB_CREATE_SURFACE);
 
         // ---- 布局计算（~200 处窗格 / 标签 / 列宽）----
@@ -701,6 +923,8 @@ pub fn paint(app: &mut App, hdc: HDC, width: i32, height: i32) {
         // `app` 的视图状态在这一帧内不再变，采一次就够。
         trace_paint_context(app, width, height, &l);
 
+        // **复用位图后这一步一个字都不能删**：离屏图上还有上一帧的画面，
+        // 不铺满一遍就会看到残影（滚动/切目录时是"上一屏的文件名糊在下面"）。
         ac::trace_sub_begin(ac::SUB_FILL);
         let t = app.theme;
         let bg = CreateSolidBrush(t.window_bg);
@@ -746,10 +970,11 @@ pub fn paint(app: &mut App, hdc: HDC, width: i32, height: i32) {
         let _ = BitBlt(hdc, 0, 0, width, height, Some(mem), 0, 0, SRCCOPY);
         ac::trace_sub_end(ac::SUB_BITBLT);
 
+        // 第74轮：把位图从 DC 上摘下来（**不删**，留给下一帧复用）。
+        // 这一步替代了原来的 `SelectObject(mem, old_bmp)` + `DeleteObject`
+        // + `DeleteDC`，所以 `sub_cleanup` 现在只剩一次 `SelectObject`。
         ac::trace_sub_begin(ac::SUB_CLEANUP);
-        SelectObject(mem, old_bmp);
-        let _ = DeleteObject(bmp.into());
-        let _ = DeleteDC(mem);
+        release_back_surface(app);
         ac::trace_sub_end(ac::SUB_CLEANUP);
 
         ac::trace_sub_begin(ac::SUB_INVALIDATE);

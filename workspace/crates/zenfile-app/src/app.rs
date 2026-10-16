@@ -502,6 +502,22 @@ pub struct App {
     pub tree: Option<ProcessTree>,
     pub dirty: bool,
     pub last_size: (i32, i32),
+    /// 第74轮：**按窗口尺寸缓存复用**的全窗口离屏位图。
+    ///
+    /// 挂在 `App` 上而不是 `static mut`：多窗口时每个 `App` 一份自己的缓存，
+    /// 互不干扰（这也是本轮没走全局变量的原因）。生命周期由
+    /// `paint::invalidate_back_surface` 统一管：
+    ///
+    /// * `WM_SIZE` / `WM_DPICHANGED` / `WM_DISPLAYCHANGE` / `WM_DESTROY`
+    ///   里**显式销毁**（不等下一帧 lazy 重建，否则最大化之后旧的大图
+    ///   一直被攥着）；
+    /// * 尺寸变化时由 `paint::acquire_back_surface` 先销毁旧的再建新的；
+    /// * 客户区 0x0（最小化）时直接丢弃。
+    ///
+    /// 生命周期内的正常路径上它**不会被 `Drop` 兜底**（GDI 句柄要在
+    /// `WM_DESTROY` 里、`hwnd` 还没失效时删），所以忘记在 `WM_DESTROY`
+    /// 里调 `invalidate_back_surface` 就等于漏一个 DC + 一张整窗位图。
+    pub back_surface: crate::paint::BackSurface,
     pub drag_origin: Option<(i32, i32)>,
     pub fast_mode: bool,
     /// 正在跑的自研传输（复制/移动）。跑完由 `drain_transfer` 收口并重列目录。
@@ -1246,6 +1262,7 @@ impl App {
             tree: None,
             dirty: true,
             last_size: (0, 0),
+            back_surface: crate::paint::BackSurface::default(),
             drag_origin: None,
             tab_drag: None,
             tab_hover_since: None,

@@ -1285,6 +1285,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             app.metrics = theme::Metrics::new(GetDpiForWindow(hwnd));
             app.sync_metrics();
             app.last_size = ((lparam.0 & 0xFFFF) as i32, (lparam.0 >> 16) as i32);
+            // 第74轮：尺寸变了，缓存的那张全窗口离屏位图当场销毁。
+            //
+            // 刻意**不等下一帧 lazy 重建**：`lparam` 给的可能是"正在拖动"的
+            // 尺寸，于是每次 WM_SIZE 都换一张图，旧的必须立刻还回去 ——
+            // 否则从 800x600 拖到 4K 的一路上，进程里会同时存在几十张不同
+            // 尺寸的整窗位图（每张几 MB）。而且最小化那一跳的 `0x0` 也要走
+            // 这条路，否则最小化期间一直攥着上一次的整窗大图。
+            paint::invalidate_back_surface(app);
             paint::reposition(app);
             let _ = InvalidateRect(Some(hwnd), None, true);
             // 位置持久化（第29轮）：状态没变时内部直接跳过，不会逐条写盘
@@ -1301,7 +1309,21 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let app = &mut *app_ptr;
             app.metrics = theme::Metrics::new(GetDpiForWindow(hwnd));
             app.sync_metrics();
+            // 第74轮：DPI 一变 `Metrics` 全部重算，量出来的窗口客户区尺寸
+            // 通常也跟着变。与其等下一帧 `paint` 里的尺寸判等，不如现在就把
+            // 缓存图还回去 —— 拖动跨屏时会连续来好几条 WM_DPICHANGED，
+            // 每一张中间尺寸的整窗位图都是几 MB。
+            paint::invalidate_back_surface(app);
             paint::reposition(app);
+            let _ = InvalidateRect(Some(hwnd), None, true);
+            LRESULT(0)
+        }
+        // 第74轮：显示模式变了（改分辨率 / 换显示器 / DWM 开关）。DDB 与创建它
+        // 时的显示格式绑定，跨格式拿旧位图来 BitBlt 会出现色彩不对，所以
+        // 一次性销毁，下一帧按新格式重建。
+        WM_DISPLAYCHANGE => {
+            let app = &mut *app_ptr;
+            paint::invalidate_back_surface(app);
             let _ = InvalidateRect(Some(hwnd), None, true);
             LRESULT(0)
         }
@@ -2943,6 +2965,15 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 let _ = KillTimer(Some(hwnd), TIMER_DRAIN);
                 let _ = KillTimer(Some(hwnd), TIMER_BUSY);
                 let _ = KillTimer(Some(hwnd), TIMER_ANIM);
+                // 第74轮：销毁缓存的那张全窗口离屏位图与它的 DC。
+                //
+                // 必须放在 `Box::from_raw` **之前** —— 之后 `App` 已经被
+                // drop（`BackSurface` 刻意没有 `Drop` 实现，GDI 句柄要显式
+                // 删），这里就再也拿不到那两个句柄了，进程退出前会一直挂着
+                // 一个 DC + 一张整窗位图（多次开关窗口就线性堆积）。
+                if !app_ptr.is_null() {
+                    paint::invalidate_back_surface(&mut *app_ptr);
+                }
                 if std::ptr::eq(app_ptr, APP) {
                     let _ = UnregisterHotKey(Some(hwnd), HOTKEY_MAIN);
                 }
