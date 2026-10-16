@@ -205,43 +205,58 @@ fn page(
     RadiusNode { id, name, py: "", def, max, kids }
 }
 
+/// 圆角默认值树（第80轮·改动3：整体上调，对标 shadcn 的
+/// `rounded-md` = 6px / `rounded-lg` = 8px）。
+///
+/// ⚠️ **单位陷阱**：这里的值是**半径（DIP）**，不是直径。
+/// GDI `RoundRect` 的第 5/6 参数是**椭圆直径**，绘制层（paint.rs）拿到本树的
+/// 半径后自己乘 2 传进去。因此本文件只能改"半径值"，**绝不能**在这里或
+/// `App::radius_of` 里做直径/半径换算 —— 那样会与绘制层的 ×2 叠加，
+/// 实际圆角变成设定值的 4 倍。
 pub fn radius_tree() -> Vec<RadiusNode> {
     vec![RadiusNode {
         id: "global",
         name: "全局圆角",
         py: "",
-        def: 4,
-        max: 20,
+        // 全局默认 4 → 6，并收窄上限 20 → 16。
+        // 上限收窄的理由：调圆角是"给控件做一点柔化"，调到 16px 以上
+        // 控件形状本身就变了（变成胶囊/圆形），已经不是在调圆角而是在改设计。
+        def: 6,
+        max: 16,
         kids: vec![
-            page("title", "标题栏圆角", 4, 12, vec![
-                leaf("title.button", "按钮圆角", "A", 4, 12),
-                leaf("title.tab", "标签圆角", "B", 6, 16),
+            // 分组（page）的 def/max 是"本组叶子的共同默认值"，
+            // 已随各叶子一起上调，见下。
+            page("title", "标题栏圆角", 6, 12, vec![
+                leaf("title.button", "按钮圆角", "A", 6, 12),
+                leaf("title.tab", "标签圆角", "B", 8, 16),
             ]),
-            page("address", "地址栏圆角", 4, 12, vec![
-                leaf("address.crumb", "面包屑圆角", "M", 4, 12),
-                leaf("address.edit", "输入框圆角", "S", 6, 16),
+            page("address", "地址栏圆角", 6, 12, vec![
+                leaf("address.crumb", "面包屑圆角", "M", 6, 12),
+                leaf("address.edit", "输入框圆角", "S", 8, 16),
             ]),
-            page("toolbar", "工具栏圆角", 4, 12, vec![
-                leaf("toolbar.button", "按钮圆角", "A", 4, 12),
+            page("toolbar", "工具栏圆角", 6, 12, vec![
+                leaf("toolbar.button", "按钮圆角", "A", 6, 12),
             ]),
             // 只列**真实界面里真的有这块底色**的项：给没有的地方留开关，
             // 用户调了半天界面纹丝不动，等于又一个"看着做完了"的假功能。
             // 常态没有底色的（侧栏条目、磁贴、表头、状态栏整条）一概不列，
             // 它们要调就用上面一级的「侧栏圆角 / 内容区圆角 / 状态栏圆角」。
-            page("sidebar", "侧栏圆角", 4, 12, vec![
-                leaf("sidebar.hover", "鼠标悬停圆角", "S", 4, 12),
-                leaf("sidebar.selected", "选中圆角", "X", 4, 12),
+            page("sidebar", "侧栏圆角", 6, 12, vec![
+                leaf("sidebar.hover", "鼠标悬停圆角", "S", 6, 12),
+                leaf("sidebar.selected", "选中圆角", "X", 6, 12),
             ]),
-            page("content", "内容区圆角", 6, 16, vec![
-                leaf("content.hover", "鼠标悬停圆角", "S", 6, 16),
-                leaf("content.selected", "选中圆角", "X", 6, 16),
+            page("content", "内容区圆角", 8, 16, vec![
+                leaf("content.hover", "鼠标悬停圆角", "S", 8, 16),
+                leaf("content.selected", "选中圆角", "X", 8, 16),
             ]),
-            page("status", "状态栏圆角", 3, 10, vec![
-                leaf("status.button", "按钮圆角", "A", 3, 10),
+            // 状态栏按钮从 3 跳到 6：3px 在 45px 高的工具栏/28px 高的状态栏里
+            // 几乎看不出来，等于没设。max 保持 10 不变（控件本身矮，上限再高就成胶囊）。
+            page("status", "状态栏圆角", 6, 10, vec![
+                leaf("status.button", "按钮圆角", "A", 6, 10),
             ]),
-            page("menu", "菜单圆角", 6, 16, vec![
-                leaf("menu.hover", "鼠标悬停圆角", "S", 4, 12),
-                leaf("menu.panel", "面板圆角", "M", 6, 16),
+            page("menu", "菜单圆角", 8, 16, vec![
+                leaf("menu.hover", "鼠标悬停圆角", "S", 6, 12),
+                leaf("menu.panel", "面板圆角", "M", 8, 16),
             ]),
         ],
     }]
@@ -260,10 +275,14 @@ fn radius_find<'a>(id: &str, nodes: &'a [RadiusNode]) -> Option<&'a RadiusNode> 
 }
 
 pub fn radius_default(id: &str) -> u32 {
-    radius_find(id, &radius_tree()).map(|n| n.def).unwrap_or(4)
+    // 兜底 4 → 6：与 radius_tree 里 global.def 保持一致。
+    // 两者必须相同 —— 否则某个 id 因为拼错/未注册而查不到时，
+    // 会拿到一个和「全局圆角」不同的值，出现"没配过的项反而有个怪圆角"。
+    radius_find(id, &radius_tree()).map(|n| n.def).unwrap_or(6)
 }
 
 pub fn radius_max(id: &str) -> u32 {
+    // 兜底 16，与 global.max 收窄后的值一致（见 radius_tree 里 global.max）。
     radius_find(id, &radius_tree()).map(|n| n.max).unwrap_or(16)
 }
 
