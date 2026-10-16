@@ -339,6 +339,73 @@ pub fn key_of(e: &FileEntry) -> String {
     e.path.to_string_lossy().to_lowercase()
 }
 
+/// 把图标放大动画推一帧。返回"画面是否变了"。
+///
+/// 抽成自由函数是**为了能被对拍测试直接调用**（见 `icon_zoom_tests`）——
+/// 挂在 `App` 上就只能靠造一个整个 `App` 来测，而 `App` 构造要拉窗口、
+/// 配置、图标缓存，测出来的失败根本分不清是这块逻辑还是别处。
+///
+/// # 第82轮改了什么
+///
+/// 原实现是：
+/// ```ignore
+/// let mut keys: Vec<String> = self.icon_zoom.keys().cloned().collect();
+/// for k in self.icon_zoom_tgt.keys() {
+///     if !self.icon_zoom.contains_key(k) { keys.push(k.clone()); }
+/// }
+/// for k in keys { /* get / insert / remove */ }
+/// ```
+/// 即**每帧为每个 key 分配一个新 `String`** —— key 是完整路径的小写，
+/// 典型 60~120 字节。悬停扫过一屏图标时这张表能有几十项，于是动画每 15ms
+/// 就要几十次 malloc + 几十次 free，**全发生在绘制路径中间**。
+///
+/// 现在：已存在的项就地改值（`retain`，值本来就是 `&mut`），只有真正
+/// "起步"的 key 才新建 entry，而那是一帧最多一次的事。
+///
+/// 🔑 **等价性的两个关键点**（写测试就是为了钉住它们）：
+///
+/// 1. 新 key 的初值是 `tgt * f`，**不是 `0.0`**。原实现在同一个分支里
+///    `cur = unwrap_or(0.0)`，紧接着算出 `0.0 + (tgt - 0.0) * f`。
+///    插 0.0 会让悬停第一帧停在原尺寸上、比原来晚一帧起跳 —— 那就是
+///    "动画慢了半拍"，优化不能改观感。
+/// 2. 收敛到 `tgt <= 0` 时**删掉这条**，不是留一个 0。删掉后
+///    `icon_draw_size` 查不到 key 就退回 base 尺寸，与原代码
+///    `self.icon_zoom.remove(&k)` 同一条路径。
+fn tick_icon_zoom(
+    zoom: &mut HashMap<String, f32>,
+    tgt: &HashMap<String, f32>,
+    f: f32,
+    dirty: &mut bool,
+) -> bool {
+    zoom.retain(|k, cur| {
+        let t = tgt.get(k).copied().unwrap_or(0.0);
+        if (*cur - t).abs() <= 0.002 {
+            if t <= 0.0 {
+                return false;
+            }
+            *cur = t;
+            return true;
+        }
+        *cur += (t - *cur) * f;
+        *dirty = true;
+        true
+    });
+    // 起步：目标表里有、`zoom` 里还没有的 key。借不到 `&mut zoom` 同时读
+    // `tgt`，所以先借用收集（`&String` 不分配）再逐个 insert。
+    if !tgt.is_empty() {
+        let fresh: Vec<(&String, f32)> = tgt
+            .iter()
+            .filter(|(k, _)| !zoom.contains_key(*k))
+            .map(|(k, t)| (k, t * f))
+            .collect();
+        for (k, v) in fresh {
+            zoom.insert(k.clone(), v);
+            *dirty = true;
+        }
+    }
+    *dirty
+}
+
 pub fn display_title(path: &Path) -> String {
     let s = path.to_string_lossy();
     if s.len() <= 3 && s.ends_with(':') {
@@ -2357,66 +2424,13 @@ impl App {
         }
 
         // —— 图标放大（大图标 / 中图标）——
-        //
-        // 第82轮：原来这里每帧 `self.icon_zoom.keys().cloned().collect::<Vec<String>>()`，
-        // 即**每帧为每个正在放大的图标分配一个新 String**（key 是完整路径的小写，
-        // 典型 60~120 字节）。悬停扫过一屏图标时这张表能有几十项，于是动画每
-        // 15ms 就要几十次 malloc + 几十次 free —— 全发生在**绘制路径中间**的
-        // 动画推进里。
-        //
-        // 换成 `retain_mut` + 只读借用遍历：
-        // * `icon_zoom` 里已收敛的项（`tgt<=0`）直接在原表上删掉，
-        // * 仍在动的项就地改值，
-        // * `icon_zoom_tgt` 里那些**还没进** `icon_zoom` 的 key 才需要新建
-        //   一个 entry —— 这是动画"起步"时的必要开销，一帧最多一次，
-        //   不再是"每帧每项都重建"。
-        //
-        // 结果逐值等价：改的都是同一张 `icon_zoom` 表、同一批 key、
-        // 同一个缓动系数，只是没有中间的临时 `Vec` 和它的克隆。
         if !self.icon_zoom.is_empty() || !self.icon_zoom_tgt.is_empty() {
-            let f = Self::anim_ease(0.28, dt);
-            // 用 `retain`（**不是** `retain_mut`）：`HashMap::retain_mut`
-            // 到本项目这个 rustc 上还没稳定，而 `retain` 的闭包签名是
-            // `FnMut(&K, &mut V) -> bool` —— 值本来就是 `&mut`，要的能力
-            // 它一样给。
-            self.icon_zoom.retain(|k, cur| {
-                let tgt = self.icon_zoom_tgt.get(k).copied().unwrap_or(0.0);
-                if (*cur - tgt).abs() <= 0.002 {
-                    if tgt <= 0.0 {
-                        // 收敛到 0 = 缩回原尺寸：**删掉这条**。删掉后
-                        // `icon_draw_size` 读不到 key 就用 base，
-                        // 与原代码 `self.icon_zoom.remove(&k)` 同一条路径。
-                        return false;
-                    }
-                    *cur = tgt;
-                    return true;
-                }
-                *cur += (tgt - *cur) * f;
-                dirty = true;
-                true
-            });
-            // 起步：目标表里有、`icon_zoom` 里还没有的 key。
-            // 借不到 `&mut self.icon_zoom` 同时读 `self.icon_zoom_tgt`，
-            // 所以先把要新增的 key **借用着**收集出来（`&String` 不分配），
-            // 再逐个 insert。`Vec<&String>` 只是指针数组，仍然是一次分配，
-            // 但省掉了 N 次 String 克隆 —— 而 N 正是这里的大头。
-            //
-            // 初值必须是 `tgt * f` 而不是 `0.0`：原实现里新 key 的
-            // `cur = unwrap_or(0.0)`，同一个分支里就算出了 `0 + (tgt-0)*f`。
-            // 插 0.0 会让悬停的第一帧停在原尺寸上，比原来晚一帧才起跳 ——
-            // 那正是"图标动画慢了半拍"的观感，不能引入。
-            if !self.icon_zoom_tgt.is_empty() {
-                let fresh: Vec<(&String, f32)> = self
-                    .icon_zoom_tgt
-                    .iter()
-                    .filter(|(k, _)| !self.icon_zoom.contains_key(*k))
-                    .map(|(k, tgt)| (k, tgt * f))
-                    .collect();
-                for (k, v) in fresh {
-                    self.icon_zoom.insert(k.clone(), v);
-                    dirty = true;
-                }
-            }
+            tick_icon_zoom(
+                &mut self.icon_zoom,
+                &self.icon_zoom_tgt,
+                Self::anim_ease(0.28, dt),
+                &mut dirty,
+            );
         }
 
         // —— 图标回弹（详细信息 / 列表）：到点就出表 ——
@@ -6266,6 +6280,200 @@ mod child_key_tests {
             theme::dark().text,
             theme::light().text,
             "两个主题的正文色必须不同，否则地址框的 text 判据项形同虚设"
+        );
+    }
+}
+
+#[cfg(test)]
+mod icon_zoom_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// 第82轮**被替换掉的原实现**，原样复现。
+    ///
+    /// 存在的唯一目的是当**对照物**：优化过的版本必须和它逐帧逐值一致。
+    /// 这里刻意保留它原来的一切毛病 —— 每帧 `keys().cloned().collect()`
+    /// 的分配、`get`/`insert`/`remove` 的重复查找 —— 因为"新代码更快"
+    /// 不是这个测试要证明的事，"新代码结果相同"才是。
+    fn tick_icon_zoom_OLD(
+        zoom: &mut HashMap<String, f32>,
+        tgt: &HashMap<String, f32>,
+        f: f32,
+        dirty: &mut bool,
+    ) -> bool {
+        let mut keys: Vec<String> = zoom.keys().cloned().collect();
+        for k in tgt.keys() {
+            if !zoom.contains_key(k) {
+                keys.push(k.clone());
+            }
+        }
+        for k in keys {
+            let cur = zoom.get(&k).copied().unwrap_or(0.0);
+            let t = tgt.get(&k).copied().unwrap_or(0.0);
+            if (cur - t).abs() <= 0.002 {
+                if t <= 0.0 {
+                    zoom.remove(&k);
+                } else {
+                    zoom.insert(k, t);
+                }
+            } else {
+                zoom.insert(k, cur + (t - cur) * f);
+                *dirty = true;
+            }
+        }
+        *dirty
+    }
+
+    /// 一个可复现的伪随机源（不用 rand，且避免"不同平台种子不同"）。
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u32(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) as u32
+        }
+    }
+
+    #[test]
+    fn matches_old_implementation_frame_by_frame() {
+        // 覆盖动画真实会经历的全过程：起步 → 收敛 → 取消悬停 → 缩回原尺寸
+        // → 再次悬停（同一个 key 第二次进表）→ 表被清空 → 再次起步。
+        let keys: Vec<String> = (0..6).map(|i| format!(r"C:\dir\file{i}.txt")).collect();
+        let mut zoom = HashMap::new();
+        let mut tgt = HashMap::new();
+        let mut old_zoom = HashMap::new();
+        let mut rng = Lcg(0x5eed_1234);
+        let mut frames_checked = 0;
+
+        for frame in 0..400u32 {
+            // —— 随机摆一个"这一帧谁该放大"的目标表 ——
+            tgt.clear();
+            let phase = frame % 60;
+            for (i, k) in keys.iter().enumerate() {
+                let on = match phase {
+                    0..=9 => i < 3,
+                    10..=19 => i < 5,
+                    20..=29 => false,          // 全部取消悬停 → 都要缩回
+                    30..=44 => i == 2,         // 单个再次悬停
+                    45..=49 => (rng.next_u32() % 6) as usize == i,
+                    _ => false,
+                };
+                if on {
+                    tgt.insert(k.clone(), 0.1);
+                }
+            }
+            // 帧间隔随机 8~24ms：验证 `f` 与帧率无关时两者也一致。
+            let dt = 8.0 + (rng.next_u32() % 17) as f32;
+            let f = App::anim_ease(0.28, dt);
+
+            let mut d_new = false;
+            let mut d_old = false;
+            tick_icon_zoom(&mut zoom, &tgt, f, &mut d_new);
+            tick_icon_zoom_OLD(&mut old_zoom, &tgt, f, &mut d_old);
+
+            assert_eq!(
+                d_new, d_old,
+                "第 {frame} 帧 dirty 判定不一致：新 {d_new} / 旧 {d_old}（dt={dt}）"
+            );
+            assert_eq!(
+                zoom, old_zoom,
+                "第 {frame} 帧 icon_zoom 内容不一致（dt={dt}, f={f}）"
+            );
+            frames_checked += 1;
+        }
+        assert_eq!(frames_checked, 400, "对拍没有跑满帧数");
+
+        // —— 显式收尾阶段：连续 40 帧"没有悬停" ——
+        //
+        // 上面 400 帧的最后一个 phase 是 `30..=44`（单个持续悬停），
+        // **本来就该留着一项没收敛**；拿它来断言"表已清空"是我一开始
+        // 写错的判据（测试设计的错，不是实现的错）。这里另起一段把目标
+        // 表清空继续跑，验证两边都会把条目**删干净** ——
+        // 留一条永不消失的 0，动画时钟就永远 Kill 不掉。
+        tgt.clear();
+        for _ in 0..40 {
+            let mut d_new = false;
+            let mut d_old = false;
+            tick_icon_zoom(&mut zoom, &tgt, App::anim_ease(0.28, 16.0), &mut d_new);
+            tick_icon_zoom_OLD(&mut old_zoom, &tgt, App::anim_ease(0.28, 16.0), &mut d_old);
+            assert_eq!(d_new, d_old, "收尾阶段 dirty 判定不一致");
+            assert_eq!(zoom, old_zoom, "收尾阶段 icon_zoom 内容不一致");
+        }
+        assert!(
+            old_zoom.is_empty(),
+            "对照实现自己没收干净，测试判据有问题"
+        );
+        assert!(
+            zoom.is_empty(),
+            "新实现没收干净：取消悬停后放大表里仍留着条目 = 动画时钟永不停"
+        );
+    }
+
+    #[test]
+    fn new_key_starts_moving_on_the_first_frame() {
+        // 钉住第82轮最容易写错的那一点：新 key 的初值是 `tgt * f`。
+        //
+        // 如果错写成 `0.0`，图标会**第一帧停在原尺寸上**，第二帧才开始
+        // 放大 —— 悬停看起来"慢了半拍"。这是优化引入观感回归的典型方式，
+        // 数值测试必须能抓住它。
+        let mut zoom = HashMap::new();
+        let mut tgt = HashMap::new();
+        tgt.insert("k".to_string(), 0.1);
+        let f = App::anim_ease(0.28, 16.0);
+
+        let mut dirty = false;
+        tick_icon_zoom(&mut zoom, &tgt, f, &mut dirty);
+
+        assert!(dirty, "新 key 起步不置 dirty = 这一帧不会重画 = 看不到动画");
+        let v = *zoom.get("k").expect("新 key 没进表");
+        assert!(
+            v > 0.0,
+            "新 key 首帧值必须已经动起来（tgt*f={}），实测 {v} —— 插了 0.0 就是慢了半拍",
+            0.1 * f
+        );
+        assert!((v - 0.1 * f).abs() < 1e-9, "首帧值应恰为 tgt*f，实测 {v}");
+    }
+
+    #[test]
+    fn converged_items_are_removed_not_left_at_zero() {
+        // 收敛到 0 必须**删条目**，不能留一条 0.0。
+        //
+        // 留着不删有两个后果：`anim_active()` 里 `|tgt - v| > 0.002` 判
+        // 不到，但表一直在涨；更直接的是 `icon_draw_size` 查得到 key、
+        // 读到 0，与"查不到、退回 base"虽然尺寸相同，却让这张表永远
+        // 非空 —— 之后每帧都要遍历这些死条目。
+        let mut zoom = HashMap::new();
+        zoom.insert("gone".to_string(), 0.0005); // 已收敛
+        zoom.insert("live".to_string(), 0.05);    // 还在动
+        let mut tgt = HashMap::new();
+        tgt.insert("live".to_string(), 0.1);
+        // "gone" 不在 tgt 里 ⇒ 目标 0 ⇒ 应被删除
+
+        let mut dirty = false;
+        tick_icon_zoom(&mut zoom, &tgt, 0.28, &mut dirty);
+
+        assert!(!zoom.contains_key("gone"), "收敛到 0 的条目没被删除");
+        assert!(zoom.contains_key("live"), "还在动的条目被误删了");
+    }
+
+    #[test]
+    fn frame_rate_independence_is_preserved() {
+        // `anim_ease` 的帧率无关性是第68轮就有的性质，重构不能破坏它：
+        // 同样从 0 走到目标，60Hz 跑 8 帧与 30Hz 跑 4 帧应当落在同一个值上。
+        let run = |dt: f32, n: u32| {
+            let mut zoom = HashMap::new();
+            let mut tgt = HashMap::new();
+            tgt.insert("k".to_string(), 0.1);
+            let mut dirty = false;
+            for _ in 0..n {
+                tick_icon_zoom(&mut zoom, &tgt, App::anim_ease(0.28, dt), &mut dirty);
+            }
+            *zoom.get("k").unwrap_or(&0.0)
+        };
+        let a = run(16.0, 8); // ~128ms
+        let b = run(33.0, 4); // ~132ms
+        assert!(
+            (a - b).abs() < 0.01,
+            "同样墙钟时间内不同帧率的结果差太多：60Hz={a} 30Hz={b}"
         );
     }
 }
