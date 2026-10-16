@@ -23,6 +23,7 @@ mod openwith;
 mod plugin_host;
 mod rename;
 mod paint;
+mod paint_cache;
 mod props;
 mod shellnew;
 mod progress;

@@ -3243,7 +3243,13 @@ pub fn paint_sidebar(app: &mut App, hdc: HDC, l: &Layout) {
         // 导航树：主页 + 常用文件夹 + 此电脑（展开=全部盘符）+ 回收站。
         // 排列本身由 App 产出，绘制与命中测试共用同一份，不存在"看得见点不到"。
         let rows = app.sidebar_rows();
-        let cur = std::fs::canonicalize(&app.tab().path).unwrap_or_default();
+        // 第76轮：这里原本也是每帧一次真实 IO。它只有 1 次/帧（不是 10~30 次），
+        // 但同样与帧无关，所以走同一张缓存（key 的 `cur` 分量用它自己）。
+        //
+        // 注意语义差别：原代码 `unwrap_or_default()` 得到的是**空 PathBuf**，
+        // 而 `canonicalize_cached` 是"判是否等于 cur"的布尔口径。所以这里
+        // 保持原口径单列一个取值的缓存入口，见 `cur_path_cached`。
+        let cur = cur_path_cached(&app.tab().path);
         // 第57轮：动画要"知道当前位置在哪一行"，所以先整棵判一遍 active。
         // 画的时候也复用这份结果（原来是在循环里逐行判，一帧要问一遍 Shell）。
         let actives: Vec<bool> = rows
@@ -3650,11 +3656,73 @@ fn sidebar_row_active(
     if row.key == crate::app::SIDEBAR_THISPC {
         return false;
     }
-    !cur.as_os_str().is_empty()
-        && std::fs::canonicalize(std::path::PathBuf::from(&row.target))
-            .map(|p| p == cur)
-            .unwrap_or(false)
+    if cur.as_os_str().is_empty() {
+        return false;
+    }
+    // 第76轮：`canonicalize` = `GetFullPathNameW` + 开句柄 +
+    // `DeviceIoControl(IOCTL_GET_VOLUME_INFORMATION)`。而这一行是**逐行**判的
+    // （见 paint 的 `actives` 构造），侧栏 10~30 行 ⇒ **每帧 10~30 次真实磁盘
+    // IO**，机械盘/网络路径上单次能到 ms 级 —— 这是 `sidebar` 那 1.16ms 的一大块。
+    //
+    // 结果只依赖 `(row.target, cur)` 两个字符串，**与帧无关**，所以缓存。
+    // 命中后这里的磁盘 IO 归零（代价退化成一次 Mutex 查找）。
+    canonicalize_cached(&row.target, cur)
 }
+
+/// 第76轮：`canonicalize` 的进程级缓存。
+///
+/// # key 与失效
+///
+/// key 是 `(target, cur)` 的原样字符串对 —— 两者都是结果的**全部**输入
+/// （`canonicalize` 是纯函数，同输入必同输出）。`cur` 进了 key 意味着"切了目录
+/// 必然重算"，`target` 进了 key 意味着"侧栏换了快捷方式必然重算"。
+///
+/// # TTL 为什么取 3 秒
+///
+/// 唯一的漏检场景是：`row.target` 与 `cur` 两个字符串都没变，但**磁盘上那条路径
+/// 的"规范形式"变了** —— 实际只可能来自"目录被删/重建成了另一个卷上的同名目录"
+/// 或"网络驱动器重新映射到别的卷"。前者要求用户恰好在侧栏停留的那几秒内删掉
+/// 并重建目录；后者在盘符仍可用的前提下不可观测。换来的是：静止侧栏下
+/// 每帧 10~30 次真实 IO **完全归零**，而这正是本轮要治的病。
+///
+/// 代价上界：最多 3 秒的显示滞后，且只在这两种极低频操作下发生。
+/// 真要做到零滞后要接 `ReadDirectoryChangesW` 驱动失效，那是改动量大得多的一轮，
+/// 本轮先取 TTL。容量上限 512 条，远大于任何侧栏的行数，纯粹是防泄漏兜底。
+static CANON_CACHE: crate::paint_cache::LazyCache<(String, String), Option<std::path::PathBuf>> =
+    crate::paint_cache::LazyCache::new(std::time::Duration::from_secs(3), 512);
+
+/// 带缓存的 `canonicalize`。返回值 `None` 表示"解析失败"，与原始语义一致。
+fn canonicalize_cached(target: &str, cur: &std::path::Path) -> bool {
+    let key = (target.to_string(), cur.as_os_str().to_string_lossy().into_owned());
+    if let Some(hit) = CANON_CACHE.get(&key) {
+        return hit.as_deref() == Some(cur);
+    }
+    // 未命中：真做一次 IO。结果**连同失败一起缓存** —— 失败也是稳定的
+    // （路径不存在就是不存在），否则每帧都要为一个不存在的路径付一次 IO。
+    let resolved = std::fs::canonicalize(std::path::PathBuf::from(target)).ok();
+    CANON_CACHE.insert(key, resolved.clone());
+    resolved.as_deref() == Some(cur)
+}
+
+/// 第76轮：`cur` 自身的 `canonicalize`（每帧 1 次），失败口径与原
+/// `unwrap_or_default()` 严格一致：解析不出来就是空 `PathBuf`。
+///
+/// 与 [`CANON_CACHE`] 分开是因为**结果口径不同**（一个是 `PathBuf`、一个是
+/// 布尔），共用一张表会让两种含义互相覆盖。TTL/容量同样 3 秒 / 512。
+static CUR_CACHE: crate::paint_cache::LazyCache<String, std::path::PathBuf> =
+    crate::paint_cache::LazyCache::new(std::time::Duration::from_secs(3), 512);
+
+/// 带缓存的 `canonicalize`，`unwrap_or_default()` 口径。
+fn cur_path_cached(path: &std::path::Path) -> std::path::PathBuf {
+    let key = path.as_os_str().to_string_lossy().into_owned();
+    if let Some(hit) = CUR_CACHE.get(&key) {
+        return hit;
+    }
+    let resolved = std::fs::canonicalize(path).unwrap_or_default();
+    CUR_CACHE.insert(key, resolved.clone());
+    resolved
+}
+
 
 // ---------------------------------------------------------------- 首页平铺布局
 
