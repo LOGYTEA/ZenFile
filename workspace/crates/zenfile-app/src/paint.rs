@@ -719,9 +719,44 @@ pub struct BackSurface {
     /// 这里，不在 GDI 内部）。空 = 这不是一张 DIB section，或者还没建。
     ///
     /// **本轮没有任何代码读它** —— 它是给后续把重采样/合成搬去 GPU 时留的
-    /// 地基（D2D 的 `ID2D1Bitmap` 可以直接包这块内存，或用
-    /// `ID2D1DeviceContext::CreateBitmap` 从这块像素初始化）。留着这个字段
-    /// 意味着换位图类型这件事**只做一次**，后续接 D2D 不必再回头换地基。
+    /// 地基。留着这个字段意味着换位图类型这件事**只做一次**，后续接 D2D
+    /// 不必再回头换地基。
+    ///
+    /// ⚠️ **接 D2D 时有两个坑，都属于"错了不报错"那一类**，写在字段旁边
+    /// 是因为隔几轮再看到就没人记得了：
+    ///
+    ///  1. **没有零拷贝包装。** `ID2D1Bitmap` 只有 `CopyFromBitmap` /
+    ///     `CopyFromMemory` / `CopyFromRenderTarget` 三个**拷贝**方法，创建
+    ///     入口只有 `CreateBitmap` 与 `CreateBitmapFromWicBitmap`。所以"把这块
+    ///     内存包成 `ID2D1Bitmap`"这件事不存在，只能从 `bits` 拷进去。
+    ///     `icons.rs` 的 `icon_native_rgba`(927) / `pmp_to_bmp`(1123) 早就是
+    ///     `CreateDIBSection` + 拿指针这条路线，主窗口与图标派生图现在格式
+    ///     统一了，这正是留这个字段的收益。
+    ///
+    ///  2. **必须显式 `D2D1_ALPHA_MODE_IGNORE`，不要依赖默认值。** 本项目的
+    ///     DIB 是 `BI_RGB` —— **alpha 字节无效，GDI 不写、恒为 0**。
+    ///     而 `D2D1_BITMAP_PROPERTIES1` 的零值是 `D2D1_ALPHA_MODE_UNKNOWN`，
+    ///     它会被**解析成 premultiplied**，于是这 0 被当成"已经预乘好的
+    ///     alpha"，`rgb * 0 = 0`，整帧**全透明**。
+    ///     注意失败形态取决于怎么填：留 `UNKNOWN` 给 `ID2D1DCRenderTarget`
+    ///     是**创建直接失败**（官方明说该 target 不接受 UNKNOWN），而显式
+    ///     填 `PREMULTIPLIED` 则是**静默全透明**（`CreateBitmap` /
+    ///     `CopyFromMemory` / `EndDraw` 全部照常返回 S_OK）。
+    ///     这与 `biHeight` 忘取负导致画面上下颠倒同属一类陷阱：
+    ///     错了不报错、只体现在画面上、能一路活过验收。
+    ///
+    /// 另注两条取用规则：
+    ///
+    /// * **stride** 按 GDI 规则是"4 字节的最小倍数"，32bpp 下即
+    ///   `width * 4`，与 D2D 的 pitch 要求一致，是精确值 —— 不必回读
+    ///   `BITMAPINFOHEADER`，也不必按更强对齐留余量（回读反而可能拿到
+    ///   比 `width * 4` 大的对齐值而误算偏移）。
+    /// * **有效期只有帧内一段。** `bits` 必须在 `bmp` 未被 `DeleteObject`
+    ///   **且**该位图仍选中在 `mem` 上时才可读 —— 选中期间 GDI 假定你在
+    ///   直接写它的像素。而 `release_back_surface()` 每帧末就把位图摘回
+    ///   `old_bmp`，所以**帧与帧之间 `bits` 不可信**。唯一可用的窗口是
+    ///   `acquire_back_surface()` 返回之后到 `release_back_surface()` 之前。
+    ///   本轮没人读它，但下一轮接 D2D 时必须落在那个窗口里。
     pub bits: *mut core::ffi::c_void,
 }
 
