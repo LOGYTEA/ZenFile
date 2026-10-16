@@ -2424,7 +2424,7 @@ impl App {
                 .set(unsafe { windows::Win32::System::SystemInformation::GetTickCount64() });
             crate::anim_clock::AnimClock::start(self.hwnd);
         } else {
-            crate::anim_clock::AnimClock::stop();
+            crate::anim_clock::AnimClock::stop(self.hwnd);
         }
         self.anim_timer_on.set(on);
     }

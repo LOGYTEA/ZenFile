@@ -54,24 +54,59 @@ pub const WM_APP_ANIM_TICK: u32 = windows::Win32::UI::WindowsAndMessaging::WM_AP
 /// （与 `SetTimer(16)` 同一个坑）。
 const FRAME_MS: u32 = 15;
 
-/// 动画时钟的全局状态（整个进程一份）。
-pub struct AnimClock {
+/// 动画时钟的公开入口。
+///
+/// 状态本身在 `ClockSlot` 里、每窗口一份，这里只做命名空间。
+pub struct AnimClock;
+
+/// 一个窗口的时钟槽。
+///
+/// 拆成"每窗口一个"是因为 `App` 本来就是每窗口一个，而原来的
+/// `ANIM_CLOCK` 是**进程级单例** —— 那会造成两个方向都错：
+///
+/// * 窗口 A 在跑动画时窗口 B 也要动画，B 调 `start()` 看到
+///   `running` 已为真就直接返回 —— 而那个线程的 post 目标是 **A 的
+///   hwnd**，B 永远收不到 tick，B 的动画是死的；
+/// * 反过来更糟：B 的 `sync_anim_timer()` 判定自己动画结束时调
+///   `stop()`，把 A 正在跑的时钟一起杀了。
+///
+/// 触发路径很日常：托盘菜单新建窗口、双击目录、切换主页 —— 只要在
+/// A 的动画还没播完时开出 B，B 的动画就废了。
+struct ClockSlot {
     /// 线程是否该继续跑。`false` 时线程退出。
     running: AtomicBool,
     /// 已 post 但**还没被主线程消费**的帧数。
     ///
     /// **必须有这个上限**（下面注释详述）。
     inflight: AtomicU32,
-    /// 线程句柄（用于退出时等待）。
+    /// 线程句柄。
     thread: AtomicU32,
 }
 
-/// 全局时钟实例。窗口句柄在 `start` 时传入。
-static ANIM_CLOCK: AnimClock = AnimClock {
-    running: AtomicBool::new(false),
-    inflight: AtomicU32::new(0),
-    thread: AtomicU32::new(0),
-};
+/// 所有窗口的时钟槽，键是 hwnd 的地址。
+///
+/// 用 `OnceLock` 惰性建表：`HashMap::new` 不是 `const fn`，不能直接放在
+/// `static Mutex::new(...)` 里求值。表是**进程级共享**但只在动画起停时
+/// 才碰，不是热路径 —— 每次加锁的代价可以忽略，换来的是「零全局可变
+/// 构造期」。
+static CLOCKS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<ClockSlot>>>,
+> = std::sync::OnceLock::new();
+
+fn clocks() -> &'static std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<ClockSlot>>> {
+    CLOCKS.get_or_init(|| {
+        std::sync::Mutex::new(std::collections::HashMap::new())
+    })
+}
+
+/// 线程参数：一个 `Arc<ClockSlot>` 加它服务的 hwnd。
+///
+/// 两者必须**同一个结构体**一起传：`CreateThread` 只给一个 `lpParameter`
+/// 指针，而线程需要「自己的槽」和「往哪 post」两样东西。
+struct SlotParam {
+    slot: std::sync::Arc<ClockSlot>,
+    hwnd: HWND,
+}
 
 /// in-flight 帧数上限。
 ///
@@ -86,49 +121,72 @@ static ANIM_CLOCK: AnimClock = AnimClock {
 /// 这样队列长度恒为 ≤1，天然丢弃过期帧 —— 丢帧是对的，追帧是错的。
 const MAX_INFLIGHT: u32 = 1;
 
+/// 取（或建）某个窗口的时钟槽。
+fn slot_of(hwnd: HWND) -> std::sync::Arc<ClockSlot> {
+    let key = hwnd.0 as usize;
+    let mut m = clocks().lock().unwrap();
+    m.entry(key)
+        .or_insert_with(|| {
+            std::sync::Arc::new(ClockSlot {
+                running: AtomicBool::new(false),
+                inflight: AtomicU32::new(0),
+                thread: AtomicU32::new(0),
+            })
+        })
+        .clone()
+}
+
 impl AnimClock {
-    /// 启动（或重启）动画时钟，目标窗口 `hwnd`。
+    /// 启动（或重启）`hwnd` 的动画时钟。
     pub fn start(hwnd: HWND) {
-        if ANIM_CLOCK.running.swap(true, Ordering::SeqCst) {
-            return; // 已在跑
+        let slot = slot_of(hwnd);
+        if slot.running.swap(true, Ordering::SeqCst) {
+            return; // 这个窗口已在跑
         }
-        let h = hwnd.0 as *const std::ffi::c_void;
+        let p = Box::into_raw(Box::new(SlotParam { slot: slot.clone(), hwnd }));
         let tid = unsafe {
             CreateThread(
                 None,
                 0,
                 Some(anim_thread),
-                Some(h),
+                Some(p as *mut std::ffi::c_void),
                 windows::Win32::System::Threading::THREAD_CREATION_FLAGS(0),
                 None,
             )
         };
-        if let Ok(t) = tid {
-            ANIM_CLOCK.thread.store(t.0 as u32, Ordering::SeqCst);
-        } else {
-            // 建线程失败：动画会停在静止帧，但 UI 不会崩（tick_anim 仍可
-            // 被 TIMER_DRAIN 顺带驱动一次）。这是可接受的降级。
-            ANIM_CLOCK.running.store(false, Ordering::SeqCst);
+        match tid {
+            Ok(t) => slot.thread.store(t.0 as u32, Ordering::SeqCst),
+            Err(_) => {
+                // 建线程失败：动画会停在静止帧，但 UI 不会崩（`tick_anim`
+                // 仍能被 `TIMER_DRAIN` 顺带驱动一次）。这是可接受的降级。
+                slot.running.store(false, Ordering::SeqCst);
+                // 线程没起来 ⇒ 没人把这个 `Box` 取回来，这里补一次，
+                // 否则每次建线程失败都泄漏一个 `Box<SlotParam>`。
+                drop(unsafe { Box::from_raw(p) });
+            }
         }
     }
 
-    /// 停止动画时钟并等线程退出。
-    pub fn stop() {
-        if !ANIM_CLOCK.running.swap(false, Ordering::SeqCst) {
-            return;
-        }
-        let t = ANIM_CLOCK.thread.load(Ordering::SeqCst);
-        if t != 0 {
-            let _ = t;
-            // 线程自己会看到 running=false 后退出。不强制 WaitForSingleObject：
-            // 窗口正在销毁时等一个还在 PostMessage 的线程反而可能死锁
-            // （它 post 到已销毁的 hwnd，消息进黑洞，线程再睡一拍才醒）。
-        }
-        ANIM_CLOCK.thread.store(0, Ordering::SeqCst);
-        ANIM_CLOCK.inflight.store(0, Ordering::SeqCst);
+    /// 停止 `hwnd` 的动画时钟（不影响别的窗口）。
+    pub fn stop(hwnd: HWND) {
+        let key = hwnd.0 as usize;
+        // 先从表里摘掉再置位：这样并发来的第二次 `stop` 直接看不到这个槽，
+        // 不会与本线程的清理互相踩。
+        let slot = match clocks().lock().unwrap().remove(&key) {
+            Some(s) => s,
+            None => return,
+        };
+        slot.running.store(false, Ordering::SeqCst);
+        slot.thread.store(0, Ordering::SeqCst);
+        // 不强制 `WaitForSingleObject`：窗口正在销毁时等一个还在
+        // `PostMessage` 的线程反而可能死锁（它 post 到已销毁的 hwnd，
+        // 消息进黑洞，线程再睡一拍才醒）。线程下一拍看到 `running`
+        // 为 false 就退出并自行 `from_raw`。
+        slot.inflight.store(0, Ordering::SeqCst);
+        drop(slot);
     }
 
-    /// 主线程消费完一帧后调用，腾出 in-flight 名额。
+    /// 主线程消费完 `hwnd` 的一帧后调用，腾出 in-flight 名额。
     ///
     /// 返回递减后的 in-flight 值，供埋点记录（判假设 (d)：若它没降到 0，
     /// 说明递减逻辑本身失真，或有一帧被 `frame_done` 减了两次）。
@@ -136,12 +194,16 @@ impl AnimClock {
     /// **注意这里用的是 load + store 而不是 `fetch_sub`**：这是既有行为，
     /// 本轮**刻意不改** —— 改它就改变了动画驱动语义，混进埋点结论里就
     /// 分不清"测出来的长尾"和"我顺手改出来的东西"了。埋点只观察。
-    pub fn frame_done() -> u32 {
-        let prev = ANIM_CLOCK.inflight.load(Ordering::SeqCst);
+    pub fn frame_done(hwnd: HWND) -> u32 {
+        let m = clocks().lock().unwrap();
+        let Some(slot) = m.get(&(hwnd.0 as usize)) else {
+            return 0;
+        };
+        let prev = slot.inflight.load(Ordering::SeqCst);
         if prev > 0 {
-            ANIM_CLOCK.inflight.store(prev - 1, Ordering::SeqCst);
+            slot.inflight.store(prev - 1, Ordering::SeqCst);
         }
-        ANIM_CLOCK.inflight.load(Ordering::SeqCst)
+        slot.inflight.load(Ordering::SeqCst)
     }
 }
 
@@ -150,10 +212,15 @@ impl AnimClock {
 /// 只做三件事：等一拍、看 in-flight 有没有满、post。
 /// **不碰任何 App 状态** —— 那是主线程的活（`tick_anim`）。
 unsafe extern "system" fn anim_thread(param: *mut std::ffi::c_void) -> u32 {
-    // `CreateThread` 的 lpParameter 是裸指针原样传过来的。
-    // **不要试图用 `HWND::from_raw` 之类重建** —— 那样反而会多一层不安全的
-    // 指针转换。这里直接 `transmute` 成 HWND 最直接（传进来时就是 HWND.0）。
-    let hwnd: HWND = std::mem::transmute(param);
+    // 参数是 `Box<SlotParam>` 的裸指针，原样取回所有权。
+    //
+    // **不需要 `ManuallyDrop`**：函数返回 `u32`，不是把这个 `Box` 还给
+    // 调用方，所以局部变量离开作用域时的自动析构**正是我们想要的** ——
+    // 线程结束时顺带释放，不多不少一次。（原先担心"双重析构"是把
+    // `Box::into_raw` 的语义记混了：它交出去的是所有权，不是副本。）
+    let p: Box<SlotParam> = unsafe { Box::from_raw(param as *mut SlotParam) };
+    let slot = &p.slot;
+    let hwnd = p.hwnd;
 
     // waitable timer：比 Sleep 精度高，且能被 running 标志提前唤醒退出。
     //
@@ -182,16 +249,16 @@ unsafe extern "system" fn anim_thread(param: *mut std::ffi::c_void) -> u32 {
         .ok(),
     };
 
-    while ANIM_CLOCK.running.load(Ordering::SeqCst) {
+    while slot.running.load(Ordering::SeqCst) {
         // in-flight 已满 = 主线程还没消化上一帧 → 这一拍**主动丢弃**。
         // 这不是丢帧，是**防止队列堆积**（见 MAX_INFLIGHT 的注释）。
         //
         // 埋点（第69轮）：这里同时记下 post 前后的 in-flight。丢帧的那一拍
         // 也会留记录（`t_handler_enter=0`），否则"这一拍没 post"与"post 了
         // 但主线程没取"在 CSV 里长得一样，无法区分假设 (a) 与 (b)。
-        let before = ANIM_CLOCK.inflight.load(Ordering::SeqCst);
+        let before = slot.inflight.load(Ordering::SeqCst);
         if before < MAX_INFLIGHT {
-            ANIM_CLOCK.inflight.fetch_add(1, Ordering::SeqCst);
+            slot.inflight.fetch_add(1, Ordering::SeqCst);
             // post **之前**取时刻：差值 `t_post → t_handler_enter` 里含的
             // 就是 PostMessage 本身 + 排队，两者在本埋点精度下无法再分开，
             // 但这对定位已经足够（PostMessage 是微秒级，排队是毫秒级）。
@@ -229,15 +296,18 @@ unsafe extern "system" fn anim_thread(param: *mut std::ffi::c_void) -> u32 {
             let _ = WaitForSingleObject(HANDLE(std::ptr::null_mut()), FRAME_MS);
         }
     }
+    // `p` 是普通 `Box<SlotParam>`，离开作用域自动释放 —— 线程结束时
+    // 顺带把这个 `Box` 和它里面的 `Arc` 引用一起还掉，不多不少一次。
     0
 }
 
-/// 供自检用：当前是否在跑、in-flight 是多少。
-pub fn debug_state() -> (bool, u32) {
-    (
-        ANIM_CLOCK.running.load(Ordering::SeqCst),
-        ANIM_CLOCK.inflight.load(Ordering::SeqCst),
-    )
+/// 供自检用：`hwnd` 的时钟是否在跑、in-flight 是多少。
+pub fn debug_state(hwnd: HWND) -> (bool, u32) {
+    let m = clocks().lock().unwrap();
+    match m.get(&(hwnd.0 as usize)) {
+        Some(s) => (s.running.load(Ordering::SeqCst), s.inflight.load(Ordering::SeqCst)),
+        None => (false, 0),
+    }
 }
 
 /// 自检：量时钟线程**真实**的推送间隔。

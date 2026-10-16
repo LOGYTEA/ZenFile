@@ -1199,7 +1199,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         app.sync_anim_timer();
         crate::anim_clock::trace_sync_end();
         // 消费完一帧，腾出 in-flight 名额让时钟线程可以继续 post
-        let after = crate::anim_clock::AnimClock::frame_done();
+        let after = crate::anim_clock::AnimClock::frame_done(hwnd);
         crate::anim_clock::trace_frame_done(after);
         return LRESULT(0);
     }
@@ -3026,6 +3026,17 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     let mut boxed = Box::from_raw(app_ptr);
                     // 后台线程必须在这里收掉：它们 PostMessage 回这个 hwnd，
                     // 窗口没了之后每帧一次的 drain 也跟着没了，线程会一直挂着。
+                    //
+                    // 动画时钟同理，而且**不能靠 `drop(boxed)` 顺带收** ——
+                    // `AnimClock` 的状态在 `anim_clock.rs` 的**进程级表**
+                    // 里，不挂在 `App` 上、没有 `Drop`。上面
+                    // `sync_anim_timer` 只在"动画自然结束"那条路上才
+                    // `stop()`，而此刻窗口正在销毁、`tick_anim` 不会再跑 ——
+                    // 于是时钟线程会一直每 15ms 往一个**已销毁**的 hwnd
+                    // `PostMessage`。单窗口时进程随即退出，肉眼无感；但多开
+                    // 窗口关掉**非最后**那个（`WINDOWS` 还有别的）时进程继续
+                    // 活着，这条线程就永久空转吃一个核。
+                    crate::anim_clock::AnimClock::stop(hwnd);
                     if let Some(w) = boxed.watcher.take() {
                         w.stop();
                     }
