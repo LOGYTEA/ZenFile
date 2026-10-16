@@ -31,11 +31,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{IsWindow, PostMessageW};
 use windows::Win32::UI::Shell::{
     CMINVOKECOMMANDINFOEX, CMF_EXPLORE, CMF_EXTENDEDVERBS, CMF_ITEMMENU, IShellFolder,
-    IContextMenu, IContextMenu3, SHGetDesktopFolder,
+    IContextMenu, IContextMenu3, IShellExtInit, SHCreateDataObject, SHGetDesktopFolder, GCS_VERB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, GetMenuItemCount,
-    GetMenuItemInfoW, GetWindowLongPtrW, RegisterClassExW, SetWindowLongPtrW, ShowWindow,
+    GetMenuItemID, GetMenuItemInfoW, GetWindowLongPtrW, RegisterClassExW, SetWindowLongPtrW,
+    ShowWindow,
     TrackPopupMenu, GWLP_USERDATA, HMENU, MENUITEMINFOW,
     MFS_DISABLED, MFT_SEPARATOR, MIIM_BITMAP, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING,
     MIIM_SUBMENU, MFS_CHECKED, SW_SHOWNOACTIVATE, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_DESTROY,
@@ -88,6 +89,15 @@ pub enum Command {
     ViewModeCycle,
     ShowNativeMenu,
     Properties,
+    // —— 「固定到…」三项 ——
+    //
+    // Windows **没有公开的 pin API**。微软的立场是"固定到任务栏/开始"属于用户的
+    // 决定，程序不该以编程方式去做（Explorer 能做是因为它自己就是 Shell）。所以
+    // 这里只剩 Shell 上下文菜单里的 verb 这一条路，而且各版本 Windows 提供的
+    // verb 不一样 —— 必须**运行时探测**，不能写死。
+    PinTaskbar,
+    PinStartMenu,
+    PinStartScreen,
     // —— 标题栏「更多」菜单专用 ——
     ViewIcons,
     ViewList,
@@ -506,6 +516,260 @@ pub fn invoke(bridge: &ShellMenuBridge, hwnd: HWND, id_offset: u32) -> bool {
         }
         ctx.InvokeCommand(&info as *const _ as *const windows::Win32::UI::Shell::CMINVOKECOMMANDINFO)
             .is_ok()
+    }
+}
+
+// -------------------------------------------------------------- 「固定到…」
+//
+// 三个 verb 名**全是实测来的**（Win10 IoT LTSC 21H2 / build 19044，用
+// `IContextMenu::GetCommandString(GCS_VERB)` 逐条枚举 notepad.exe 与文件夹的菜单）：
+//
+//   · `PinToStartScreen` —— 真的存在，exe 和文件夹都有，由 appresolver.dll 提供
+//   · `taskbarpin`       —— 菜单里**没有**。任务栏固定那个扩展（CLSID
+//                           {90AA3A4E-1CBA-4233-B8BB-535773D48449}）确实在
+//                           shell32.dll 里、也有 InProcServer32，但它**没有注册成
+//                           ContextMenuHandler**，所以不会出现在菜单里。加
+//                           CMF_EXTENDEDVERBS 也查不到。要它只能自己 CoCreate +
+//                           IShellExtInit 把上下文喂进去。
+//   · `startpin`         —— 菜单里没有
+//
+// 所以这三项一律**运行时探测**，探测不到就把菜单项置成禁用态 —— 宁可显示"用不了"，
+// 也不能点了静悄悄什么都不发生（资源管理器里不可用的动作就是淡的、点不动）。
+const VERB_PIN_START_SCREEN: &str = "PinToStartScreen";
+const VERB_PIN_TASKBAR: &str = "taskbarpin";
+const VERB_PIN_START: &str = "startpin";
+
+/// 任务栏固定的 Shell 扩展。见上面注释：它没挂进 ContextMenuHandler，得手动 CoCreate。
+const CLSID_TASKBAR_PIN: windows::core::GUID = windows::core::GUID {
+    data1: 0x90AA3A4E,
+    data2: 0x1CBA,
+    data3: 0x4233,
+    data4: [0xB8, 0xBB, 0x53, 0x57, 0x73, 0xD4, 0x84, 0x49],
+};
+
+/// 在 Shell 菜单里找某个 verb 对应的**命令偏移**（InvokeCommand 用 MAKEINTRESOURCE
+/// 形式，所以要的是相对 idCmdFirst 的偏移量，不是菜单 id）。
+///
+/// `GetCommandString` 的 `idcmd` 必须传偏移量 —— 传菜单 id 会直接返回
+/// "参数错误"(0x80070057)。这是实测踩到的，不是从文档推出来的。
+fn verb_offset(ctx: &IContextMenu, hmenu: HMENU, first_id: u32, verb: &str) -> Option<u32> {
+    unsafe {
+        let count = GetMenuItemCount(Some(hmenu));
+        let mut buf = [0u16; 128];
+        for i in 0..count {
+            let id = GetMenuItemID(hmenu, i as i32);
+            if id < first_id || id == u32::MAX {
+                continue;
+            }
+            buf[0] = 0;
+            // GCS_VERB = GCS_VERBW，缓冲区按 UTF-16 传
+            if ctx
+                .GetCommandString(
+                    (id - first_id) as usize,
+                    GCS_VERB,
+                    None,
+                    windows::core::PSTR(buf.as_mut_ptr().cast::<u8>()),
+                    buf.len() as u32,
+                )
+                .is_ok()
+            {
+                let s = String::from_utf16_lossy(&buf);
+                if s.trim_end_matches('\0').eq_ignore_ascii_case(verb) {
+                    return Some(id - first_id);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 这三个「固定」在当前系统 + 当前条目上分别能不能用。
+///
+/// 一次建桥探三个 verb，避免为每一项各建一次 Shell 菜单（每次都要 ParseDisplayName
+/// + GetUIObjectOf + QueryContextMenu，右键一次建 4 次太浪费）。
+pub fn pin_verbs_available(hwnd: HWND, parent: &Path, files: &[PathBuf]) -> [bool; 3] {
+    let mut out = [false; 3];
+    let Some(bridge) = build_shell_bridge(hwnd, parent, files, true) else {
+        return out;
+    };
+    let (Some(ctx), Some(hmenu)) = (&bridge.menu, bridge.hmenu) else {
+        return out;
+    };
+    let pin_screen = verb_offset(ctx, hmenu, bridge.first_id, VERB_PIN_START_SCREEN).is_some();
+    // 「固定到开始菜单」：Win10/11 里"开始菜单"就是"开始"的磁贴区，和开始屏幕
+    // 是同一个目标。系统若单独提供 `startpin` 就用它，否则退回 `PinToStartScreen`。
+    let pin_start = verb_offset(ctx, hmenu, bridge.first_id, VERB_PIN_START).is_some() || pin_screen;
+    out[1] = pin_start;
+    out[2] = pin_screen;
+    out[0] = verb_offset(ctx, hmenu, bridge.first_id, VERB_PIN_TASKBAR).is_some()
+        || taskbar_pin_available(hwnd, parent, files);
+    out
+}
+
+/// 执行某个「固定」动作。返回 false 表示当前系统做不到。
+pub fn pin_invoke(hwnd: HWND, parent: &Path, files: &[PathBuf], which: PinTarget) -> bool {
+    // 先走菜单里现成的 verb
+    if let Some(bridge) = build_shell_bridge(hwnd, parent, files, true) {
+        let (ctx, hmenu, first) = (&bridge.menu, bridge.hmenu, bridge.first_id);
+        if let (Some(ctx), Some(hmenu)) = (ctx, hmenu) {
+            let verb = match which {
+                PinTarget::Taskbar => VERB_PIN_TASKBAR,
+                PinTarget::StartMenu => VERB_PIN_START,
+                PinTarget::StartScreen => VERB_PIN_START_SCREEN,
+            };
+            if let Some(off) = verb_offset(ctx, hmenu, first, verb) {
+                return invoke(&bridge, hwnd, off);
+            }
+            // 开始菜单：系统没单独提供 `startpin` 时，退回和开始屏幕同一个 verb
+            if which == PinTarget::StartMenu {
+                if let Some(off) = verb_offset(ctx, hmenu, first, VERB_PIN_START_SCREEN) {
+                    return invoke(&bridge, hwnd, off);
+                }
+            }
+        }
+    }
+    if which == PinTarget::Taskbar {
+        return taskbar_pin_invoke(hwnd, parent, files);
+    }
+    false
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PinTarget {
+    Taskbar,
+    StartMenu,
+    StartScreen,
+}
+
+/// 手动 CoCreate 任务栏固定扩展，拿它的菜单查 `taskbarpin`。
+///
+/// 它实现 `IContextMenu` + `IShellExtInit`：必须先 `Initialize` 把"在哪个目录、
+/// 选中了什么"喂进去，`QueryContextMenu` 才会吐出 `taskbarpin`。
+fn taskbar_pin_context(
+    hwnd: HWND,
+    parent: &Path,
+    files: &[PathBuf],
+) -> Option<(IContextMenu, HMENU)> {
+    unsafe {
+        let desktop: IShellFolder = SHGetDesktopFolder().ok()?;
+        let mut attrs = 0u32;
+        let mut parent_pidl: *mut windows::Win32::UI::Shell::Common::ITEMIDLIST =
+            std::ptr::null_mut();
+        desktop
+            .ParseDisplayName(
+                hwnd,
+                None,
+                &HSTRING::from(parent.to_string_lossy().as_ref()),
+                None,
+                &mut parent_pidl,
+                &mut attrs,
+            )
+            .ok()?;
+        if parent_pidl.is_null() {
+            return None;
+        }
+        let folder: IShellFolder = desktop.BindToObject(parent_pidl, None).ok()?;
+        let mut pidls: Vec<*mut windows::Win32::UI::Shell::Common::ITEMIDLIST> = Vec::new();
+        for f in files {
+            let name = f.file_name()?.to_string_lossy().into_owned();
+            let eaten = 0u32;
+            let mut a2 = 0u32;
+            let mut pidl: *mut windows::Win32::UI::Shell::Common::ITEMIDLIST =
+                std::ptr::null_mut();
+            if folder
+                .ParseDisplayName(
+                    hwnd,
+                    None,
+                    &HSTRING::from(name.as_str()),
+                    Some(&eaten),
+                    &mut pidl,
+                    &mut a2,
+                )
+                .is_err()
+                || pidl.is_null()
+            {
+                continue;
+            }
+            pidls.push(pidl);
+        }
+        if pidls.is_empty() {
+            CoTaskMemFree(Some(parent_pidl as *const core::ffi::c_void));
+            return None;
+        }
+        let slice: Vec<*const windows::Win32::UI::Shell::Common::ITEMIDLIST> =
+            pidls.iter().map(|p| *p as *const _).collect();
+        // IShellExtInit 要的"选中了什么"是一个 IDataObject
+        let data: windows::Win32::System::Com::IDataObject =
+            SHCreateDataObject(Some(parent_pidl as *const _), Some(&slice), None).ok()?;
+
+        let ctx: IContextMenu = windows::Win32::System::Com::CoCreateInstance(
+            &CLSID_TASKBAR_PIN,
+            None,
+            windows::Win32::System::Com::CLSCTX_INPROC_SERVER,
+        )
+        .ok()?;
+        let init: IShellExtInit = ctx.cast::<IShellExtInit>().ok()?;
+        init.Initialize(Some(parent_pidl as *const _), &data, None).ok()?;
+
+        let hmenu = CreatePopupMenu().ok()?;
+        if ctx
+            .QueryContextMenu(hmenu, 0, CMD_FIRST, CMD_LAST, CMF_EXPLORE)
+            .is_err()
+        {
+            let _ = DestroyMenu(hmenu);
+            for p in pidls {
+                CoTaskMemFree(Some(p as *const core::ffi::c_void));
+            }
+            CoTaskMemFree(Some(parent_pidl as *const core::ffi::c_void));
+            return None;
+        }
+        for p in pidls {
+            CoTaskMemFree(Some(p as *const core::ffi::c_void));
+        }
+        CoTaskMemFree(Some(parent_pidl as *const core::ffi::c_void));
+        Some((ctx, hmenu))
+    }
+}
+
+/// 「固定到任务栏」在当前系统能不能用（只探不执行）。
+fn taskbar_pin_available(hwnd: HWND, parent: &Path, files: &[PathBuf]) -> bool {
+    match taskbar_pin_context(hwnd, parent, files) {
+        Some((ctx, hmenu)) => {
+            let ok = verb_offset(&ctx, hmenu, CMD_FIRST, VERB_PIN_TASKBAR).is_some();
+            let _ = unsafe { DestroyMenu(hmenu) };
+            ok
+        }
+        None => false,
+    }
+}
+
+/// 「固定到任务栏」：走 CoCreate 出来的扩展菜单。
+fn taskbar_pin_invoke(hwnd: HWND, parent: &Path, files: &[PathBuf]) -> bool {
+    let Some((ctx, hmenu)) = taskbar_pin_context(hwnd, parent, files) else {
+        return false;
+    };
+    let Some(off) = verb_offset(&ctx, hmenu, CMD_FIRST, VERB_PIN_TASKBAR) else {
+        let _ = unsafe { DestroyMenu(hmenu) };
+        return false;
+    };
+    unsafe {
+        let info = CMINVOKECOMMANDINFOEX {
+            cbSize: std::mem::size_of::<CMINVOKECOMMANDINFOEX>() as u32,
+            fMask: 0x00004000, // CMIC_MASK_UNICODE
+            hwnd,
+            lpVerbW: PCWSTR(off as usize as *const u16),
+            lpParametersW: PCWSTR::null(),
+            lpDirectoryW: PCWSTR::null(),
+            nShow: 5,
+            ..Default::default()
+        };
+        let r = ctx
+            .InvokeCommand(
+                &info as *const _ as *const windows::Win32::UI::Shell::CMINVOKECOMMANDINFO,
+            )
+            .is_ok();
+        let _ = DestroyMenu(hmenu);
+        r
     }
 }
 

@@ -4370,6 +4370,39 @@ impl App {
         }
     }
 
+    /// 对当前选中项执行「固定到…」。
+    ///
+    /// 失败要给话说清楚：这三项依赖 Shell 的 verb，不同 Windows 版本给的 verb
+    /// 不一样（实测 Win10 LTSC 19044 只有 `PinToStartScreen` 真在菜单里），静悄悄
+    /// 失败最容易被当成"菜单坏了"。
+    fn pin_selected(&mut self, target: menu::PinTarget) {
+        let items = self
+            .context_targets
+            .clone()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| self.tab().selected_paths());
+        let Some(first) = items.first().cloned() else {
+            report(self.hwnd, "没有选中任何项目");
+            return;
+        };
+        let parent = first
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| self.tab().path.clone());
+        let one = vec![first];
+        if menu::pin_invoke(self.hwnd, &parent, &one, target) {
+            return;
+        }
+        report(
+            self.hwnd,
+            match target {
+                menu::PinTarget::Taskbar => "当前系统不支持“固定到任务栏”",
+                menu::PinTarget::StartMenu => "当前系统不支持“固定到开始菜单”",
+                menu::PinTarget::StartScreen => "当前系统不支持“固定到开始屏幕”",
+            },
+        );
+    }
+
     pub fn run_command(&mut self, cmd: Command) {
         match cmd {
             Command::Open => self.open_focused(),
@@ -4449,6 +4482,9 @@ impl App {
                     crate::props::open(self as *mut App, target);
                 }
             }
+            Command::PinTaskbar => self.pin_selected(menu::PinTarget::Taskbar),
+            Command::PinStartMenu => self.pin_selected(menu::PinTarget::StartMenu),
+            Command::PinStartScreen => self.pin_selected(menu::PinTarget::StartScreen),
             Command::ViewIcons => self.set_view(ViewMode::LargeIcons),
             Command::ViewList => self.set_view(ViewMode::List),
             Command::ViewDetails => self.set_view(ViewMode::Details),
@@ -5486,6 +5522,33 @@ fn disabled_row(text: &str, glyph: Option<&'static str>, cmd: Command) -> menu::
     r
 }
 
+/// 三个「固定到…」在当前系统 + 当前条目上能不能用（[任务栏, 开始菜单, 开始屏幕]）。
+///
+/// 只对**第一个**选中项探：这三项都是"对这个东西做什么"，多选时资源管理器也是
+/// 只按第一个来（而且 Shell 菜单跨目录多选本来就建不出来）。
+/// 探测要建 Shell 菜单桥，有成本，但只在开菜单时走一次。
+fn pin_avail(app: &App, items: &[PathBuf]) -> [bool; 3] {
+    let Some(first) = items.first() else {
+        return [false; 3];
+    };
+    let parent = first
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| app.tab().path.clone());
+    let one = vec![first.clone()];
+    menu::pin_verbs_available(app.hwnd, &parent, &one)
+}
+
+/// 「固定到…」三项：能用就正常项，用不了就禁用态（不是隐藏）。
+fn pin_row(text: &str, ok: bool, cmd: Command) -> menu::MenuEntry {
+    let glyph: Option<&'static str> = Some("\u{E718}");
+    if ok {
+        shell_row(text, glyph, cmd)
+    } else {
+        disabled_row(text, glyph, cmd)
+    }
+}
+
 /// 「排序方式」下拉的内容：四个排序列（当前列打点）+ 方向二选一。
 ///
 /// 右键菜单和标题栏「更多」菜单共用这一份，避免两边顺序/文案对不上
@@ -5681,6 +5744,16 @@ pub fn own_menu_rows(app: &App, items: &[PathBuf], kind: MenuKind) -> Vec<menu::
         push(5, shell_row("重命名", Some("\u{E8AC}"), Command::Rename));
         // 「批量重命名」搬到了目录栏最右侧的按钮（带下拉），不再占右键菜单的位置
         push(7, shell_row("删除", Some("\u{E74D}"), Command::Delete));
+        // —— 三个「固定到…」——
+        //
+        // Windows 没有公开的 pin API，只能问 Shell 菜单要 verb，而各版本 Windows
+        // 给的 verb 不一样（实测 Win10 LTSC 19044 只有 `PinToStartScreen` 真在菜单里）。
+        // 所以**每次开菜单都探一次**，用不了就给禁用态 —— 宁可让用户看见"用不了"，
+        // 也不能点了静悄悄没反应。
+        let pin = pin_avail(app, items);
+        push(14, pin_row("固定到任务栏", pin[0], Command::PinTaskbar));
+        push(15, pin_row("固定到开始菜单", pin[1], Command::PinStartMenu));
+        push(16, pin_row("固定到“开始”屏幕", pin[2], Command::PinStartScreen));
     }
     if items.is_empty() {
         // —— 以下只属于"空白处右键"（背景菜单）——
