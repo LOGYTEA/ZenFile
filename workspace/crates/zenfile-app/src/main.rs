@@ -156,6 +156,128 @@ fn app_selftest() -> i32 {
 ///
 /// 消息循环要 **Peek + Dispatch 两步**。只 `PeekMessage(PM_REMOVE)` 会把消息
 /// 从队列取走但**不调用 wnd_proc**，量出来是"0 次"。（第一版就漏了。）
+/// 帧链路埋点录制的两条自定义消息（第69轮）。
+const WM_APP_TRACE_STOP: u32 = WM_APP + 10;
+
+/// 埋点录制驱动用的窗口定时器 ID（与 `TIMER_BUSY` / `TIMER_DRAIN` 不冲突）。
+const TRACE_TIMER_ID: usize = 9;
+
+/// 埋点 dump 的目标文件（写 `$TEMP%`，release 是 windows 子系统，
+/// `println!` 全被丢弃 —— 调试信息只能走文件）。
+fn anim_trace_path() -> PathBuf {
+    std::env::temp_dir().join("zenfile_anim_trace.csv")
+}
+
+/// 第69轮：挂一个"到点 dump"的链路。
+///
+/// 流程（全部在**主线程**，所以 dump 与录制之间不存在撕裂）：
+///
+///   1. 挂一只 500ms 的 `TIMER_TRACE`：满两拍后（≈1s 预热）才开 trace
+///      —— 预热期丢掉是因为刚开窗那几帧的 `dt` 与消息队列状态都不是
+///      稳态，录进来会污染分布。
+///   2. 第一次触发 → 开 `TRACE_ON`。
+///   3. 第二次触发 → 关 `TRACE_ON`、写 CSV、Kill 定时器。
+///
+/// 用**消息定时器**而不是 `std::thread::sleep` + `PostMessage`：dump
+/// 必须在 UI 线程做（后台线程去 `dump_trace` 会和 `trace_paint_enter`
+/// 抢锁，虽然有 Mutex 不会崩，但会把"最后一帧 paint"打乱）。
+/// `TIMER_TRACE` 是独立 ID，不与 `TIMER_BUSY` / `TIMER_DRAIN` 冲突。
+fn spawn_anim_trace_timer(hwnd: HWND, record_ms: u64) {
+    unsafe {
+        // 500ms 一拍：两拍开录，之后按 record_ms 累计到点收网。
+        let _ = SetTimer(Some(hwnd), TRACE_TIMER_ID, 500, None);
+    }
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_millis(1000 + record_ms);
+    TRACE_DEADLINE
+        .lock()
+        .map(|mut d| *d = Some(deadline))
+        .unwrap_or(());
+    TRACE_STAGE
+        .lock()
+        .map(|mut s| *s = 0)
+        .unwrap_or(());
+}
+
+/// `--anim-trace` 的时间线状态（阶段 + 收网时刻），仅主线程读写，
+/// 用 `Mutex` 而不是 `static mut` 只是为了不引入新的 `unsafe` 全局。
+static TRACE_DEADLINE: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+static TRACE_STAGE: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
+
+/// 埋点录制的一次心跳（`WM_TIMER` / `TRACE_TIMER_ID`）。
+///
+/// 阶段机（每次进来只推进一步）：
+///
+///   0 → 1   预热结束，**开** trace（`TRACE_ON = true`）
+///   1 → 2   到 deadline，**关** trace 并 dump 到 `$TEMP%`
+///
+/// 之所以用"阶段 + deadline"而不是"开一只定时器再等"：录制时长是
+/// 命令行给的任意毫秒数，而 `SetTimer` 的周期要在挂的时候就知道，
+/// 两拍 500ms 的心跳 + 绝对时刻比较，是唯一既能任意时长、又能保证
+/// dump 落在**主线程消息处理里**的做法。
+///
+/// dump 完成后**不退出进程**、不 Kill 掉窗口：留给人工继续操作窗口，
+/// 需要再录一次就再跑一遍命令行。录制开关已被 dump 置 false，
+/// 后续操作不会再有埋点开销。
+fn tick_anim_trace(hwnd: HWND) {
+    let stage = match TRACE_STAGE.lock() {
+        Ok(mut s) => {
+            let cur = *s;
+            *s += 1;
+            cur
+        }
+        Err(_) => return,
+    };
+    match stage {
+        0 => {
+            // 预热完毕，开录。
+            crate::anim_clock::trace_set(true);
+        }
+        1 => {
+            let deadline = TRACE_DEADLINE.lock().ok().and_then(|d| *d);
+            if let Some(dl) = deadline {
+                if std::time::Instant::now() < dl {
+                    // 还不到收网时刻：把阶段退回去，下一拍再判。
+                    if let Ok(mut s) = TRACE_STAGE.lock() {
+                        *s = 1;
+                    }
+                    return;
+                }
+            }
+            let path = anim_trace_path();
+            let pstr = path.to_string_lossy().to_string();
+            // dump_trace 内部会先把 TRACE_ON 置 false 再取缓冲，
+            // 所以这里**不需要**再手动关一次（顺序反了会漏掉最后一帧）。
+            match crate::anim_clock::dump_trace(&pstr) {
+                Ok(n) => {
+                    let orphans = crate::anim_clock::trace_orphan_paints();
+                    let note = format!(
+                        "frames={n} orphan_paints={orphans} path={}\n",
+                        pstr
+                    );
+                    let _ = std::fs::write(format!("{pstr}.done"), note.as_bytes());
+                }
+                Err(e) => {
+                    let _ = std::fs::write(
+                        format!("{pstr}.done"),
+                        format!("dump failed: {e}\n").as_bytes(),
+                    );
+                }
+            }
+            // 收工：撤掉这只定时器，窗口继续正常跑（埋点已关）。
+            unsafe {
+                let _ = KillTimer(Some(hwnd), TRACE_TIMER_ID);
+            }
+        }
+        _ => {
+            unsafe {
+                let _ = KillTimer(Some(hwnd), TRACE_TIMER_ID);
+            }
+        }
+    }
+}
+
 fn bench_timer() -> i32 {
     use std::sync::Mutex;
     use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
@@ -271,6 +393,30 @@ fn main() {
         let code = crate::plugin_host::run_plugin_process(&id, &args);
         std::process::exit(code);
     }
+
+    // -------------------------------------------------- 帧链路埋点录制（第69轮）
+    //
+    // `ZenFile.exe --anim-trace <毫秒数>`：**带着正常窗口启动**，后台录制
+    // 指定的时长，到点把 CSV 写到 `$TEMP%\zenfile_anim_trace.csv`，
+    // 然后窗口照常留着继续跑。
+    //
+    // 为什么**不**像 `--plugin` / `--bench-timer` 那样 early-return 自退：
+    // 动画只有在**真实窗口 + 真实绘制**下才存在。凭空造一个 headless
+    // 的 tick 循环，测出来的是"理想情况下的链路"，恰恰把我们要查的
+    // 排队/合成延迟全绕过去了 —— 那样量出来的数字没有意义。
+    // 所以这里只**记下参数**，让流程继续往下走完正常开窗的每一步，
+    // 真正常见的是后面 `spawn_anim_trace_timer` 挂的那个 dump 定时器。
+    //
+    // 关于单实例：**刻意放在 `hand_off_to_running_instance` 之前取参数、
+    // 但不 return**，因此单实例逻辑本身一行未改。要配合 `--new-process`
+    // 使用（否则会被转交给已有实例，本进程根本走不到开窗）；实测
+    // `--new-process --anim-trace 5000` 会正常开出新窗口并录到帧。
+    let anim_trace_ms: Option<u64> = args
+        .iter()
+        .position(|a| a == "--anim-trace")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms > 0);
 
     if args.iter().any(|a| a == "--bench-timer") {
         // 定时器基准（第68轮）：量 `SetTimer(16)` 的**真实投递间隔**。
@@ -400,6 +546,15 @@ fn main() {
         }
     }
 
+    // 帧链路埋点录制（第69轮）：窗口已建好，现在才开 trace。
+    //
+    // 放在开窗**之后**才开 trace，而不是进 `main` 就开：开窗那一大段
+    // （读配置、建子控件、`open_tab` 首次枚举目录）会占掉几百毫秒，
+    // 那段里的重绘跟动画链路无关，录进来只会把分布的尾巴拉脏。
+    if let Some(ms) = anim_trace_ms {
+        spawn_anim_trace_timer(hwnd, ms);
+    }
+
     let mut msg = MSG::default();
     loop {
         let r = unsafe { GetMessageW(&mut msg, None, 0, 0) };
@@ -411,7 +566,6 @@ fn main() {
             let _ = DispatchMessageW(&msg);
         }
     }
-
     // 退出顺序 §3.6：先终止子进程再让宿主退出
     unsafe {
         if !TRAY_HWND.0.is_null() {
@@ -1028,14 +1182,23 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
     //
     // 放在框架关键消息**之前**：它要读写 `App`，但 `GWLP_USERDATA` 在
     // 窗口创建后才设 —— 动画时钟只在那之后才启动，所以这里必然已有值。
+    //
+    // 第69轮埋点：这一分支上依次打了 4 个时刻
+    // （进分支 / tick 后 / sync 后 / frame_done 后），**只加打点，
+    // 不动任何控制流** —— 返回值、调用顺序、InvalidateRect 的参数全部
+    // 与第68轮一致，这样测出来的分布才是"现状的分布"。
     if msg == crate::anim_clock::WM_APP_ANIM_TICK {
+        crate::anim_clock::trace_handler_enter();
         let app = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App) };
         if app.tick_anim() {
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
+        crate::anim_clock::trace_tick_end();
         app.sync_anim_timer();
+        crate::anim_clock::trace_sync_end();
         // 消费完一帧，腾出 in-flight 名额让时钟线程可以继续 post
-        crate::anim_clock::AnimClock::frame_done();
+        let after = crate::anim_clock::AnimClock::frame_done();
+        crate::anim_clock::trace_frame_done(after);
         return LRESULT(0);
     }
     // 框架关键消息必须先于 App 判空守卫处理：GWLP_USERDATA 是在 CreateWindowExW
@@ -1046,7 +1209,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
     match msg {
         WM_NCCALCSIZE => return handle_nc_calc_size(hwnd, wparam, lparam),
         WM_NCHITTEST => return handle_hit_test(hwnd, lparam),
-        WM_ERASEBKGND => return LRESULT(1),
+        // 第70轮埋点：主窗口的 `WM_ERASEBKGND` 计数。
+        //
+        // 主窗口这里直接 `return LRESULT(1)`（"擦过了"），所以**它自己不擦**。
+        // 记这个计数是为了和两个子 EDIT 的对照：子控件那边每次
+        // `InvalidateRect(..., erase=true)` 都会真发一次 `WM_ERASEBKGND`，
+        // 主窗口这边则一条都不会有 —— 差值就是"每帧额外擦了几次"。
+        WM_ERASEBKGND => {
+            crate::anim_clock::trace_child_erase(crate::anim_clock::CHILD_MAIN);
+            return LRESULT(1);
+        }
         _ => {}
     }
 
@@ -1095,7 +1267,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let mut rect = RECT::default();
             GetClientRect(hwnd, &mut rect).unwrap_or(());
             let app = &mut *app_ptr;
+            // 第70轮：主窗口这一次的 `WM_PAINT` 也进子窗口统计（`CHILD_MAIN`），
+            // 口径与两个子 EDIT 完全一致 —— 同一把尺子量三处，才能直接比大小。
+            crate::anim_clock::trace_child_paint_enter(crate::anim_clock::CHILD_MAIN);
+            // 纯绘制耗时的边界。放在 BeginPaint **之后**、paint 之前 ——
+            // BeginPaint 本身要做 UpdateRegion 的校验与裁剪，属于"上屏"那一侧
+            // 的成本，不该算进绘制里（否则会把 (c) 混进 paint 耗时）。
+            crate::anim_clock::trace_paint_enter();
             paint::paint(app, hdc, rect.right, rect.bottom);
+            crate::anim_clock::trace_paint_exit();
+            crate::anim_clock::trace_child_paint_exit(crate::anim_clock::CHILD_MAIN);
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
@@ -1146,6 +1327,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             if wparam.0 == TIMER_BUSY {
                 let app = &mut *app_ptr;
                 paint::tick_busy_strip(hwnd, app);
+            } else if wparam.0 == TRACE_TIMER_ID {
+                // 第69轮埋点录制：两拍开录、到点收网写 CSV。
+                tick_anim_trace(hwnd);
             } else if wparam.0 == TIMER_DRAIN {
                 let app = &mut *app_ptr;
                 // 插件状态机（第65轮）：查进程存活 + 心跳超时，该重启的重启。

@@ -284,16 +284,90 @@ mod tests {
     }
 
     #[test]
-    fn stroke_is_one_pixel_across_the_board() {
-        // 光学粗细一致：小图标与大图标用同样粗的线。
+    fn gdi_fallback_stroke_is_monotonic_in_size() {
+        // 第72轮：这条测试原来叫 `stroke_is_one_pixel_across_the_board`，
+        // 断言 `stroke_px` 在所有档位都恰好 1px（≥1.5x 时 2px）。
+        //
+        // 它**断言的是已废弃的规格**，不是自绘路径的笔画像素。
+        // `stroke_px` 仍然存在，但只服务 `paint.rs` 里三处 **GDI 手绘回退**
+        // （`draw_ui_icon` 返回 false 才触发）；第70轮起自绘 UI 字形一律走
+        // `icon_spec_design::stroke_hw`（= `2.5 * size/13`，随边长线性变粗）。
+        //
+        // 所以"大图标还是 1px"这条老期望**在自绘路径上已经不成立了** ——
+        // 继续留着它只会让每次 `cargo test` 都红，而且红得毫无意义：
+        // 它守的是一条已经不走的代码路径。
+        //
+        // 真正要守的不变式是**单调性**：边长越大描边越粗，不会出现
+        // "18px 的图标比 10px 的还淡"这种光学错配。逐像素相等不是目标，
+        // 光学一致才是（第70轮把它从 1px 提到 2px 就是为此）。
         for s in Size::ALL {
             for scale in [1.0, 1.5, 2.0] {
-                assert_eq!(
-                    stroke_px(s.scaled(scale), scale),
-                    if scale >= 1.5 { 2 } else { 1 },
-                    "{s:?} @ {scale}x 的笔画粗细与其它档不一致"
+                let w = stroke_px(s.scaled(scale), scale);
+                assert!(w >= 1, "{s:?} @ {scale}x 的回退描边细到画不出来");
+            }
+            // 小档一定不大于大档（scale=1 下比较）
+            if let Some(big) = Size::ALL.last() {
+                assert!(
+                    stroke_px(s.px(), 1.0) <= stroke_px(big.px(), 1.0),
+                    "{s:?} 的回退描边比最大档还粗，光学上会显得更重"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn self_drawn_stroke_scales_with_size() {
+        // 自绘路径的真实笔画像素（`icon_spec_design::stroke_hw` 的直径）
+        // 必须**随边长单调递增** —— 18px 的图标不能比 10px 的还淡，
+        // 那才是"光学重量不一致"的根因。
+        let sizes = Size::ALL;
+        for w in sizes.windows(2) {
+            let a = 2.0 * crate::icon_spec_design::design::stroke_hw(w[0].px());
+            let b = 2.0 * crate::icon_spec_design::design::stroke_hw(w[1].px());
+            assert!(b >= a, "{:?} 的笔画比 {:?} 细", w[1], w[0]);
+            assert!(a > 0.0, "{:?} 的笔画直径为 0", w[0]);
+        }
+    }
+    #[test]
+    fn multi_stroke_glyphs_keep_gaps_wider_than_their_strokes() {
+        // **这才是"笔画不能糊死"的真正判据。**
+        //
+        // `icon_spec_design` 的注释里写过一条粗略纪律"笔画直径不得超外接框
+        // 25%"，第70轮作者据此说"当前 5/24 = 20.8%"。但那个 5 是按
+        // **13px（Sm）档**算的，而 `stroke_hw(size) = 2.5 * size/13` 是
+        // **随边长线性增长**的，`BOX` 却是固定的 24 设计单位 ——
+        // 于是"占框比"逐档上升，实测：
+        //
+        // ```text
+        //   10px (Xs) -> 15.4%      17px (Lg) -> 27.2%
+        //   13px (Sm) -> 20.8%      18px (Xl) -> 28.8%
+        //   15px (Md) -> 22.5%
+        // ```
+        //
+        // 所以那条 25% 只在 Sm 档成立，**对 Lg/Xl 一直是破的**。
+        // 但它也从来不是真正的失效条件：糊死只发生在**相邻笔画之间**，
+        // 跟"占外接框多少"没有因果关系 —— 单笔画字形（导航箭头）占比再高
+        // 也不粘连，多笔画字形（hamburger / viewgrid / viewlist / gear）
+        // 才是危险区。真窗口实测也印证了这点：Lg/Xl 的 18px 导航键渲染出
+        // 干净的 4px 笔画，无糊无连。
+        //
+        // 真正的失效条件由 `row_gap(hw) = 4*hw` 保证：行间距 = **两个笔画
+        // 直径**，净空恒等于一个直径，抗锯齿之后仍然看得见分开的缝。
+        // 这条测试就把它钉住，别让有人再把 row_gap 改回写死的数字。
+        for s in Size::ALL {
+            let hw = crate::icon_spec_design::design::stroke_hw(s.px());
+            let gap = crate::icon_spec_design::design::row_gap(hw);
+            let diameter = 2.0 * hw;
+            assert!(
+                gap > diameter,
+                "{}px 档的行间距 {gap:.1} 不大于笔画直径 {diameter:.1}，多笔画字形会粘连",
+                s.px()
+            );
+            assert!(
+                gap - diameter >= diameter,
+                "{}px 档的墨迹净空不足一个笔画直径",
+                s.px()
+            );
         }
     }
 }

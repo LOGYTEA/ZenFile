@@ -677,53 +677,201 @@ pub fn grid_content_h(g: &IconGrid, count: usize) -> i32 {
 // ---------------------------------------------------------------- 绘制
 
 pub fn paint(app: &mut App, hdc: HDC, width: i32, height: i32) {
+    use crate::anim_clock as ac;
+    // 第70轮埋点：`begin_anim_frame` 前打点。
+    ac::trace_sub_begin(ac::SUB_BEGIN_ANIM);
     // 动画的"每帧开始"：把上一帧的 悬停/选中 集合滚成 prev（判"刚变成
     // 这个状态"用），并清空这一帧的放大目标（没写到的项 = 不放大）。
     app.begin_anim_frame();
+    ac::trace_sub_end(ac::SUB_BEGIN_ANIM);
     unsafe {
+        // ---- 建离屏表面：每帧一张全窗口位图 ----
+        ac::trace_sub_begin(ac::SUB_CREATE_SURFACE);
         let mem = CreateCompatibleDC(Some(hdc));
         let bmp = CreateCompatibleBitmap(hdc, width, height);
         let old_bmp = SelectObject(mem, bmp.into());
+        ac::trace_sub_end(ac::SUB_CREATE_SURFACE);
+
+        // ---- 布局计算（~200 处窗格 / 标签 / 列宽）----
+        ac::trace_sub_begin(ac::SUB_LAYOUT);
         let l = layout_sized(app, width, height);
+        ac::trace_sub_end(ac::SUB_LAYOUT);
+
+        // 第70轮：布局算完，此刻采一次判据快照 —— 布局里的 `l.view` 与
+        // `app` 的视图状态在这一帧内不再变，采一次就够。
+        trace_paint_context(app, width, height, &l);
+
+        ac::trace_sub_begin(ac::SUB_FILL);
         let t = app.theme;
         let bg = CreateSolidBrush(t.window_bg);
         let all = RECT { left: 0, top: 0, right: width, bottom: height };
         FillRect(mem, &all, bg);
         let _ = DeleteObject(bg.into());
+        ac::trace_sub_end(ac::SUB_FILL);
 
+        ac::trace_sub_begin(ac::SUB_TITLE);
         paint_title_bar(app, mem, &l);
+        ac::trace_sub_end(ac::SUB_TITLE);
+
+        ac::trace_sub_begin(ac::SUB_TOOLBAR);
         paint_toolbar(app, mem, &l);
+        ac::trace_sub_end(ac::SUB_TOOLBAR);
+
         if app.cfg.ui.sidebar_visible {
+            ac::trace_sub_begin(ac::SUB_SIDEBAR);
             paint_sidebar(app, mem, &l);
+            ac::trace_sub_end(ac::SUB_SIDEBAR);
         }
+        ac::trace_sub_begin(ac::SUB_PANES);
         paint_panes(app, mem, &l);
+        ac::trace_sub_end(ac::SUB_PANES);
+
         if app.cfg.ui.statusbar_visible {
+            ac::trace_sub_begin(ac::SUB_STATUS);
             paint_status(app, mem, &l);
+            ac::trace_sub_end(ac::SUB_STATUS);
         }
 
+        ac::trace_sub_begin(ac::SUB_DRAG_OVERLAY);
         paint_drag_overlay(app, mem, &l);
-        // 拖标签时的"8 向贴"预览：压在最上面
-        paint_dock_overlay(app, mem, &l);
+        ac::trace_sub_end(ac::SUB_DRAG_OVERLAY);
 
+        // 拖标签时的"8 向贴"预览：压在最上面
+        ac::trace_sub_begin(ac::SUB_DOCK_OVERLAY);
+        paint_dock_overlay(app, mem, &l);
+        ac::trace_sub_end(ac::SUB_DOCK_OVERLAY);
+
+        // ---- 全窗口上传 ----
+        ac::trace_sub_begin(ac::SUB_BITBLT);
         let _ = BitBlt(hdc, 0, 0, width, height, Some(mem), 0, 0, SRCCOPY);
+        ac::trace_sub_end(ac::SUB_BITBLT);
+
+        ac::trace_sub_begin(ac::SUB_CLEANUP);
         SelectObject(mem, old_bmp);
         let _ = DeleteObject(bmp.into());
         let _ = DeleteDC(mem);
+        ac::trace_sub_end(ac::SUB_CLEANUP);
+
+        ac::trace_sub_begin(ac::SUB_INVALIDATE);
         // 地址框 / 搜索框的空态提示（放大镜 + "搜索 X"）画在**子 EDIT 自己身上**，
         // 而主窗口带 WS_CLIPCHILDREN，父窗口重绘永远不碰它们那两块。提示词跟着
         // 当前标签变（"搜索设置" / "搜索 Windows"），标签切换却只重绘父窗口 ——
         // 不在这里显式让子 EDIT 跟着重画，提示词就停在旧标签的文字上（实测：
         // 把搜索框从排布里摘掉再装回，提示一直是"搜索设置"）。
         // 子 EDIT 重画不会再失效父窗口，这里不会成环。
+        //
+        // 第69轮埋点：**这两句一个字都没改**，只在旁边各加一句观测 ——
+        // 记录"本帧确实执行了"。它们是后续优化的头号嫌疑：每帧无条件
+        // `erase=true` 地擦两个子 EDIT，意味着**每帧其实是 3 次重绘**
+        // （父窗口 1 次 + 两个子控件各 1 次），而不是 1 次。CSV 里
+        // `inv_search` / `inv_address` 与 `orphan_paints` 一起就能判断
+        // 这次重绘到底有没有发生、发生了几次。
+        crate::anim_clock::trace_invalidate(0);
         let _ = InvalidateRect(Some(app.hwnd_search), None, true);
+        crate::anim_clock::trace_invalidate(1);
         let _ = InvalidateRect(Some(app.hwnd_address), None, true);
+        ac::trace_sub_end(ac::SUB_INVALIDATE);
     }
+    ac::trace_sub_begin(ac::SUB_SYNC_TIMER);
     // 每帧末尾统一校准动画定时器：本帧 paint 已经把各动画目标（`icon_zoom_tgt`
     // 等）按"当前悬停/选中"重写完了，这里看一眼"还有没有没跑完的"——
     // 比如刚取消选中的条目，放大目标被 `begin_anim_frame` 清成了 0、但 `icon_zoom`
     // 还停在 0.10，必须由定时器把它缓动回 0。只在该开/该关时才动定时器
     // （`sync_anim_timer` 内部有去重），所以无动画时空跑是零成本。
     app.sync_anim_timer();
+    ac::trace_sub_end(ac::SUB_SYNC_TIMER);
+}
+
+/// 第70轮埋点：把"这一帧是什么帧"的判据一次性交给 `anim_clock`。
+///
+/// **只读，不改任何状态** —— 它调用的每个字段都是纯读取，`anim_active()`
+/// 本身也只读字段。判据取值口径：
+///
+/// * `entries` 用 `tab().entries.len()`（筛选**前**），`visible` 用
+///   `tab().visible.len()`（筛选**后**）。两个都记，因为"筛选把 5000 行压到
+///   20 行"是一种优化，若只记一个会看不出是列表变短还是别的。
+/// * `view_mode` 映射成 0..3，**顺序与 `zenfile_core::ViewMode` 的声明
+///   顺序一致**（Details/List/MediumIcons/LargeIcons），分析脚本里要写死这个映射。
+/// * `d_flags` 里每一位对应 `anim_clock` 里的一个 `CTX_*` 常量。
+#[inline(always)]
+fn trace_paint_context(app: &App, width: i32, height: i32, l: &Layout) {
+    use crate::anim_clock as ac;
+    // 关着 trace 时整段只花一次 relaxed 原子读 —— 所有 `&app` 字段访问
+    // 都在这个判断之后，编译器会把它们一起优化掉。
+    if !ac::trace_on() {
+        return;
+    }
+    let tab = app.tab();
+    let mode = match tab.view_mode {
+        zenfile_core::ViewMode::Details => 0u32,
+        zenfile_core::ViewMode::List => 1,
+        zenfile_core::ViewMode::MediumIcons => 2,
+        zenfile_core::ViewMode::LargeIcons => 3,
+    };
+    let mut flags = 0u32;
+    if app.addr_anim.is_some() {
+        flags |= ac::CTX_ADDR_ANIM;
+    }
+    if app.sb_scroll_target.is_some() {
+        flags |= ac::CTX_SB_SCROLL;
+    }
+    if let (Some(c), Some(t)) = (app.sb_active_y, app.sb_active_target) {
+        if (t - c).abs() > 0.5 {
+            flags |= ac::CTX_SB_ACTIVE;
+        }
+    }
+    if let (Some(c), Some(t)) = (app.sb_hover_y, app.sb_hover_target) {
+        if (t - c).abs() > 0.5 {
+            flags |= ac::CTX_SB_HOVER;
+        }
+    }
+    if app.drag.as_ref().is_some_and(|d| d.active) {
+        flags |= ac::CTX_DRAG;
+    }
+    if app.pane_div_drag.is_some() {
+        flags |= ac::CTX_DIV_DRAG;
+    }
+    if app.cfg.ui.sidebar_visible {
+        flags |= ac::CTX_SIDEBAR_VISIBLE;
+    }
+    if app.cfg.ui.statusbar_visible {
+        flags |= ac::CTX_STATUS_VISIBLE;
+    }
+    if tab.home {
+        flags |= ac::CTX_HOME;
+    }
+    if tab.recycle {
+        flags |= ac::CTX_RECYCLE;
+    }
+    if tab.settings {
+        flags |= ac::CTX_SETTINGS;
+    }
+    if tab.loading {
+        flags |= ac::CTX_LOADING;
+    }
+    if tab.col_filter.is_some() {
+        flags |= ac::CTX_COL_FILTER;
+    }
+    if app.panes.len() > 1 {
+        flags |= ac::CTX_SPLIT;
+    }
+    if !app.icon_zoom_tgt.is_empty() {
+        flags |= ac::CTX_ICON_ZOOM_TGT;
+    }
+    ac::trace_ctx(
+        width,
+        height,
+        l.view,
+        app.panes.len(),
+        tab.entries.len(),
+        tab.visible.len(),
+        mode,
+        app.icon_zoom.len(),
+        app.icon_bounce.len(),
+        app.cap_anim.len(),
+        flags,
+        app.anim_active(),
+    );
 }
 
 /// 拖拽覆盖层：框选矩形 + 投放目标高亮 + 跟着光标的"移动到…"提示。
@@ -3896,10 +4044,19 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
                 //
                 // 列表视图没有列分隔，整行就该整行可点可画（行式列表的语义）。
                 None => {
+                    // 列区右沿（第32轮 #1）：Details 用**循环外**已经算好的那份
+                    // `boxes`（表头分隔线同源），**绝不在行循环里重算**。
+                    //
+                    // 第72轮：这里原来每行调一次 `col_boxes`，而它内部每列都要
+                    // `App::col_width` → `sysview::system_col_width`，
+                    // 后者每次做 `RegOpenKey`+`RegQueryValue`+`RegCloseKey`。
+                    // 57 行 × 4 列 = **每帧 228 次注册表往返**。
+                    // 埋点实测 Details 模式单帧 paint 的 P95 是 38.6ms、
+                    // 整窗 58.8% 的墙钟都耗在 paint 上 —— 这 228 次往返就是主因。
+                    //
+                    // 关键：`w` 是**整列几何的常量**，与行号 `i` 无关，所以
+                    // 循环外算一次、循环内复用，结果**逐字节不变**。
                     let w = if mode == zenfile_core::ViewMode::Details {
-                        // 列区右沿 = 最后一列的 x+w（表头分隔线同源，第32轮 #1）
-                        let icon_size = (16.0 * app.metrics.scale) as i32;
-                        let boxes = col_boxes(app, l, icon_size);
                         (cols_right(&boxes).min(l.view.right) - l.view.left).max(10)
                     } else {
                         l.view.right - l.view.left
@@ -5327,6 +5484,36 @@ unsafe fn call_old(old: isize, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
 }
 
 unsafe extern "system" fn addr_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // 第70轮埋点：地址框自己的 `WM_PAINT` / `WM_ERASEBKGND` 计时。
+    //
+    // 关键：子 EDIT 的 `WM_PAINT` **归不上任何动画帧**（`TRACE_PENDING`
+    // 已经被主窗口那次 paint 认领走了），所以它只会累加分类计数，
+    // 一帧的时刻都不会被污染 —— 这正是我们要的：既量到了它的代价，
+    // 又不干扰外层时间线。
+    //
+    // `CHILD_ADDR` 在这里写死而不是靠 ID 反查：能走到 `addr_proc`
+    // 的窗口按定义就是地址框，反查反而多一次 `GetDlgCtrlID`。
+    //
+    // 用一层 wrapper 而不是把 enter/exit 塞进分支里：`addr_proc` 有好几处
+    // `return`，把配对语句撒在分支里一定会漏掉一条路径，那样 enter/exit
+    // 就会错配、把下一次 paint 的耗时算到上一次上。
+    if msg == WM_ERASEBKGND {
+        crate::anim_clock::trace_child_erase(crate::anim_clock::CHILD_ADDR);
+    } else if msg == WM_PAINT {
+        crate::anim_clock::trace_child_paint_enter(crate::anim_clock::CHILD_ADDR);
+        let r = addr_proc_inner(hwnd, msg, wparam, lparam);
+        crate::anim_clock::trace_child_paint_exit(crate::anim_clock::CHILD_ADDR);
+        return r;
+    }
+    addr_proc_inner(hwnd, msg, wparam, lparam)
+}
+
+unsafe extern "system" fn addr_proc_inner(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     // 滚轮转发（第41轮）：WM_MOUSEWHEEL 发给**焦点窗口**，焦点在框里时
     // 主窗口收不到 → 列表滚不动，看着像卡死。主窗口按屏幕坐标取点，
     // lparam 原样转发即可。
@@ -5355,6 +5542,31 @@ unsafe extern "system" fn addr_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
 }
 
 unsafe extern "system" fn search_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // 第70轮埋点：搜索框自己的 `WM_PAINT` / `WM_ERASEBKGND` 计时。
+    //
+    // `search_proc` 是本轮最该盯的子窗口：它比地址框多一层
+    // `paint_search_decor`（放大镜 + 空态提示文字，每次都要拿 `GetDC`、
+    // 画字、还窗），所以单次 paint 大概率比地址框贵。
+    //
+    // 与 `addr_proc` 同样用 wrapper 保证 enter/exit 配对（这个函数有
+    // 5 处 `return`，配对语句不能撒在分支里）。
+    if msg == WM_ERASEBKGND {
+        crate::anim_clock::trace_child_erase(crate::anim_clock::CHILD_SEARCH);
+    } else if msg == WM_PAINT {
+        crate::anim_clock::trace_child_paint_enter(crate::anim_clock::CHILD_SEARCH);
+        let r = search_proc_inner(hwnd, msg, wparam, lparam);
+        crate::anim_clock::trace_child_paint_exit(crate::anim_clock::CHILD_SEARCH);
+        return r;
+    }
+    search_proc_inner(hwnd, msg, wparam, lparam)
+}
+
+unsafe extern "system" fn search_proc_inner(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     // 拿到/失去焦点时 EDIT 只会**局部**重画（通常只有插入符那一小块），而装饰是
     // 画在 `GetDC` 拿到的 DC 上的 —— 裁剪区不是整块，放大镜和提示字就只剩一点点
     // 残影，整框看着像被清空了（实测点一下：非底色像素 568 → 26）。所以焦点一变
@@ -5399,6 +5611,27 @@ unsafe extern "system" fn search_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
 }
 
 unsafe extern "system" fn rename_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // 第70轮埋点：重命名框归入 `CHILD_OTHER`。
+    //
+    // 它平时不存在（只有 F2 才建），录制期间若没按 F2 计数恒为 0 ——
+    // 这本身也是有用信息：说明"每帧那两次额外重绘"**不来自**重命名框。
+    if msg == WM_ERASEBKGND {
+        crate::anim_clock::trace_child_erase(crate::anim_clock::CHILD_OTHER);
+    } else if msg == WM_PAINT {
+        crate::anim_clock::trace_child_paint_enter(crate::anim_clock::CHILD_OTHER);
+        let r = rename_proc_inner(hwnd, msg, wparam, lparam);
+        crate::anim_clock::trace_child_paint_exit(crate::anim_clock::CHILD_OTHER);
+        return r;
+    }
+    rename_proc_inner(hwnd, msg, wparam, lparam)
+}
+
+unsafe extern "system" fn rename_proc_inner(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     if msg == WM_KEYDOWN && wparam.0 as i32 == 0x0D {
         crate::on_rename_commit();
         return LRESULT(0);

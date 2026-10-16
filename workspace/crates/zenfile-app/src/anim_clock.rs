@@ -40,8 +40,8 @@
 //! 仍然要自己算 sleep 时长 —— 绕一圈还是回到等待原语。
 //! 一个显式的 waitable timer 更直接、可测。
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use windows::Win32::Foundation::{HANDLE, HWND};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use windows::Win32::Foundation::{HANDLE, HWND, RECT};
 use windows::Win32::System::Threading::{CreateThread, WaitForSingleObject};
 
 /// 主线程收到这个自定义消息就推一帧动画。
@@ -129,11 +129,19 @@ impl AnimClock {
     }
 
     /// 主线程消费完一帧后调用，腾出 in-flight 名额。
-    pub fn frame_done() {
+    ///
+    /// 返回递减后的 in-flight 值，供埋点记录（判假设 (d)：若它没降到 0，
+    /// 说明递减逻辑本身失真，或有一帧被 `frame_done` 减了两次）。
+    ///
+    /// **注意这里用的是 load + store 而不是 `fetch_sub`**：这是既有行为，
+    /// 本轮**刻意不改** —— 改它就改变了动画驱动语义，混进埋点结论里就
+    /// 分不清"测出来的长尾"和"我顺手改出来的东西"了。埋点只观察。
+    pub fn frame_done() -> u32 {
         let prev = ANIM_CLOCK.inflight.load(Ordering::SeqCst);
         if prev > 0 {
             ANIM_CLOCK.inflight.store(prev - 1, Ordering::SeqCst);
         }
+        ANIM_CLOCK.inflight.load(Ordering::SeqCst)
     }
 }
 
@@ -177,14 +185,25 @@ unsafe extern "system" fn anim_thread(param: *mut std::ffi::c_void) -> u32 {
     while ANIM_CLOCK.running.load(Ordering::SeqCst) {
         // in-flight 已满 = 主线程还没消化上一帧 → 这一拍**主动丢弃**。
         // 这不是丢帧，是**防止队列堆积**（见 MAX_INFLIGHT 的注释）。
-        if ANIM_CLOCK.inflight.load(Ordering::SeqCst) < MAX_INFLIGHT {
+        //
+        // 埋点（第69轮）：这里同时记下 post 前后的 in-flight。丢帧的那一拍
+        // 也会留记录（`t_handler_enter=0`），否则"这一拍没 post"与"post 了
+        // 但主线程没取"在 CSV 里长得一样，无法区分假设 (a) 与 (b)。
+        let before = ANIM_CLOCK.inflight.load(Ordering::SeqCst);
+        if before < MAX_INFLIGHT {
             ANIM_CLOCK.inflight.fetch_add(1, Ordering::SeqCst);
+            // post **之前**取时刻：差值 `t_post → t_handler_enter` 里含的
+            // 就是 PostMessage 本身 + 排队，两者在本埋点精度下无法再分开，
+            // 但这对定位已经足够（PostMessage 是微秒级，排队是毫秒级）。
+            crate::anim_clock::trace_post(before, before + 1);
             let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                 Some(hwnd),
                 WM_APP_ANIM_TICK,
                 windows::Win32::Foundation::WPARAM(0),
                 windows::Win32::Foundation::LPARAM(0),
             );
+        } else {
+            crate::anim_clock::trace_post(before, before);
         }
 
         // 等下一拍。
@@ -280,4 +299,1108 @@ unsafe extern "system" fn measure_thread(_p: *mut std::ffi::c_void) -> u32 {
         }
     }
     0
+}
+
+// ====================================================================
+// 帧链路时间戳埋点（第69轮）
+// ====================================================================
+//
+// # 要回答的问题
+//
+// 已知事实：中位帧间隔 16.6ms、UI 线程 P95 响应 2.77ms（每帧计算很便宜），
+// 但存在 **50~80ms 的尾部长延迟**。四个互斥假设：
+//
+//   (a) 后台线程没按时 post（waitable timer 精度 / 线程被调度出去）
+//   (b) post 了，但消息在队列里排队很久才被主线程取走
+//   (c) 消息很快被消费，但 InvalidateRect 之后合成/上屏延迟
+//   (d) frame_done() 的调用位置导致 in-flight 计数失真
+//
+// 区分它们只需要**同一帧的若干时刻**：
+//
+//   post → handler_enter 大        ⇒ (a) 或 (b)
+//   handler_enter → paint_exit 大  ⇒ 主线程在算或在排别的消息
+//   paint_enter → paint_exit 大    ⇒ (c) 的绘制部分
+//
+// 把 (a) 和 (b) 分开的**唯一**办法是看 in-flight：
+//
+//   * 帧间隔大 **且** `inflight_before` 恒为 0 ⇒ 线程是"到点就 post"，
+//     post 完到被取走之间隔了很久 = 消息躺在队列里 ⇒ **(b) 消息排队**。
+//   * `inflight_before` 频繁为 1（= MAX_INFLIGHT）⇒ 线程是被主线程
+//     卡住才没 post，队列侧已经堆着 ⇒ (b) 的极端形态（堆积）。
+//   * 帧间隔大 **且** 帧间隔 ≈ FRAME_MS 的整数倍 ⇒ 更像 (a)（定时器
+//     本身被量化/线程被调度出去），而不是队列忙。
+//
+// # 时间基准：为什么是 QPC 而不是 GetTickCount64
+//
+// `GetTickCount64` 默认**只有 ~15.6ms 分辨率**（等于系统时钟节拍）。
+// 本任务要量的差异是 **2ms 级**（UI 线程 P95 才 2.77ms）：用它的话
+// 一半以上采样会直接是 0，整个分布被量化噪声淹没。
+// `QueryPerformanceCounter` 是硬件计数器（现代 Windows 上频率 = 实际
+// CPU 晶振，10MHz~24MHz 不等），分辨率在纳秒级。
+//
+// 注意这跟 `anim_thread` 里的 `FRAME_MS` 无关 —— 那走 waitable timer。
+//
+// # 零常态开销：这是本模块唯一的硬约束
+//
+// 埋点插在**每帧 6 个位置**（post / handler / tick / sync / paint×2）。
+// 常态下若每处都 `QueryPerformanceCounter` + `Mutex::lock` + `push`，
+// 埋点本身就成了它要测量的那个瓶颈 —— 测出来的长尾全是自己造的。
+//
+// 所以每处都写成 `if TRACE_ON.load(Relaxed) { ... }`：关闭时机器码就是
+// **一次 relaxed 原子读 + 一个跳转**（约 1~2ns），没有系统调用、没有
+// 取锁、没有分配。对比一帧 2.77ms 的实际计算量是 6 个数量级以下。
+//
+// 用 `Relaxed` 而不是 `SeqCst` 是安全的：这里只需要"本线程刚写的
+// true 自己看得到"，不需要任何跨线程**顺序**保证（没有数据依赖
+// TRACE_ON 去保护别的内存）。dump 时会显式先写 false 再取锁，保证
+// 读到的是关闭点之前的完整数据（见 `dump_trace`）。
+//
+// # 锁的纪律
+//
+// 后台线程和主线程**都**要写这个缓冲，所以要锁。纪律：锁只包住
+// 一次字段写入 / 一次 push，**持锁期间不调用任何别的函数**（不取
+// QPC、不碰 App、不做 I/O）。临界区因此只有几十纳秒，不存在 UI
+// 线程等后台线程的可能。格式化与文件 I/O 全部在锁外。
+
+use std::sync::Mutex;
+
+/// 环境变量名。置为 `1` 才开埋点。
+pub const TRACE_ENV: &str = "ZENFILE_ANIM_TRACE";
+
+/// 埋点总开关。默认 false = 常态零开销。
+static TRACE_ON: AtomicBool = AtomicBool::new(false);
+
+/// 环形缓冲容量。
+///
+/// 5000ms / 15ms ≈ 333 帧；取 4096 留足余量（动画停了以后 dump 也
+/// 还能继续录，直到写满）。满了之后**覆盖最旧的**而不是拒绝新的
+/// —— 排查长尾要看的是"最近发生了什么"。
+const TRACE_CAP: usize = 4096;
+
+/// "没有帧号"哨兵。
+const NO_SEQ: u64 = u64::MAX;
+
+/// 一帧的完整时间线。时刻都是 QPC 原始计数（未换算），存整数，
+/// 由分析脚本按 `qpc_hz` 换算 —— 换算留在脚本里，程序侧不做浮点。
+///
+/// 时刻为 0 = 这一帧没走到那个阶段（例如没触发重绘就没有 paint 时刻）。
+#[derive(Clone, Copy, Default)]
+pub struct FrameRec {
+    /// 帧序号，**后台线程侧**单调递增。
+    ///
+    /// 这是把两侧记录配对的唯一依据：主线程拿不到"post 时刻对应哪个
+    /// 帧号"（`PostMessageW` 的 lparam 是 0；改它就等于改了动画驱动
+    /// 逻辑，超出"只埋点"的范围），所以配对靠"当前待绘的那一帧"。
+    pub seq: u64,
+    /// 后台线程 post **之前**的 QPC 时刻。
+    pub t_post: u64,
+    /// post 之前的 in-flight 值。判 (d) 与区分 (a)/(b) 的关键字段。
+    pub inflight_before: u32,
+    /// post 之后（fetch_add 之后）的 in-flight 值。
+    pub inflight_after: u32,
+    /// `frame_done()` 之后的 in-flight 值。判 (d) 直接证据：
+    /// 若它没降到 0，说明递减本身失真。
+    pub inflight_after_done: u32,
+    /// 主线程进入 `WM_APP_ANIM_TICK` 分支的 QPC 时刻。
+    ///
+    /// `t_handler_enter - t_post` = 投递 + 排队延迟。
+    pub t_handler_enter: u64,
+    /// `app.tick_anim()` 返回后。
+    pub t_tick_end: u64,
+    /// `sync_anim_timer()` 返回后。
+    pub t_sync_end: u64,
+    /// `frame_done()` 调用后。判 (d)。
+    pub t_frame_done: u64,
+    /// 进入 `paint::paint` 的 QPC 时刻（`WM_PAINT` 分支，BeginPaint 之后）。
+    pub t_paint_enter: u64,
+    /// `paint::paint` 返回后。
+    pub t_paint_exit: u64,
+    /// 本帧那次 paint 归属于哪个 seq。
+    ///
+    /// 归不上的（鼠标悬停 / `WM_TIMER` 引起的）paint 记 `NO_SEQ` 且
+    /// 只累加 `TRACE_ORPHAN_PAINTS`，**不污染**任何一帧的时刻 ——
+    /// 否则一次悬停重绘会被记成"动画帧的绘制耗时"，把结论带偏。
+    pub paint_seq: u64,
+    /// paint 里那句无条件 `InvalidateRect(hwnd_search)` 是否执行了。
+    /// 本轮**只记录、不改动**（`paint.rs` 那两句一个字没动）。
+    pub invalidated_search: u32,
+    /// 同上，地址框。
+    pub invalidated_address: u32,
+
+    // ----------------------------------------------------------------
+    // 第70轮：`paint()` 内部逐子函数耗时（同一份 `TraceBuf`，同一行 CSV）
+    // ----------------------------------------------------------------
+    //
+    // 设计要点：
+    //
+    // * **不另起缓冲**。子函数时刻必须和 `t_paint_enter / t_paint_exit`
+    //   在**同一条记录**里，否则两份数据要靠 seq 二次关联，join 出错就
+    //   悄悄得出错误结论。追加字段是 O(1)、无分配。
+    // * 存 **QPC 原始计数**（u64），不存毫秒浮点 —— 换算统一在分析脚本。
+    // * `0` = 这一步这一帧**没执行**（例如 `sidebar_visible == false`，
+    //   `paint_sidebar` 根本没被调用；分析脚本必须跳过 0，不能当成"耗时 0"
+    //   混进统计 —— 那会把中位数系统性拉低）。
+    //
+    // 步编号与 `SUB_*` 常量一一对应，顺序 = `paint()` 里的实际调用顺序。
+    /// 每一步的**开始**时刻（QPC 原始计数）。下标见 `SUB_*`。
+    pub sub_begin: [u64; SUB_N],
+    /// 每一步的**结束**时刻。`sub_e[i] - sub_begin[i]` = 该步耗时。
+    pub sub_end: [u64; SUB_N],
+
+    // ----------------------------------------------------------------
+    // 第70轮：区分"快帧 / 慢帧"的判据（每帧一次，在 layout 之后采）
+    // ----------------------------------------------------------------
+    //
+    // 上一轮测到 paint 耗时**双峰且中间 10~24ms 完全为空** —— 同一段代码
+    // 一半帧 6ms 以内、另一簇 24~40ms。内容"多了一点"只会让分布变宽，
+    // 不会挖出空洞，所以更像是**走了不同的代码路径**。这些字段就是为了
+    // 把"不同的路径"量化成可比较的数字。
+    //
+    // 全部只读、不改状态；`anim_active()` 本身是纯函数（只读字段），
+    // 这里额外调它不会引入副作用。
+    /// 客户区宽 / 高（像素）。
+    pub d_w: u32,
+    /// 客户区高（像素）。
+    pub d_h: u32,
+    /// 分栏数（1 = 不分栏）。
+    pub d_panes: u32,
+    /// 当前标签的**目录条目总数**（筛选前）。
+    pub d_entries: u32,
+    /// 当前标签**实际要画出来的行数**（筛选后）。列表越长 paint 越贵？
+    pub d_visible: u32,
+    /// 视图模式（0=Details 1=List 2=MediumIcons 3=LargeIcons）。
+    pub d_viewmode: u32,
+    /// `l.view` 面积（像素²）。
+    pub d_view_area: u64,
+    /// 正在放大动画中的图标数。
+    pub d_icon_zoom: u32,
+    /// 正在"弹一下"的条目数。
+    pub d_icon_bounce: u32,
+    /// 标题栏按键悬停动画数。
+    pub d_cap_anim: u32,
+    /// 状态位图（见 `CTX_*` 常量）。
+    pub d_flags: u32,
+    /// `app.anim_active()` 的结果（1 = 此刻确实有缓动在跑）。
+    pub d_anim_active: u32,
+}
+
+// ====================================================================
+// 第70轮：paint 内部步编号 / 判据位 / 子窗口类别
+// ====================================================================
+
+/// `paint()` 内部逐段计时的步数。顺序 = `paint()` 里的实际调用顺序。
+///
+/// 编号**只增不改**：CSV 里每一步占两列（`_b` / `_e`），分析脚本按名字
+/// 取列；一旦重排，历史 CSV 的语义就变了。
+pub const SUB_N: usize = 15;
+
+/// 每一步在 CSV 里的列名前缀（`_b` = begin，`_e` = end）。
+///
+/// 与 `SUB_*` 编号**严格同序** —— `SUB_NAMES[i]` 就是第 `i` 步。
+pub const SUB_NAMES: [&str; SUB_N] = [
+    "sub_begin_anim",
+    "sub_create_surface",
+    "sub_layout",
+    "sub_fill",
+    "sub_title",
+    "sub_toolbar",
+    "sub_sidebar",
+    "sub_panes",
+    "sub_status",
+    "sub_drag_overlay",
+    "sub_dock_overlay",
+    "sub_bitblt",
+    "sub_cleanup",
+    "sub_invalidate",
+    "sub_sync_timer",
+];
+
+/// `app.begin_anim_frame()`。
+pub const SUB_BEGIN_ANIM: usize = 0;
+/// `CreateCompatibleDC` + `CreateCompatibleBitmap` + `SelectObject(mem,bmp)`。
+///
+/// **重点嫌疑**：每帧新建一张**全窗口**大小的位图。
+pub const SUB_CREATE_SURFACE: usize = 1;
+/// `layout_sized(app, w, h)`。遍历约 200 处窗格 / 标签 / 列宽计算。
+pub const SUB_LAYOUT: usize = 2;
+/// 整窗 `FillRect` 清屏。
+pub const SUB_FILL: usize = 3;
+/// `paint_title_bar`。
+pub const SUB_TITLE: usize = 4;
+/// `paint_toolbar`。
+pub const SUB_TOOLBAR: usize = 5;
+/// `paint_sidebar`（仅 `sidebar_visible` 时执行）。
+pub const SUB_SIDEBAR: usize = 6;
+/// `paint_panes` —— 渲染整个文件列表。**重点嫌疑**。
+pub const SUB_PANES: usize = 7;
+/// `paint_status`（仅 `statusbar_visible` 时执行）。
+pub const SUB_STATUS: usize = 8;
+/// `paint_drag_overlay`（仅拖拽中执行）。
+pub const SUB_DRAG_OVERLAY: usize = 9;
+/// `paint_dock_overlay`（仅贴靠预览中执行）。
+pub const SUB_DOCK_OVERLAY: usize = 10;
+/// 全窗口 `BitBlt(mem → hdc)`。**重点嫌疑**：全窗口上传。
+pub const SUB_BITBLT: usize = 11;
+/// `SelectObject` / `DeleteObject(bmp)` / `DeleteDC(mem)` 的清理。
+pub const SUB_CLEANUP: usize = 12;
+/// 那两句无条件 `InvalidateRect(子EDIT, erase=true)`。**重点嫌疑**。
+pub const SUB_INVALIDATE: usize = 13;
+/// `app.sync_anim_timer()`（在 `paint()` 末尾，窗口清理之后）。
+pub const SUB_SYNC_TIMER: usize = 14;
+
+/// `d_flags` 位：地址栏滑入 / 滑出动画在跑。
+pub const CTX_ADDR_ANIM: u32 = 1 << 0;
+/// `d_flags` 位：侧栏导航窗格平滑滚动在跑。
+pub const CTX_SB_SCROLL: u32 = 1 << 1;
+/// `d_flags` 位：侧栏"当前位置"指示条正在缓动。
+pub const CTX_SB_ACTIVE: u32 = 1 << 2;
+/// `d_flags` 位：侧栏悬停高亮条正在缓动。
+pub const CTX_SB_HOVER: u32 = 1 << 3;
+/// `d_flags` 位：正在拖拽（框选 / 拖文件）。
+pub const CTX_DRAG: u32 = 1 << 4;
+/// `d_flags` 位：正在拖窗格分隔线。
+pub const CTX_DIV_DRAG: u32 = 1 << 5;
+/// `d_flags` 位：侧栏可见（决定 `paint_sidebar` 跑不跑）。
+pub const CTX_SIDEBAR_VISIBLE: u32 = 1 << 6;
+/// `d_flags` 位：状态栏可见。
+pub const CTX_STATUS_VISIBLE: u32 = 1 << 7;
+/// `d_flags` 位：当前标签是"主页"虚拟目录。
+pub const CTX_HOME: u32 = 1 << 8;
+/// `d_flags` 位：当前标签是"回收站"。
+pub const CTX_RECYCLE: u32 = 1 << 9;
+/// `d_flags` 位：当前标签是"设置"页。
+pub const CTX_SETTINGS: u32 = 1 << 10;
+/// `d_flags` 位：当前标签正在加载。
+pub const CTX_LOADING: u32 = 1 << 11;
+/// `d_flags` 位：存在列筛选（画表头筛选箭头 + 行可能被过滤）。
+pub const CTX_COL_FILTER: u32 = 1 << 12;
+/// `d_flags` 位：分栏（`panes > 1`）。
+pub const CTX_SPLIT: u32 = 1 << 13;
+/// `d_flags` 位：存在图标缩放目标（本帧至少有一个图标在放大）。
+pub const CTX_ICON_ZOOM_TGT: u32 = 1 << 14;
+
+// --------------------------------------------------------------------
+// 子窗口分类：主窗口 / 搜索框 / 地址框 / 其余 EDIT（重命名框等）
+// --------------------------------------------------------------------
+
+/// 子窗口分类总数（CSV `.child` 里的 `kind`）。
+pub const CHILD_KINDS: usize = 4;
+/// 主窗口。
+pub const CHILD_MAIN: usize = 0;
+/// 搜索框（`hwnd_search`，类 `EDIT` + 子类化 `search_proc`）。
+pub const CHILD_SEARCH: usize = 1;
+/// 地址框（`hwnd_address`，类 `EDIT` + 子类化 `addr_proc`）。
+pub const CHILD_ADDR: usize = 2;
+/// 其余 `EDIT` 子窗口（重命名框等）—— 单列一栏，避免"漏在统计外"。
+pub const CHILD_OTHER: usize = 3;
+
+/// `.child` 摘要里每类子窗口的行名（与 `CHILD_*` 编号同序）。
+pub const CHILD_KIND_NAMES: [&str; CHILD_KINDS] = ["main", "search", "addr", "other"];
+
+/// 每类子窗口的 `WM_PAINT` 次数。
+static CHILD_PAINT_CNT: [AtomicU64; CHILD_KINDS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+/// 每类子窗口 `WM_ERASEBKGND` 次数。
+///
+/// `InvalidateRect(hwnd, None, true)` 的 `erase=true` 就是"先发一次
+/// `WM_ERASEBKGND` 再发 `WM_PAINT`"，所以这个计数直接回答"每帧额外触发
+/// 了几次背景擦除"。
+static CHILD_ERASE_CNT: [AtomicU64; CHILD_KINDS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+/// 每类子窗口 `WM_PAINT` 累计耗时（QPC 原始计数之和）。
+static CHILD_PAINT_NS: [AtomicU64; CHILD_KINDS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+/// 每类子窗口 `WM_PAINT` 单次最大耗时（QPC 原始计数）。
+static CHILD_PAINT_MAX: [AtomicU64; CHILD_KINDS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// 每次子窗口 `WM_PAINT` 的原始耗时样本（QPC 差值）。
+///
+/// 环形（满了清空重记）—— 只给分位数用，不需要全量。
+static CHILD_SAMPLES: Mutex<[Vec<u64>; CHILD_KINDS]> = Mutex::new([
+    Vec::new(),
+    Vec::new(),
+    Vec::new(),
+    Vec::new(),
+]);
+
+/// 子窗口样本环形容量。
+const CHILD_SAMPLE_CAP: usize = 4096;
+
+/// 子窗口 `WM_PAINT` 开始时刻（按类别），`trace_child_paint_exit` 用。
+static CHILD_ENTER: [AtomicU64; CHILD_KINDS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// "当前这个 paint 已认领了一个动画帧" —— 决定内部步打点往哪写。
+///
+/// 必须单独一个标志而不是靠 `TRACE_PENDING`：孤儿 paint（子 EDIT 的
+/// `WM_PAINT`、悬停重绘）会把 `PENDING` 换走，若内部步跟着 PENDING 写就会
+/// 污染某一帧的时刻。
+static TRACE_PAINT_OWNED: AtomicBool = AtomicBool::new(false);
+
+/// 本次 paint 认领到的 seq（内部步打点靠它 O(1) 定位记录）。
+static TRACE_CLAIMED_SEQ: AtomicU64 = AtomicU64::new(NO_SEQ);
+
+/// 认不上一帧的 paint 里，内部步打点被调用的次数（数据健全性自检）。
+///
+/// 正常应为 0：孤儿 paint 不进 `paint()`（子 EDIT 走自己的窗口过程）。
+/// 若不为 0，说明有别的路径调了 `paint()`，结论要打问号。
+static TRACE_SUB_UNCLAIMED: AtomicU64 = AtomicU64::new(0);
+
+/// 真正的 O(1) 环形缓冲。
+///
+/// **不用 `Vec` + `remove(0)`**：那是 O(n) 搬移，4096 条 × 56 字节
+/// ≈ 220KB 的 memmove **每帧一次** —— 埋点自己就成了它要测量的瓶颈。
+///
+/// 也不用"固定数组 + AtomicUsize 写指针"的无锁写法：那种写法 dump
+/// 时可能读到正被后台线程改写的记录，算出 `t_handler_enter < t_post`
+/// 这种物理上不可能的值，污染结论。**分析工具的数值可信度比省下的
+/// 几十纳秒重要**。
+struct TraceBuf {
+    cap: usize,
+    /// 最老一条的下标。
+    head: usize,
+    /// 有效条数。
+    len: usize,
+    items: Vec<FrameRec>,
+}
+
+impl TraceBuf {
+    const fn new() -> Self {
+        Self { cap: TRACE_CAP, head: 0, len: 0, items: Vec::new() }
+    }
+
+    /// 第 `i` 条（`0` = 最老，`len-1` = 最新）。
+    #[inline(always)]
+    fn at(&self, i: usize) -> &FrameRec {
+        &self.items[(self.head + i) % self.cap]
+    }
+
+    #[inline(always)]
+    fn at_mut(&mut self, i: usize) -> &mut FrameRec {
+        let k = (self.head + i) % self.cap;
+        &mut self.items[k]
+    }
+
+    #[inline(always)]
+    fn newest_seq(&self) -> u64 {
+        if self.len == 0 {
+            NO_SEQ
+        } else {
+            self.at(self.len - 1).seq
+        }
+    }
+
+    /// 按帧号找下标。**O(1)**：缓冲里存的是一段**连续**的 seq
+    /// （只有 dump 才清空），所以从最新一条往回数就是 seq 往回减。
+    #[inline(always)]
+    fn find(&self, seq: u64) -> Option<usize> {
+        if self.len == 0 || seq == NO_SEQ {
+            return None;
+        }
+        let newest = self.newest_seq();
+        if seq > newest {
+            return None;
+        }
+        let back = (newest - seq) as usize;
+        if back >= self.len {
+            return None;
+        }
+        Some(self.len - 1 - back)
+    }
+
+    #[inline(always)]
+    fn push(&mut self, r: FrameRec) {
+        if self.len < self.cap {
+            // 填充阶段 head 恒为 0，于是 slot == len == items.len()，
+            // 直接追加即可（之后一旦绕头就都走 else 分支原地覆盖）。
+            if self.items.len() < self.cap {
+                self.items.push(r);
+            } else {
+                let k = (self.head + self.len) % self.cap;
+                self.items[k] = r;
+            }
+            self.len += 1;
+        } else {
+            self.items[self.head] = r;
+            self.head = (self.head + 1) % self.cap;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.head = 0;
+        self.len = 0;
+    }
+
+    /// 拿走全部内容（供 dump 在锁外慢慢格式化）。
+    fn take_all(&mut self) -> Vec<FrameRec> {
+        let mut items = std::mem::take(&mut self.items);
+        self.head = 0;
+        self.len = 0;
+        items
+    }
+}
+
+static TRACE_BUF: Mutex<TraceBuf> = Mutex::new(TraceBuf::new());
+
+/// 后台线程侧的帧序号。只有开 trace 时才自增。
+static TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 主线程正在处理 / 等待重绘的帧号；`NO_SEQ` = 没有。
+///
+/// `t_handler_enter` 时置为本帧的 seq，`trace_paint_enter` 消费掉它
+/// （换成 `NO_SEQ`）。这样"这一帧还没被重绘"和"这一帧已经被别的
+/// paint 消费掉了"能区分开 —— 前者说明帧画丢了。
+static TRACE_PENDING: AtomicU64 = AtomicU64::new(NO_SEQ);
+
+/// 归不上任何动画帧的 `WM_PAINT` 次数（悬停 / `WM_TIMER` 引起的）。
+///
+/// 与帧数相除就是"每帧平均几次重绘"。若明显 > 1，说明一帧其实被画了
+/// 多次（`paint.rs` 末尾那两句无条件 `InvalidateRect` 会让两个子
+/// EDIT 各自再触发一次）—— 这正是假设 (c) 的头号嫌疑。
+static TRACE_ORPHAN_PAINTS: AtomicU64 = AtomicU64::new(0);
+
+/// QPC 频率（计数/秒），首次调用时查询并缓存。
+static QPC_FREQ: AtomicU64 = AtomicU64::new(0);
+
+/// 读一次 QPC 原始计数。
+///
+/// `#[inline(always)]`：它被内联进每个埋点位置，关掉 trace 时那一整块
+/// 会被优化掉，所以这里**不需要**自己再判 `TRACE_ON`。
+#[inline(always)]
+pub fn qpc() -> u64 {
+    let mut c: i64 = 0;
+    // 失败时返回 0：宁可让这一帧时刻为 0（分析脚本能识别并跳过），
+    // 也不要 panic —— 埋点绝不能成为崩溃源。
+    if unsafe { windows::Win32::System::Performance::QueryPerformanceCounter(&mut c) }.is_err() {
+        return 0;
+    }
+    c as u64
+}
+
+/// QPC 频率（计数/秒）。
+pub fn qpc_hz() -> u64 {
+    let cached = QPC_FREQ.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    let mut f: i64 = 0;
+    if unsafe { windows::Win32::System::Performance::QueryPerformanceFrequency(&mut f) }.is_err()
+        || f <= 0
+    {
+        return 1;
+    }
+    let f = f as u64;
+    QPC_FREQ.store(f, Ordering::Relaxed);
+    f
+}
+
+/// 按 `TRACE_ENV=1` 初始化开关。进程启动时显式调一次。
+///
+/// 不在 `static` 初始化器里读环境变量：Rust 的 static 初始化器里不能
+/// 安全调 Win32 API，且 release 下可能被去重，行为不可靠。
+pub fn trace_init_from_env() -> bool {
+    let on = std::env::var(TRACE_ENV).map(|v| v.trim() == "1").unwrap_or(false);
+    TRACE_ON.store(on, Ordering::Relaxed);
+    if on {
+        // 每次开 trace 从空缓冲开始，否则会混进上一次的残留帧。
+        if let Ok(mut b) = TRACE_BUF.lock() {
+            b.clear();
+        }
+        TRACE_SEQ.store(0, Ordering::Relaxed);
+        TRACE_PENDING.store(NO_SEQ, Ordering::Relaxed);
+        TRACE_ORPHAN_PAINTS.store(0, Ordering::Relaxed);
+        reset_child_stats();
+    }
+    on
+}
+
+/// 埋点是否开着。
+pub fn trace_on() -> bool {
+    TRACE_ON.load(Ordering::Relaxed)
+}
+
+/// 开 / 关开关。关时顺手清空缓冲，让"一段录制 = 一份缓冲"成立。
+pub fn trace_set(on: bool) {
+    TRACE_ON.store(on, Ordering::Relaxed);
+    if on {
+        reset_child_stats();
+    } else {
+        TRACE_PENDING.store(NO_SEQ, Ordering::Relaxed);
+        TRACE_PAINT_OWNED.store(false, Ordering::Relaxed);
+        TRACE_CLAIMED_SEQ.store(NO_SEQ, Ordering::Relaxed);
+        if let Ok(mut b) = TRACE_BUF.lock() {
+            b.clear();
+        }
+    }
+}
+
+/// 归零所有子窗口统计（每次开录时清一遍）。
+fn reset_child_stats() {
+    TRACE_SUB_UNCLAIMED.store(0, Ordering::Relaxed);
+    for k in 0..CHILD_KINDS {
+        CHILD_PAINT_CNT[k].store(0, Ordering::Relaxed);
+        CHILD_ERASE_CNT[k].store(0, Ordering::Relaxed);
+        CHILD_PAINT_NS[k].store(0, Ordering::Relaxed);
+        CHILD_PAINT_MAX[k].store(0, Ordering::Relaxed);
+        CHILD_ENTER[k].store(0, Ordering::Relaxed);
+    }
+    if let Ok(mut v) = CHILD_SAMPLES.lock() {
+        for b in v.iter_mut() {
+            b.clear();
+        }
+    }
+}
+
+/// 环形缓冲里已录到的帧数。
+fn trace_buf_len() -> usize {
+    TRACE_BUF.lock().map(|b| b.len).unwrap_or(0)
+}
+
+/// 已录到的帧数。
+pub fn trace_count() -> usize {
+    trace_buf_len()
+}
+
+/// 归不上动画帧的 paint 次数。
+pub fn trace_orphan_paints() -> u64 {
+    TRACE_ORPHAN_PAINTS.load(Ordering::Relaxed)
+}
+
+// --------------------------------------------------------------------
+// 埋点位置（每个都是「关闭时零成本」的那条线）
+// --------------------------------------------------------------------
+
+/// **后台线程**：post 之前打点，并建好这一帧的空记录。
+///
+/// inflight 已满（这一拍被丢弃）时**照样留一条记录**：它的
+/// `t_handler_enter` 恒为 0、`inflight_before >= MAX_INFLIGHT`。
+/// 不留的话，"这一拍根本没 post"和"post 了但主线程没取"在 CSV 里
+/// 都表现为"时间段里缺一条记录"，无法区分。
+#[inline(always)]
+pub fn trace_post(inflight_before: u32, inflight_after: u32) {
+    if TRACE_ON.load(Ordering::Relaxed) {
+        let rec = FrameRec {
+            seq: TRACE_SEQ.fetch_add(1, Ordering::Relaxed),
+            t_post: qpc(),
+            inflight_before,
+            inflight_after,
+            paint_seq: NO_SEQ,
+            ..Default::default()
+        };
+        if let Ok(mut b) = TRACE_BUF.lock() {
+            b.push(rec);
+        }
+    }
+}
+
+/// 取"当前待绘那一帧"的下标。**只在持锁后调用。**
+#[inline(always)]
+fn pending_idx(b: &TraceBuf) -> Option<usize> {
+    b.find(TRACE_PENDING.load(Ordering::Relaxed))
+}
+
+/// **主线程**：进入 `WM_APP_ANIM_TICK` 分支。
+#[inline(always)]
+pub fn trace_handler_enter() {
+    if TRACE_ON.load(Ordering::Relaxed) {
+        let t = qpc();
+        // seq 在**取锁之前**发布：这样 tick 逻辑跑完（可能几 ms）之后
+        // 才来的 paint 也能找到正确的帧；而这里立刻置 PENDING，保证
+        // 同一帧不会有两个 paint 各写一次时刻。
+        TRACE_PENDING.store(TRACE_SEQ.load(Ordering::Relaxed) - 1, Ordering::Relaxed);
+        if let Ok(mut b) = TRACE_BUF.lock() {
+            if let Some(i) = pending_idx(&b) {
+                b.at_mut(i).t_handler_enter = t;
+            }
+        }
+    }
+}
+
+/// 某个阶段结束的通用打点。
+///
+/// 抽成一个函数而不是写三遍，是为了让"锁内只有一次写"这条纪律只有
+/// 一处实现可审。
+#[inline(always)]
+fn trace_mark(field: u8) {
+    if TRACE_ON.load(Ordering::Relaxed) {
+        let t = qpc();
+        if let Ok(mut b) = TRACE_BUF.lock() {
+            if let Some(i) = pending_idx(&b) {
+                let r = b.at_mut(i);
+                match field {
+                    0 => r.t_tick_end = t,
+                    1 => r.t_sync_end = t,
+                    _ => r.t_frame_done = t,
+                }
+            }
+        }
+    }
+}
+
+/// `tick_anim()` 返回后。
+#[inline(always)]
+pub fn trace_tick_end() {
+    trace_mark(0);
+}
+
+/// `sync_anim_timer()` 返回后。
+#[inline(always)]
+pub fn trace_sync_end() {
+    trace_mark(1);
+}
+
+/// `frame_done()` 之后。判 (d)：顺带记下递减后的 in-flight，
+/// 若它没降到 0，说明递减本身失真。
+#[inline(always)]
+pub fn trace_frame_done(inflight_after_done: u32) {
+    if TRACE_ON.load(Ordering::Relaxed) {
+        let t = qpc();
+        if let Ok(mut b) = TRACE_BUF.lock() {
+            if let Some(i) = pending_idx(&b) {
+                let r = b.at_mut(i);
+                r.t_frame_done = t;
+                r.inflight_after_done = inflight_after_done;
+            }
+        }
+    }
+}
+
+/// **主线程**：进入 `paint::paint` 之前。
+///
+/// 认领语义：把 `TRACE_PENDING` 取出来当自己的 seq，然后置回
+/// `NO_SEQ`。取到 `NO_SEQ` 说明这次 `WM_PAINT` 跟动画帧无关
+/// （悬停 / `WM_TIMER` / 窗口尺寸变化），只累加孤儿计数、**不写**
+/// 任何帧的时刻。
+///
+/// 顺带把 `t_paint_exit` 与两个失效标志清零：没有 `WM_PAINT` 到达时，
+/// 它们必须是 0 而不是上一帧的残留值（否则会算出负的绘制耗时）。
+#[inline(always)]
+pub fn trace_paint_enter() {
+    if TRACE_ON.load(Ordering::Relaxed) {
+        let t = qpc();
+        let claimed = TRACE_PENDING.swap(NO_SEQ, Ordering::Relaxed);
+        if claimed == NO_SEQ {
+            TRACE_ORPHAN_PAINTS.fetch_add(1, Ordering::Relaxed);
+            // 认不上一帧：内部步打点必须**完全跳过**，否则会把
+            // "悬停引起的父窗口重绘"的子函数时刻写进某条动画帧记录。
+            TRACE_PAINT_OWNED.store(false, Ordering::Relaxed);
+            TRACE_CLAIMED_SEQ.store(NO_SEQ, Ordering::Relaxed);
+            return;
+        }
+        // 第70轮：先把"我认领了 seq X"发布出去，`paint()` 里的内部步
+        // 打点全靠它定位记录（比"扫描最新一条带 t_paint_enter 的记录"
+        // 更快也更准 —— 两次 paint 连着发生时后者会认错帧）。
+        TRACE_CLAIMED_SEQ.store(claimed, Ordering::Relaxed);
+        TRACE_PAINT_OWNED.store(true, Ordering::Relaxed);
+        if let Ok(mut b) = TRACE_BUF.lock() {
+            if let Some(i) = b.find(claimed) {
+                let r = b.at_mut(i);
+                r.paint_seq = claimed;
+                r.t_paint_enter = t;
+                r.t_paint_exit = 0;
+                r.invalidated_search = 0;
+                r.invalidated_address = 0;
+                // 内部步：整段清零。不清的话"这一帧跳过了某一步"会读到
+                // 缓冲里那条槽位上一轮的残留时刻，算出乱七八糟的耗时。
+                r.sub_begin = [0; SUB_N];
+                r.sub_end = [0; SUB_N];
+            }
+        }
+    }
+}
+
+/// **主线程**：`paint::paint` 返回后。
+#[inline(always)]
+pub fn trace_paint_exit() {
+    if TRACE_ON.load(Ordering::Relaxed) {
+        let t = qpc();
+        if let Ok(mut b) = TRACE_BUF.lock() {
+            // paint 时刻已写进 `paint_seq` 那一帧；但 PENDING 已被消费，
+            // 所以这里按"最近一帧 paint_enter 过、且还没 exit"来找。
+            // 环形缓冲里它必然是最新一条带 t_paint_enter 的记录。
+            if let Some(i) = newest_unfinished_paint(&b) {
+                b.at_mut(i).t_paint_exit = t;
+            }
+        }
+        TRACE_PAINT_OWNED.store(false, Ordering::Relaxed);
+        TRACE_CLAIMED_SEQ.store(NO_SEQ, Ordering::Relaxed);
+    }
+}
+
+/// 找到"最近一个已开始但未结束 paint"的帧下标。
+///
+/// 必须在持锁后调用。倒着扫，最坏情况（脏数据）也只扫到缓冲末尾。
+#[inline(always)]
+fn newest_unfinished_paint(b: &TraceBuf) -> Option<usize> {
+    let mut i = b.len;
+    while i > 0 {
+        i -= 1;
+        let r = b.at(i);
+        if r.t_paint_enter != 0 && r.t_paint_exit == 0 {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// 记录"paint 里那句无条件 `InvalidateRect(hwnd_search)` 执行了"。
+///
+/// 本轮**只是记录**（`paint.rs` 里那两句无条件失效一个字都没改）。
+/// 用途：若 `paint` 耗时正常但帧间隔长尾很大，那"每帧都在无条件擦除
+/// 两个子 EDIT"就退到嫌疑列表 —— 它们各自会再触发一次子窗口
+/// `WM_PAINT`，也就是每帧其实有 3 次重绘而不是 1 次（看
+/// `TRACE_ORPHAN_PAINTS` 与帧数的比值）。
+#[inline(always)]
+pub fn trace_invalidate(kind: u8) {
+    if TRACE_ON.load(Ordering::Relaxed) {
+        if let Ok(mut b) = TRACE_BUF.lock() {
+            if let Some(i) = newest_unfinished_paint(&b) {
+                if kind == 0 {
+                    b.at_mut(i).invalidated_search = 1;
+                } else {
+                    b.at_mut(i).invalidated_address = 1;
+                }
+            }
+        }
+    }
+}
+
+// --------------------------------------------------------------------
+// 第70轮：paint 内部逐段打点
+// --------------------------------------------------------------------
+
+/// **主线程**：`paint()` 内某一步的开始。
+///
+/// 与 `trace_mark` 同样的纪律 —— QPC 在**取锁之前**取，锁内只有两次写。
+///
+/// 认领语义：`TRACE_PAINT_OWNED == false`（孤儿 paint）时直接返回，
+/// 只累加 `TRACE_SUB_UNCLAIMED` 自检计数。子 EDIT 的 `WM_PAINT` 走
+/// 自己的窗口过程、**根本不进 `paint()`**，所以正常情况下这里永远
+/// 认得上；认不上就说明有别的路径调了 `paint()`。
+#[inline(always)]
+pub fn trace_sub_begin(step: usize) {
+    if TRACE_ON.load(Ordering::Relaxed) {
+        let t = qpc();
+        if TRACE_PAINT_OWNED.load(Ordering::Relaxed) {
+            if let Ok(mut b) = TRACE_BUF.lock() {
+                if let Some(i) = b.find(TRACE_CLAIMED_SEQ.load(Ordering::Relaxed)) {
+                    b.at_mut(i).sub_begin[step] = t;
+                }
+            }
+        } else {
+            TRACE_SUB_UNCLAIMED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// **主线程**：`paint()` 内某一步的结束。
+///
+/// 锁内只有一次写。注意 `sub_end[i] == 0` 时分析脚本要当作"这一步没跑"，
+/// 但**开始时刻为 0** 才是真正的"没跑"信号 —— 因为 `qpc()` 理论上可能
+/// 返回 0（只有 QPC 读失败时），实际上把两者都当"没跑"处理即可。
+#[inline(always)]
+pub fn trace_sub_end(step: usize) {
+    if TRACE_ON.load(Ordering::Relaxed) && TRACE_PAINT_OWNED.load(Ordering::Relaxed) {
+        let t = qpc();
+        if let Ok(mut b) = TRACE_BUF.lock() {
+            if let Some(i) = b.find(TRACE_CLAIMED_SEQ.load(Ordering::Relaxed)) {
+                b.at_mut(i).sub_end[step] = t;
+            }
+        }
+    }
+}
+
+/// **主线程**：采一次判据快照（`layout` 之后打一次即可 —— 布局里的
+/// `l.view` 和 `app` 的视图状态在这一帧内不会再变）。
+///
+/// 取时刻与写字段在同一次调用里，但**不在锁内取 QPC**（锁内只有字段写）。
+///
+/// 逐项说明为什么要记它（不是"能记就记"，是每一项都有具体的
+/// 双峰解释能力）：
+///
+/// * `entries` / `visible` —— 列表越长要画的行越多。Details 视图每行
+///   一次文本 + 可能一次图标；行数差 10 倍就应该把分布**变宽**，
+///   而不是挖出空洞。所以它是"排除项"，不是"解释项"。
+/// * `view_mode` —— 大图标视图要画图标（Shell 取图标 + AlphaBlend），
+///   单帧成本可能差一个量级。**这是最有区分度的一项。**
+/// * `view_area` —— `BitBlt` 与 `FillRect` 的规模。
+/// * `icon_zoom` / `icon_bounce` / `cap_anim` —— 正在跑的动画数量。
+///   动画跑得多不代表画得多，但每帧要逐个查表算缓动。
+/// * `addr_anim` / `sb_scroll_target` / `sb_active_y != target` ——
+///   这些是"**切目录**"这一类交互特有的标志。上一轮测到**点击侧栏条目换目录**
+///   是最有效的驱动方式，而这类帧恰好也是最慢的那一簇 —— 如果慢帧与
+///   这些位强相关，就说明慢帧不是"画的东西多"，而是"**多画了一层东西**"
+///   （地址栏滑入 + 侧栏指示条 + 滚动，每一项都可能在同一个位置反复
+///   AlphaBlend / 画文本）。
+/// * `anim_active()` —— 兜底判据：慢帧是不是"确实有缓动在跑"的帧。
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub fn trace_ctx(
+    width: i32,
+    height: i32,
+    view: RECT,
+    panes: usize,
+    entries: usize,
+    visible: usize,
+    view_mode: u32,
+    icon_zoom: usize,
+    icon_bounce: usize,
+    cap_anim: usize,
+    flags: u32,
+    anim_active: bool,
+) {
+    if TRACE_ON.load(Ordering::Relaxed) && TRACE_PAINT_OWNED.load(Ordering::Relaxed) {
+        let area = ((view.right - view.left).max(0) as i64) * ((view.bottom - view.top).max(0) as i64);
+        if let Ok(mut b) = TRACE_BUF.lock() {
+            if let Some(i) = b.find(TRACE_CLAIMED_SEQ.load(Ordering::Relaxed)) {
+                let r = b.at_mut(i);
+                r.d_w = width.max(0) as u32;
+                r.d_h = height.max(0) as u32;
+                r.d_panes = panes as u32;
+                r.d_entries = entries as u32;
+                r.d_visible = visible as u32;
+                r.d_viewmode = view_mode;
+                r.d_view_area = area.max(0) as u64;
+                r.d_icon_zoom = icon_zoom as u32;
+                r.d_icon_bounce = icon_bounce as u32;
+                r.d_cap_anim = cap_anim as u32;
+                r.d_flags = flags;
+                r.d_anim_active = anim_active as u32;
+            }
+        }
+    }
+}
+
+// --------------------------------------------------------------------
+// 第70轮：子窗口（两个子 EDIT）每次重绘的代价
+// --------------------------------------------------------------------
+//
+// 分类方式：**由各自的窗口过程写死类别**，不做运行时反查。
+// `addr_proc` / `search_proc` / `rename_proc` 各自只可能被对应的那个
+// hwnd 调用，所以在那里写 `CHILD_ADDR` / `CHILD_SEARCH` / `CHILD_OTHER`
+// 是**恒等映射**，比 `GetDlgCtrlID` 反查更省、更不会错。
+// （原先那版按控件 ID 反查的 `child_kind` 已删 —— 它在录制期间会白付
+// 一次系统调用，而结果与写死完全相同。）
+//
+// 另一个关键性质：子 EDIT 的 `WM_PAINT` **归不上任何动画帧**，所以它
+// 只累加这里的分类计数，**一个 `FrameRec` 都不碰** —— 既量到了它的
+// 代价，又完全不干扰外层时间线。
+
+/// **主线程**：某个窗口的 `WM_PAINT` 开始。
+#[inline(always)]
+pub fn trace_child_paint_enter(kind: usize) {
+    if TRACE_ON.load(Ordering::Relaxed) {
+        let t = qpc();
+        CHILD_PAINT_CNT[kind].fetch_add(1, Ordering::Relaxed);
+        CHILD_ENTER[kind].store(t, Ordering::Relaxed);
+    }
+}
+
+/// **主线程**：某个窗口的 `WM_PAINT` 结束。
+#[inline(always)]
+pub fn trace_child_paint_exit(kind: usize) {
+    if TRACE_ON.load(Ordering::Relaxed) {
+        let t = qpc();
+        let e = CHILD_ENTER[kind].load(Ordering::Relaxed);
+        if e == 0 || t <= e {
+            return;
+        }
+        let d = t - e;
+        CHILD_PAINT_NS[kind].fetch_add(d, Ordering::Relaxed);
+        // max 用 CAS 循环；这是全进程唯一一处"锁外原子自旋"，只跑在
+        // 录制的几秒里，且原子操作不涉及锁，不会与后台时钟线程互等。
+        let mut cur = CHILD_PAINT_MAX[kind].load(Ordering::Relaxed);
+        while d > cur {
+            match CHILD_PAINT_MAX[kind].compare_exchange_weak(
+                cur,
+                d,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(c) => cur = c,
+            }
+        }
+        if let Ok(mut v) = CHILD_SAMPLES.lock() {
+            let b = &mut v[kind];
+            if b.len() < CHILD_SAMPLE_CAP {
+                b.push(d);
+            } else {
+                b.clear();
+                b.push(d);
+            }
+        }
+    }
+}
+
+/// **主线程**：某个窗口的 `WM_ERASEBKGND`。
+///
+/// `InvalidateRect(hwnd, None, true)` 的 `erase=true` 让 Windows 先发一次
+/// `WM_ERASEBKGND` 再发 `WM_PAINT` —— 所以这个计数就是"每帧额外几次擦除"。
+#[inline(always)]
+pub fn trace_child_erase(kind: usize) {
+    if TRACE_ON.load(Ordering::Relaxed) {
+        CHILD_ERASE_CNT[kind].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+// --------------------------------------------------------------------
+// dump
+// --------------------------------------------------------------------
+
+/// 把缓冲写成 CSV。返回写出的帧数。
+///
+/// **必须在主线程调**（调用点就在消息循环这一侧），并且**先把开关
+/// 置 false 再读缓冲** —— 否则后台线程可能正写到一半，dump 出来的
+/// 最后一帧是半条记录（`t_handler_enter` 有、`t_post` 空），统计里
+/// 就会出现物理上不可能的"负间隔"。
+///
+/// 顺序：关开关 → 取锁 → 整个缓冲 move 出来（锁内只有一次 move）
+/// → **放锁** → 再在锁外做格式化与文件 I/O。写文件要几十毫秒，
+/// 绝不能占着锁（后台线程会一直等）。
+pub fn dump_trace(path: &str) -> std::io::Result<usize> {
+    TRACE_ON.store(false, Ordering::Relaxed);
+    TRACE_PENDING.store(NO_SEQ, Ordering::Relaxed);
+    TRACE_PAINT_OWNED.store(false, Ordering::Relaxed);
+    TRACE_CLAIMED_SEQ.store(NO_SEQ, Ordering::Relaxed);
+    let orphans = TRACE_ORPHAN_PAINTS.load(Ordering::Relaxed);
+    let unclaimed = TRACE_SUB_UNCLAIMED.load(Ordering::Relaxed);
+    let recs: Vec<FrameRec> = {
+        let mut b = TRACE_BUF
+            .lock()
+            .map_err(|_| std::io::Error::other("trace buffer poisoned"))?;
+        b.take_all()
+    };
+    let hz = qpc_hz();
+
+    // 第70轮：CSV **只追加**子函数与判据列，老列顺序一个字节没动 ——
+    // 上一轮的分析脚本按列名/列序取值，追加不影响它继续用。
+    let mut s = String::with_capacity(recs.len() * 320 + 512);
+    // 老 14 列，**末尾不带换行** —— 第70轮的新列要接在同一行表头后面。
+    // （这里若留 `\n`，追加列就会跑到第二行，解析脚本按列名取值全落空。）
+    s.push_str(
+        "seq,t_post,t_handler_enter,t_tick_end,t_sync_end,t_frame_done,\
+         t_paint_enter,t_paint_exit,inflight_before,inflight_after,\
+         inflight_after_done,paint_seq,inv_search,inv_address",
+    );
+    // ---- 第70轮追加列 ----
+    use std::fmt::Write as _;
+    let mut hdr = String::new();
+    for name in SUB_NAMES.iter() {
+        let _ = write!(hdr, ",{name}_b,{name}_e");
+    }
+    hdr.push_str(
+        ",d_w,d_h,d_panes,d_entries,d_visible,d_viewmode,d_view_area,\
+         d_icon_zoom,d_icon_bounce,d_cap_anim,d_flags,d_anim_active",
+    );
+    s.push_str(&hdr);
+    s.push('\n');
+
+    for r in &recs {
+        // 老 14 列 + 第70轮追加列，**拼成一行**再换行 —— 分两次写会让
+        // 追加列掉到下一行，行列错位。
+        let _ = write!(
+            s,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            r.seq,
+            r.t_post,
+            r.t_handler_enter,
+            r.t_tick_end,
+            r.t_sync_end,
+            r.t_frame_done,
+            r.t_paint_enter,
+            r.t_paint_exit,
+            r.inflight_before,
+            r.inflight_after,
+            r.inflight_after_done,
+            r.paint_seq,
+            r.invalidated_search,
+            r.invalidated_address
+        );
+        for i in 0..SUB_N {
+            let _ = write!(s, ",{},{}", r.sub_begin[i], r.sub_end[i]);
+        }
+        let _ = write!(
+            s,
+            ",{},{},{},{},{},{},{},{},{},{},{},{}",
+            r.d_w,
+            r.d_h,
+            r.d_panes,
+            r.d_entries,
+            r.d_visible,
+            r.d_viewmode,
+            r.d_view_area,
+            r.d_icon_zoom,
+            r.d_icon_bounce,
+            r.d_cap_anim,
+            r.d_flags,
+            r.d_anim_active
+        );
+        s.push('\n');
+    }
+    std::fs::write(path, s.as_bytes())?;
+
+    // ---- 子窗口统计：另写一份 `.child`，与主 CSV 并排 ----
+    //
+    // 为什么不塞进主 CSV：子窗口的 `WM_PAINT` 次数与耗时是**聚合计数**，
+    // 不是逐帧序列 —— 塞进去就得给每帧加 4×4 列而其中 99% 是 0。
+    // 分位数只有这一份统计才需要，所以单独落一份。
+    let samples: Vec<Vec<u64>> = CHILD_SAMPLES
+        .lock()
+        .map(|v| v.iter().cloned().collect())
+        .unwrap_or_else(|_| vec![Vec::new(); CHILD_KINDS]);
+    let mut c = String::new();
+    c.push_str("kind,paint_cnt,erase_cnt,total_ticks,max_ticks,p50_ticks,p95_ticks,mean_ticks\n");
+    for k in 0..CHILD_KINDS {
+        let n = CHILD_PAINT_CNT[k].load(Ordering::Relaxed);
+        let total = CHILD_PAINT_NS[k].load(Ordering::Relaxed);
+        let mx = CHILD_PAINT_MAX[k].load(Ordering::Relaxed);
+        let mut v: Vec<u64> = samples.get(k).cloned().unwrap_or_default();
+        v.sort_unstable();
+        let p50 = v.get(v.len() / 2).copied().unwrap_or(0);
+        let p95 = v.get(v.len().saturating_sub(1).min((v.len() * 95) / 100)).copied().unwrap_or(0);
+        let mean = if n > 0 { total / n } else { 0 };
+        let _ = writeln!(
+            c,
+            "{},{},{},{},{},{},{},{}",
+            CHILD_KIND_NAMES[k], n, CHILD_ERASE_CNT[k].load(Ordering::Relaxed), total, mx, p50, p95, mean
+        );
+    }
+    let _ = std::fs::write(format!("{path}.child"), c.as_bytes());
+
+    // 元信息另写一份：QPC 频率、帧数、孤儿 paint 数，免得脚本猜。
+    let meta = format!(
+        "qpc_hz={} frames={} frame_ms={} orphan_paints={} trace_env={} \
+         sub_steps={} sub_unclaimed={}\n",
+        hz,
+        recs.len(),
+        FRAME_MS,
+        orphans,
+        TRACE_ENV,
+        SUB_N,
+        unclaimed
+    );
+    let _ = std::fs::write(format!("{path}.meta"), meta.as_bytes());
+    Ok(recs.len())
 }
