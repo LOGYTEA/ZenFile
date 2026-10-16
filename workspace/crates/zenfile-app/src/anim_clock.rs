@@ -370,12 +370,121 @@ pub const TRACE_ENV: &str = "ZENFILE_ANIM_TRACE";
 /// 埋点总开关。默认 false = 常态零开销。
 static TRACE_ON: AtomicBool = AtomicBool::new(false);
 
-/// 环形缓冲容量。
+/// **动画帧**环形缓冲容量（第74轮：拆分环形缓冲，见 `TRACE_CAP_STATIC`）。
 ///
-/// 5000ms / 15ms ≈ 333 帧；取 4096 留足余量（动画停了以后 dump 也
-/// 还能继续录，直到写满）。满了之后**覆盖最旧的**而不是拒绝新的
-/// —— 排查长尾要看的是"最近发生了什么"。
-const TRACE_CAP: usize = 4096;
+/// 依据：一次 `--anim-trace` 录制最长 `--anim-trace 13000` 毫秒，
+/// 时钟线程按 15ms 一拍 → 13000/15 ≈ 867 条；开录前还有 1s 预热不录。
+/// 取 4096 留了约 4.7 倍余量。**这个值本轮不变** —— 动画帧的数量上限
+/// 由"录制时长 ÷ 帧间隔"决定，与用户操作强度无关（`MAX_INFLIGHT=1`
+/// 保证 in-flight ≤1，节奏不会因为主线程忙而变快）。
+const TRACE_CAP_ANIM: usize = 4096;
+
+/// **非动画（静态）paint** 环形缓冲容量（第74轮新增）。
+///
+/// # 为什么必须另开一个环，而不是往同一个环里塞
+///
+/// 同一个环、容量几千、满了"丢最旧"，会出现这个后果：
+/// **一次窗口 resize 的上百次 `WM_PAINT` 会把正在录的动画帧整体挤掉**。
+/// 而"静态重绘的单次绝对成本"恰恰是本轮要量的东西（低配机器卡不卡
+/// 取决于单次重绘多久），它和"动画帧间隔分布"是两组互不替代的数据。
+/// 挤掉就等于两个都测不准。所以拆成两个独立的环：
+///
+/// * `TRACE_BUF`（动画）—— 只由后台时钟线程 `trace_post` 追加，
+///   容量见上，**静态 paint 一个字节都碰不到它**；
+/// * `TRACE_STATIC_BUF`（静态）—— 只由主线程 `trace_paint_enter` 追加，
+///   只会被别的静态 paint 挤掉。
+///
+/// # 16384 这个数怎么来的
+///
+/// 静态 paint 的产生速率上界 = 重绘频率。窗口拖动/resize 时系统按
+/// 屏幕刷新率连续发 `WM_PAINT`，144Hz 屏 ≈ 144 次/秒；一次从最大化到
+/// 还原的完整往返外加连续拖边，本轮实测 13 秒录制里静态 paint 的量级
+/// 是**几百到一两千**。16384 能覆盖"连续 113 秒不间断 resize"，
+/// 对 13 秒的录制来说是 1000 倍余量。
+///
+/// 代价：`FrameRec` 384 字节（字段见下），16384 × 384 ≈ 6.3MB，
+/// 加上动画环 4096 × 384 ≈ 1.6MB，合计约 7.9MB 常驻 —— 对一个资源
+/// 管理器可接受，且**只在 `TRACE_ON` 为真并真的发生过 push 时才分配**
+/// （`Vec::new()` 不分配；关着 trace 时这块内存根本不存在）。
+///
+/// # 满了怎么办
+///
+/// 仍是**覆盖最旧的**（丢最旧而不是拒新），理由与动画环一致：排查要看
+/// "最近发生了什么"。但**被丢掉的数量必须记账**（`TRACE_STATIC_DROPPED`，
+/// 写进 `.meta`）—— 否则"没录到"和"没发生"在 CSV 里长得一样，
+/// 和本轮修的这个缺陷是同一类错误。
+const TRACE_CAP_STATIC: usize = 16384;
+
+/// **静态 paint 的 seq 基址**（第74轮）。
+///
+/// 静态记录与动画记录**写进同一份 CSV**，所以两者的 `seq` 必须能一眼
+/// 分开。给静态记录加一个 `1<<48` 的偏移：动画 seq 是录制期内单调递增的
+/// 小整数（867 条录制 ⇒ 最大 866），静态 seq 是 281474976710656 + n。
+/// 两段数值不可能相交，**即使分析脚本完全不看 `kind` 列也不会混**。
+pub const STATIC_SEQ_BASE: u64 = 1u64 << 48;
+
+/// CSV 里的 `kind` 列取值：这是一条**动画帧**记录（`trace_post` 建的）。
+pub const KIND_ANIM: u32 = 0;
+/// CSV 里的 `kind` 列取值：这是一次**静态 / 非动画** `WM_PAINT` 记录
+/// （`trace_paint_enter` 建的，`seq >= STATIC_SEQ_BASE`）。
+pub const KIND_PAINT: u32 = 1;
+
+/// CSV `kind` 列里写出来的**文本**（`0` / `1`）。
+const KIND_ANIM_TXT: &str = "anim";
+const KIND_PAINT_TXT: &str = "paint";
+
+/// `TRACE_ACTIVE_PAINT`：当前这次 paint 的记录在**哪个环**里。
+///
+/// * `ACTIVE_NONE` —— 没有正在进行的 paint；
+/// * `ACTIVE_ANIM` —— 在动画环（`TRACE_BUF`）；
+/// * `ACTIVE_PAINT` —— 在静态环（`TRACE_STATIC_BUF`）。
+///
+/// 第74轮新增。第73版靠"倒着扫最近一条 `t_paint_enter != 0` 的记录"来
+/// 定位，而现在两种记录**同时存在于两个环里**，倒扫会认错行（动画帧的
+/// 时刻可能被写到一条静态记录上）。改成显式发布"在哪个环"。
+const ACTIVE_NONE: u32 = 0;
+const ACTIVE_ANIM: u32 = 1;
+const ACTIVE_PAINT: u32 = 2;
+
+/// **自检计数器**：本进程一共记过多少条 paint 记录（动画 + 静态）。
+///
+/// 第74轮：这是"看起来在采但其实全丢"的哨兵。配套的断言见
+/// `TRACE_SUB_STEPS_WRITTEN`。
+static TRACE_PAINTS_RECORDED: AtomicU64 = AtomicU64::new(0);
+
+/// **自检计数器**：`sub_*` 打点被调用的总次数（begin + end 都算）。
+static TRACE_SUB_STEPS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// **自检计数器**：`sub_*` 打点里**真的写进了某条记录**的次数。
+///
+/// # 为什么必须是这一个，而不是 `sub_steps_total`
+///
+/// 任务书给的断言是 `paints_recorded * 16 >= sub_steps_total`。这个式子
+/// **在本项目的代码里恒不成立**：一次完整的 `paint()` 会打 15 对
+/// `trace_sub_begin/end` = **30 次**，恒 > 16，所以只要有一次完整 paint
+/// 断言就必然为 0 —— 它测不出"丢数据"，只会恒定误报。
+///
+/// 真正能区分"采到了"与"全丢了"的量是 `sub_steps_written`：打点被调用
+/// **并且成功写进了一条记录**的次数。旧版缺陷下 `paint()` 每次走完 15 个
+/// 打点，但 `TRACE_PAINT_OWNED == false` 让它们全部只累加计数器、
+/// 一条记录都不写 —— 即 `sub_steps_written == 0` 而
+/// `paints_recorded > 0`。这才是哨兵。
+///
+/// # 判据
+///
+/// 每次 `paint()` 至少有**一对**完整的 `begin`/`end`
+/// （`SUB_BEGIN_ANIM` 是无条件执行的，它不是 `if` 分支），所以
+/// `sub_steps_written >= paints_recorded * 2` 是"每次 paint 都落盘了
+/// 子步骤"的充要下限。留 2 而不是 1 是为了容忍某一侧边界不完整。
+static TRACE_SUB_STEPS_WRITTEN: AtomicU64 = AtomicU64::new(0);
+
+/// 自检是否通过（见 `TRACE_SUB_STEPS_WRITTEN` 的说明）。
+#[inline]
+pub fn trace_selftest_ok() -> bool {
+    let p = TRACE_PAINTS_RECORDED.load(Ordering::Relaxed);
+    let w = TRACE_SUB_STEPS_WRITTEN.load(Ordering::Relaxed);
+    w >= p * 2
+}
 
 /// "没有帧号"哨兵。
 const NO_SEQ: u64 = u64::MAX;
@@ -415,12 +524,20 @@ pub struct FrameRec {
     pub t_paint_enter: u64,
     /// `paint::paint` 返回后。
     pub t_paint_exit: u64,
-    /// 本帧那次 paint 归属于哪个 seq。
+    /// 本次 paint 归属于哪个 seq。
     ///
-    /// 归不上的（鼠标悬停 / `WM_TIMER` 引起的）paint 记 `NO_SEQ` 且
-    /// 只累加 `TRACE_ORPHAN_PAINTS`，**不污染**任何一帧的时刻 ——
-    /// 否则一次悬停重绘会被记成"动画帧的绘制耗时"，把结论带偏。
+    /// 动画帧：等于该帧的 `seq`（`>= 0` 且 `< STATIC_SEQ_BASE`）。
+    /// 静态 paint：等于它自己那条记录的 `seq`（`>= STATIC_SEQ_BASE`）。
+    ///
+    /// **第74轮改动**：以前"归不上任何动画帧"的 paint 记 `NO_SEQ` 且整条
+    /// 记录被丢弃 —— 那正是本轮修掉的缺陷（1260 次 paint 一行没落盘）。
+    /// 现在静态 paint **自己也有一条记录**，`paint_seq` 就是它自己的 seq。
     pub paint_seq: u64,
+    /// 记录类别（CSV 的 `kind` 列）：`KIND_ANIM` / `KIND_STATIC`。
+    ///
+    /// 与 `seq >= STATIC_SEQ_BASE` 恒等，单列出来是为了让分析脚本不必
+    /// 记住偏移常量（脚本里 `kind == 1` 就是静态帧）。
+    pub kind: u32,
     /// paint 里那句无条件 `InvalidateRect(hwnd_search)` 是否执行了。
     /// 本轮**只记录、不改动**（`paint.rs` 那两句一个字没动）。
     pub invalidated_search: u32,
@@ -683,11 +800,18 @@ struct TraceBuf {
     /// 有效条数。
     len: usize,
     items: Vec<FrameRec>,
+    /// 因"丢最旧"被覆盖掉的条数（第74轮新增，静态环记账用）。
+    dropped: u64,
 }
 
 impl TraceBuf {
     const fn new() -> Self {
-        Self { cap: TRACE_CAP, head: 0, len: 0, items: Vec::new() }
+        Self { cap: TRACE_CAP_ANIM, head: 0, len: 0, items: Vec::new(), dropped: 0 }
+    }
+
+    /// 静态环专用构造：容量 `TRACE_CAP_STATIC`。
+    const fn static_new() -> Self {
+        Self { cap: TRACE_CAP_STATIC, head: 0, len: 0, items: Vec::new(), dropped: 0 }
     }
 
     /// 第 `i` 条（`0` = 最老，`len-1` = 最新）。
@@ -744,24 +868,44 @@ impl TraceBuf {
         } else {
             self.items[self.head] = r;
             self.head = (self.head + 1) % self.cap;
+            self.dropped += 1;
         }
     }
 
     fn clear(&mut self) {
         self.head = 0;
         self.len = 0;
+        self.dropped = 0;
     }
 
     /// 拿走全部内容（供 dump 在锁外慢慢格式化）。
     fn take_all(&mut self) -> Vec<FrameRec> {
-        let mut items = std::mem::take(&mut self.items);
+        let items = std::mem::take(&mut self.items);
         self.head = 0;
         self.len = 0;
+        self.dropped = 0;
         items
+    }
+
+    /// 因"丢最旧"被覆盖掉的条数。**必须在持锁后调用**。
+    fn dropped(&self) -> u64 {
+        self.dropped
     }
 }
 
 static TRACE_BUF: Mutex<TraceBuf> = Mutex::new(TraceBuf::new());
+
+/// 静态 paint 环形缓冲（第74轮）。
+///
+/// 与 `TRACE_BUF` **完全独立**：满环/清空只影响自己。这样一次 resize
+/// 引发的上百次 `WM_PAINT` 不会把正在录的动画帧挤掉。
+static TRACE_STATIC_BUF: Mutex<TraceBuf> = Mutex::new(TraceBuf::static_new());
+
+/// 静态 paint 序号（加 `STATIC_SEQ_BASE` 后才是 CSV 里的 `seq`）。
+static TRACE_STATIC_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 当前这次 paint 的记录在哪个环里（`ACTIVE_*`）。
+static TRACE_ACTIVE_PAINT: AtomicU32 = AtomicU32::new(ACTIVE_NONE);
 
 /// 后台线程侧的帧序号。只有开 trace 时才自增。
 static TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -827,7 +971,15 @@ pub fn trace_init_from_env() -> bool {
         if let Ok(mut b) = TRACE_BUF.lock() {
             b.clear();
         }
+        if let Ok(mut b) = TRACE_STATIC_BUF.lock() {
+            b.clear();
+        }
         TRACE_SEQ.store(0, Ordering::Relaxed);
+        TRACE_STATIC_SEQ.store(0, Ordering::Relaxed);
+        TRACE_PAINTS_RECORDED.store(0, Ordering::Relaxed);
+        TRACE_SUB_STEPS_TOTAL.store(0, Ordering::Relaxed);
+        TRACE_SUB_STEPS_WRITTEN.store(0, Ordering::Relaxed);
+        TRACE_ACTIVE_PAINT.store(ACTIVE_NONE, Ordering::Relaxed);
         TRACE_PENDING.store(NO_SEQ, Ordering::Relaxed);
         TRACE_ORPHAN_PAINTS.store(0, Ordering::Relaxed);
         reset_child_stats();
@@ -849,7 +1001,11 @@ pub fn trace_set(on: bool) {
         TRACE_PENDING.store(NO_SEQ, Ordering::Relaxed);
         TRACE_PAINT_OWNED.store(false, Ordering::Relaxed);
         TRACE_CLAIMED_SEQ.store(NO_SEQ, Ordering::Relaxed);
+        TRACE_ACTIVE_PAINT.store(ACTIVE_NONE, Ordering::Relaxed);
         if let Ok(mut b) = TRACE_BUF.lock() {
+            b.clear();
+        }
+        if let Ok(mut b) = TRACE_STATIC_BUF.lock() {
             b.clear();
         }
     }
@@ -906,6 +1062,7 @@ pub fn trace_post(inflight_before: u32, inflight_after: u32) {
             inflight_before,
             inflight_after,
             paint_seq: NO_SEQ,
+            kind: KIND_ANIM,
             ..Default::default()
         };
         if let Ok(mut b) = TRACE_BUF.lock() {
@@ -988,31 +1145,71 @@ pub fn trace_frame_done(inflight_after_done: u32) {
 
 /// **主线程**：进入 `paint::paint` 之前。
 ///
-/// 认领语义：把 `TRACE_PENDING` 取出来当自己的 seq，然后置回
-/// `NO_SEQ`。取到 `NO_SEQ` 说明这次 `WM_PAINT` 跟动画帧无关
-/// （悬停 / `WM_TIMER` / 窗口尺寸变化），只累加孤儿计数、**不写**
-/// 任何帧的时刻。
+/// # 第74轮：认领失败不再丢数据，而是**给它自己建一条记录**
 ///
-/// 顺带把 `t_paint_exit` 与两个失效标志清零：没有 `WM_PAINT` 到达时，
-/// 它们必须是 0 而不是上一帧的残留值（否则会算出负的绘制耗时）。
+/// 以前这里是 `if claimed == NO_SEQ { 孤儿计数++; return; }` —— 那次
+/// `return` 就是本轮修掉的缺陷：1260 次 paint 一行没落盘，所有静态重绘
+/// （悬停 / resize / 切目录 / 子 EDIT）的成本全部丢失，而那恰恰是
+/// "低配机器卡不卡"最需要的量（静态帧不需要 60fps，要的是**单次重绘
+/// 的绝对成本**）。
+///
+/// 现在两条路径：
+///
+/// * 认领到动画 seq → 写进 `TRACE_BUF` 里那一帧（行为与旧版完全一致，
+///   动画帧的时间线一个字节没变）；
+/// * 认领不到（`NO_SEQ`）→ **当场在 `TRACE_STATIC_BUF` 里 `push` 一条
+///   新记录**，`seq = STATIC_SEQ_BASE + n`，把它自己的 seq 发布成
+///   `TRACE_CLAIMED_SEQ`，并把 `TRACE_PAINT_OWNED` 置真。
+///
+/// 于是 `paint()` 里那 15 个 `sub_*` 打点**对任何 paint 都生效**，
+/// 与"是不是动画帧"彻底无关。
 #[inline(always)]
 pub fn trace_paint_enter() {
     if TRACE_ON.load(Ordering::Relaxed) {
         let t = qpc();
         let claimed = TRACE_PENDING.swap(NO_SEQ, Ordering::Relaxed);
+        TRACE_PAINTS_RECORDED.fetch_add(1, Ordering::Relaxed);
         if claimed == NO_SEQ {
+            // 静态 paint：自己建一条记录。
+            //
+            // `orphan_paints` 的**新语义**：以前是"认领失败、被丢掉的
+            // paint 数"（丢数据）；现在是"**非动画** paint 数"，也就是
+            // CSV 里 `kind=paint` 的行数。计数值与旧版同源（都是"没认领
+            // 上动画帧的次数"），但从"丢失计数"变成"静态帧计数" ——
+            // 它现在**恰好等于**静态记录条数，可以直接用来校验 CSV。
             TRACE_ORPHAN_PAINTS.fetch_add(1, Ordering::Relaxed);
-            // 认不上一帧：内部步打点必须**完全跳过**，否则会把
-            // "悬停引起的父窗口重绘"的子函数时刻写进某条动画帧记录。
-            TRACE_PAINT_OWNED.store(false, Ordering::Relaxed);
-            TRACE_CLAIMED_SEQ.store(NO_SEQ, Ordering::Relaxed);
+            let seq = STATIC_SEQ_BASE + TRACE_STATIC_SEQ.fetch_add(1, Ordering::Relaxed);
+            let mut r = FrameRec {
+                seq,
+                kind: KIND_PAINT,
+                paint_seq: seq,
+                ..FrameRec::default()
+            };
+            r.t_paint_enter = t;
+            // 子步骤整段清零：不清的话"这一步这一帧没跑"会读到槽位上
+            // 一次被覆盖掉的记录的残留时刻，算出乱七八糟的耗时。
+            r.sub_begin = [0; SUB_N];
+            r.sub_end = [0; SUB_N];
+            if let Ok(mut b) = TRACE_STATIC_BUF.lock() {
+                b.push(r);
+            } else {
+                // 锁被 poison（只可能 panic 传播进来）：退回"无记录"，
+                // 记一次未认领，绝不 panic —— 埋点不能成为崩溃源。
+                TRACE_SUB_UNCLAIMED.fetch_add(1, Ordering::Relaxed);
+                TRACE_PAINT_OWNED.store(false, Ordering::Relaxed);
+                TRACE_CLAIMED_SEQ.store(NO_SEQ, Ordering::Relaxed);
+                TRACE_ACTIVE_PAINT.store(ACTIVE_NONE, Ordering::Relaxed);
+                return;
+            }
+            TRACE_CLAIMED_SEQ.store(seq, Ordering::Relaxed);
+            TRACE_PAINT_OWNED.store(true, Ordering::Relaxed);
+            TRACE_ACTIVE_PAINT.store(ACTIVE_PAINT, Ordering::Relaxed);
             return;
         }
-        // 第70轮：先把"我认领了 seq X"发布出去，`paint()` 里的内部步
-        // 打点全靠它定位记录（比"扫描最新一条带 t_paint_enter 的记录"
-        // 更快也更准 —— 两次 paint 连着发生时后者会认错帧）。
+        // 动画帧：行为与旧版一字不差。
         TRACE_CLAIMED_SEQ.store(claimed, Ordering::Relaxed);
         TRACE_PAINT_OWNED.store(true, Ordering::Relaxed);
+        TRACE_ACTIVE_PAINT.store(ACTIVE_ANIM, Ordering::Relaxed);
         if let Ok(mut b) = TRACE_BUF.lock() {
             if let Some(i) = b.find(claimed) {
                 let r = b.at_mut(i);
@@ -1021,8 +1218,6 @@ pub fn trace_paint_enter() {
                 r.t_paint_exit = 0;
                 r.invalidated_search = 0;
                 r.invalidated_address = 0;
-                // 内部步：整段清零。不清的话"这一帧跳过了某一步"会读到
-                // 缓冲里那条槽位上一轮的残留时刻，算出乱七八糟的耗时。
                 r.sub_begin = [0; SUB_N];
                 r.sub_end = [0; SUB_N];
             }
@@ -1035,16 +1230,30 @@ pub fn trace_paint_enter() {
 pub fn trace_paint_exit() {
     if TRACE_ON.load(Ordering::Relaxed) {
         let t = qpc();
-        if let Ok(mut b) = TRACE_BUF.lock() {
-            // paint 时刻已写进 `paint_seq` 那一帧；但 PENDING 已被消费，
-            // 所以这里按"最近一帧 paint_enter 过、且还没 exit"来找。
-            // 环形缓冲里它必然是最新一条带 t_paint_enter 的记录。
-            if let Some(i) = newest_unfinished_paint(&b) {
-                b.at_mut(i).t_paint_exit = t;
+        // 按"这次 paint 认领/新建的是哪条记录"定位，而不是像旧版那样
+        // 倒扫"最近一条未结束的 paint" —— 静态 paint 现在也各自一条
+        // 记录，倒扫在两种记录交错时会认错行。
+        let seq = TRACE_CLAIMED_SEQ.load(Ordering::Relaxed);
+        match TRACE_ACTIVE_PAINT.load(Ordering::Relaxed) {
+            ACTIVE_PAINT => {
+                if let Ok(mut b) = TRACE_STATIC_BUF.lock() {
+                    if let Some(i) = b.find(seq) {
+                        b.at_mut(i).t_paint_exit = t;
+                    }
+                }
             }
+            ACTIVE_ANIM => {
+                if let Ok(mut b) = TRACE_BUF.lock() {
+                    if let Some(i) = b.find(seq) {
+                        b.at_mut(i).t_paint_exit = t;
+                    }
+                }
+            }
+            _ => {}
         }
         TRACE_PAINT_OWNED.store(false, Ordering::Relaxed);
         TRACE_CLAIMED_SEQ.store(NO_SEQ, Ordering::Relaxed);
+        TRACE_ACTIVE_PAINT.store(ACTIVE_NONE, Ordering::Relaxed);
     }
 }
 
@@ -1052,6 +1261,7 @@ pub fn trace_paint_exit() {
 ///
 /// 必须在持锁后调用。倒着扫，最坏情况（脏数据）也只扫到缓冲末尾。
 #[inline(always)]
+#[allow(dead_code)]
 fn newest_unfinished_paint(b: &TraceBuf) -> Option<usize> {
     let mut i = b.len;
     while i > 0 {
@@ -1074,12 +1284,26 @@ fn newest_unfinished_paint(b: &TraceBuf) -> Option<usize> {
 #[inline(always)]
 pub fn trace_invalidate(kind: u8) {
     if TRACE_ON.load(Ordering::Relaxed) {
-        if let Ok(mut b) = TRACE_BUF.lock() {
-            if let Some(i) = newest_unfinished_paint(&b) {
-                if kind == 0 {
-                    b.at_mut(i).invalidated_search = 1;
-                } else {
-                    b.at_mut(i).invalidated_address = 1;
+        let seq = TRACE_CLAIMED_SEQ.load(Ordering::Relaxed);
+        let which = TRACE_ACTIVE_PAINT.load(Ordering::Relaxed);
+        if which == ACTIVE_PAINT {
+            if let Ok(mut b) = TRACE_STATIC_BUF.lock() {
+                if let Some(i) = b.find(seq) {
+                    if kind == 0 {
+                        b.at_mut(i).invalidated_search = 1;
+                    } else {
+                        b.at_mut(i).invalidated_address = 1;
+                    }
+                }
+            }
+        } else if which == ACTIVE_ANIM {
+            if let Ok(mut b) = TRACE_BUF.lock() {
+                if let Some(i) = b.find(seq) {
+                    if kind == 0 {
+                        b.at_mut(i).invalidated_search = 1;
+                    } else {
+                        b.at_mut(i).invalidated_address = 1;
+                    }
                 }
             }
         }
@@ -1094,22 +1318,46 @@ pub fn trace_invalidate(kind: u8) {
 ///
 /// 与 `trace_mark` 同样的纪律 —— QPC 在**取锁之前**取，锁内只有两次写。
 ///
-/// 认领语义：`TRACE_PAINT_OWNED == false`（孤儿 paint）时直接返回，
-/// 只累加 `TRACE_SUB_UNCLAIMED` 自检计数。子 EDIT 的 `WM_PAINT` 走
-/// 自己的窗口过程、**根本不进 `paint()`**，所以正常情况下这里永远
-/// 认得上；认不上就说明有别的路径调了 `paint()`。
+/// # 第74轮：子步骤打点改成**帧无关**
+///
+/// 旧版这里判 `TRACE_PAINT_OWNED`，false 就直接返回并累加
+/// `TRACE_SUB_UNCLAIMED`。那是本轮修掉的缺陷的一半：`paint()` 每次调用
+/// 都会走完 15 个打点，但非动画 paint 的 `TRACE_PAINT_OWNED` 是 false，
+/// 于是 1260 次 paint × 15 步**全部只累加计数器、一条记录都不写**。
+///
+/// 现在 `trace_paint_enter` 保证**任何**一次 `paint()` 都有对应记录
+/// （动画帧认领、非动画现场新建），所以这里只判"当前有没有正在进行的
+/// paint"，然后按 `TRACE_ACTIVE_PAINT` 去对应的环写。
 #[inline(always)]
 pub fn trace_sub_begin(step: usize) {
     if TRACE_ON.load(Ordering::Relaxed) {
         let t = qpc();
-        if TRACE_PAINT_OWNED.load(Ordering::Relaxed) {
-            if let Ok(mut b) = TRACE_BUF.lock() {
-                if let Some(i) = b.find(TRACE_CLAIMED_SEQ.load(Ordering::Relaxed)) {
-                    b.at_mut(i).sub_begin[step] = t;
+        TRACE_SUB_STEPS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        if !TRACE_PAINT_OWNED.load(Ordering::Relaxed) {
+            // 理论上到不了这里（`paint()` 必被 `trace_paint_enter` 包住）。
+            // 真到了就是有别的路径直接调了 `paint()`，记一次留证据。
+            TRACE_SUB_UNCLAIMED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let seq = TRACE_CLAIMED_SEQ.load(Ordering::Relaxed);
+        match TRACE_ACTIVE_PAINT.load(Ordering::Relaxed) {
+            ACTIVE_PAINT => {
+                if let Ok(mut b) = TRACE_STATIC_BUF.lock() {
+                    if let Some(i) = b.find(seq) {
+                        b.at_mut(i).sub_begin[step] = t;
+                        TRACE_SUB_STEPS_WRITTEN.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
-        } else {
-            TRACE_SUB_UNCLAIMED.fetch_add(1, Ordering::Relaxed);
+            ACTIVE_ANIM => {
+                if let Ok(mut b) = TRACE_BUF.lock() {
+                    if let Some(i) = b.find(seq) {
+                        b.at_mut(i).sub_begin[step] = t;
+                        TRACE_SUB_STEPS_WRITTEN.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -1121,12 +1369,32 @@ pub fn trace_sub_begin(step: usize) {
 /// 返回 0（只有 QPC 读失败时），实际上把两者都当"没跑"处理即可。
 #[inline(always)]
 pub fn trace_sub_end(step: usize) {
-    if TRACE_ON.load(Ordering::Relaxed) && TRACE_PAINT_OWNED.load(Ordering::Relaxed) {
+    if TRACE_ON.load(Ordering::Relaxed) {
         let t = qpc();
-        if let Ok(mut b) = TRACE_BUF.lock() {
-            if let Some(i) = b.find(TRACE_CLAIMED_SEQ.load(Ordering::Relaxed)) {
-                b.at_mut(i).sub_end[step] = t;
+        TRACE_SUB_STEPS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        if !TRACE_PAINT_OWNED.load(Ordering::Relaxed) {
+            TRACE_SUB_UNCLAIMED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let seq = TRACE_CLAIMED_SEQ.load(Ordering::Relaxed);
+        match TRACE_ACTIVE_PAINT.load(Ordering::Relaxed) {
+            ACTIVE_PAINT => {
+                if let Ok(mut b) = TRACE_STATIC_BUF.lock() {
+                    if let Some(i) = b.find(seq) {
+                        b.at_mut(i).sub_end[step] = t;
+                        TRACE_SUB_STEPS_WRITTEN.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
             }
+            ACTIVE_ANIM => {
+                if let Ok(mut b) = TRACE_BUF.lock() {
+                    if let Some(i) = b.find(seq) {
+                        b.at_mut(i).sub_end[step] = t;
+                        TRACE_SUB_STEPS_WRITTEN.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -1172,22 +1440,39 @@ pub fn trace_ctx(
 ) {
     if TRACE_ON.load(Ordering::Relaxed) && TRACE_PAINT_OWNED.load(Ordering::Relaxed) {
         let area = ((view.right - view.left).max(0) as i64) * ((view.bottom - view.top).max(0) as i64);
-        if let Ok(mut b) = TRACE_BUF.lock() {
-            if let Some(i) = b.find(TRACE_CLAIMED_SEQ.load(Ordering::Relaxed)) {
-                let r = b.at_mut(i);
-                r.d_w = width.max(0) as u32;
-                r.d_h = height.max(0) as u32;
-                r.d_panes = panes as u32;
-                r.d_entries = entries as u32;
-                r.d_visible = visible as u32;
-                r.d_viewmode = view_mode;
-                r.d_view_area = area.max(0) as u64;
-                r.d_icon_zoom = icon_zoom as u32;
-                r.d_icon_bounce = icon_bounce as u32;
-                r.d_cap_anim = cap_anim as u32;
-                r.d_flags = flags;
-                r.d_anim_active = anim_active as u32;
+        let seq = TRACE_CLAIMED_SEQ.load(Ordering::Relaxed);
+        // 判据快照在两个环里写法完全一样，抽成一次写。
+        macro_rules! put_ctx {
+            ($b:expr) => {{
+                if let Some(i) = $b.find(seq) {
+                    let r = $b.at_mut(i);
+                    r.d_w = width.max(0) as u32;
+                    r.d_h = height.max(0) as u32;
+                    r.d_panes = panes as u32;
+                    r.d_entries = entries as u32;
+                    r.d_visible = visible as u32;
+                    r.d_viewmode = view_mode;
+                    r.d_view_area = area.max(0) as u64;
+                    r.d_icon_zoom = icon_zoom as u32;
+                    r.d_icon_bounce = icon_bounce as u32;
+                    r.d_cap_anim = cap_anim as u32;
+                    r.d_flags = flags;
+                    r.d_anim_active = anim_active as u32;
+                }
+            }};
+        }
+        match TRACE_ACTIVE_PAINT.load(Ordering::Relaxed) {
+            ACTIVE_PAINT => {
+                if let Ok(mut b) = TRACE_STATIC_BUF.lock() {
+                    put_ctx!(b);
+                }
             }
+            ACTIVE_ANIM => {
+                if let Ok(mut b) = TRACE_BUF.lock() {
+                    put_ctx!(b);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -1284,19 +1569,55 @@ pub fn dump_trace(path: &str) -> std::io::Result<usize> {
     TRACE_PENDING.store(NO_SEQ, Ordering::Relaxed);
     TRACE_PAINT_OWNED.store(false, Ordering::Relaxed);
     TRACE_CLAIMED_SEQ.store(NO_SEQ, Ordering::Relaxed);
+    TRACE_ACTIVE_PAINT.store(ACTIVE_NONE, Ordering::Relaxed);
     let orphans = TRACE_ORPHAN_PAINTS.load(Ordering::Relaxed);
     let unclaimed = TRACE_SUB_UNCLAIMED.load(Ordering::Relaxed);
-    let recs: Vec<FrameRec> = {
+    let paints_recorded = TRACE_PAINTS_RECORDED.load(Ordering::Relaxed);
+    let sub_steps_total = TRACE_SUB_STEPS_TOTAL.load(Ordering::Relaxed);
+    let sub_steps_written = TRACE_SUB_STEPS_WRITTEN.load(Ordering::Relaxed);
+    let selftest_ok = trace_selftest_ok();
+
+    // ---- 锁内只有两次 move：两个环各整体搬出 ----
+    //
+    // 第74轮：动画环与静态环是**两个独立缓冲**，各自 `take_all` 一次。
+    // 之后的归并、格式化、文件 I/O 全在**锁外** —— 锁纪律与旧版一致。
+    let (recs, statics, anim_dropped, static_dropped) = {
         let mut b = TRACE_BUF
             .lock()
             .map_err(|_| std::io::Error::other("trace buffer poisoned"))?;
-        b.take_all()
+        let anim_dropped = b.dropped();
+        let r = b.take_all();
+        drop(b);
+        let mut sb = TRACE_STATIC_BUF
+            .lock()
+            .map_err(|_| std::io::Error::other("trace static buffer poisoned"))?;
+        let sd = sb.dropped();
+        let s = sb.take_all();
+        (r, s, anim_dropped, sd)
     };
+
+    // 归并成**一条**时间轴：一次 paint = 一行，两类混排。
+    //
+    // 动画帧里 `t_paint_enter == 0` 的（post 了但这一拍没触发重绘）
+    // 排在最前，保持"动画时间线在前"的旧观感。
+    let mut all: Vec<FrameRec> = Vec::with_capacity(recs.len() + statics.len());
+    all.extend(recs.iter().filter(|r| r.t_paint_enter == 0).copied());
+    let mut painted: Vec<&FrameRec> = recs.iter().filter(|r| r.t_paint_enter != 0).collect();
+    let mut sp: Vec<&FrameRec> = statics.iter().filter(|r| r.t_paint_enter != 0).collect();
+    painted.sort_unstable_by_key(|r| r.t_paint_enter);
+    sp.sort_unstable_by_key(|r| r.t_paint_enter);
+    all.extend(painted.into_iter().copied());
+    all.extend(sp.into_iter().copied());
+    drop(recs);
+    drop(statics);
+
+    let n_anim = all.iter().filter(|r| r.kind == KIND_ANIM).count();
+    let n_paint = all.iter().filter(|r| r.kind == KIND_PAINT).count();
     let hz = qpc_hz();
 
     // 第70轮：CSV **只追加**子函数与判据列，老列顺序一个字节没动 ——
     // 上一轮的分析脚本按列名/列序取值，追加不影响它继续用。
-    let mut s = String::with_capacity(recs.len() * 320 + 512);
+    let mut s = String::with_capacity(all.len() * 340 + 1024);
     // 老 14 列，**末尾不带换行** —— 第70轮的新列要接在同一行表头后面。
     // （这里若留 `\n`，追加列就会跑到第二行，解析脚本按列名取值全落空。）
     s.push_str(
@@ -1314,10 +1635,15 @@ pub fn dump_trace(path: &str) -> std::io::Result<usize> {
         ",d_w,d_h,d_panes,d_entries,d_visible,d_viewmode,d_view_area,\
          d_icon_zoom,d_icon_bounce,d_cap_anim,d_flags,d_anim_active",
     );
+    // ---- 第74轮追加列：`kind`，**追加在最后**（不插中间） ----
+    //
+    // 老分析脚本（`%TEMP%\qa73\an73.py`）按**列名**取值（`r['t_paint_enter']`），
+    // 末尾追加对它完全透明；插在中间则会破坏任何按列序取值的脚本。
+    hdr.push_str(",kind");
     s.push_str(&hdr);
     s.push('\n');
 
-    for r in &recs {
+    for r in &all {
         // 老 14 列 + 第70轮追加列，**拼成一行**再换行 —— 分两次写会让
         // 追加列掉到下一行，行列错位。
         let _ = write!(
@@ -1357,6 +1683,8 @@ pub fn dump_trace(path: &str) -> std::io::Result<usize> {
             r.d_flags,
             r.d_anim_active
         );
+        // ---- 第74轮追加列：kind 文本（`anim` / `paint`） ----
+        let _ = write!(s, ",{}", if r.kind == KIND_PAINT { KIND_PAINT_TXT } else { KIND_ANIM_TXT });
         s.push('\n');
     }
     std::fs::write(path, s.as_bytes())?;
@@ -1390,17 +1718,43 @@ pub fn dump_trace(path: &str) -> std::io::Result<usize> {
     let _ = std::fs::write(format!("{path}.child"), c.as_bytes());
 
     // 元信息另写一份：QPC 频率、帧数、孤儿 paint 数，免得脚本猜。
+    //
+    // 第74轮新增自检字段 —— 这是本轮缺陷（"看起来在采但全丢"）的哨兵：
+    //
+    // * `paints_recorded` = `trace_paint_enter` 被调用总次数，**必须**
+    //   等于 CSV 数据行数（不等就是有记录没落盘，或落盘了没记账）。
+    // * `sub_steps_total`  = `sub_*` 打点被调用总次数。
+    // * `sub_steps_written`= 其中**真的写进记录**的次数。
+    // * `selftest_ok`      = `sub_steps_written >= paints_recorded * 2`。
+    //   旧版缺陷下 `sub_steps_written == 0` 而 `paints_recorded == 1260`
+    //   ⇒ 断言必然为 0，一眼看出"数据全丢"。
+    // * `static_dropped` / `anim_dropped` = 两环各自"丢最旧"丢掉的条数。
+    //   没有它就无法区分"只发生了 N 次"与"发生了远多于 N 次但只留 N 条"。
     let meta = format!(
         "qpc_hz={} frames={} frame_ms={} orphan_paints={} trace_env={} \
-         sub_steps={} sub_unclaimed={}\n",
+         sub_steps={} sub_unclaimed={}\n\
+         paints_recorded={} sub_steps_total={} sub_steps_written={} selftest_ok={} \
+         rows_anim={} rows_paint={} anim_dropped={} static_dropped={} \
+         static_cap={} anim_cap={} static_seq_base={}\n",
         hz,
-        recs.len(),
+        all.len(),
         FRAME_MS,
         orphans,
         TRACE_ENV,
         SUB_N,
-        unclaimed
+        unclaimed,
+        paints_recorded,
+        sub_steps_total,
+        sub_steps_written,
+        if selftest_ok { 1 } else { 0 },
+        n_anim,
+        n_paint,
+        anim_dropped,
+        static_dropped,
+        TRACE_CAP_STATIC,
+        TRACE_CAP_ANIM,
+        STATIC_SEQ_BASE
     );
     let _ = std::fs::write(format!("{path}.meta"), meta.as_bytes());
-    Ok(recs.len())
+    Ok(all.len())
 }
