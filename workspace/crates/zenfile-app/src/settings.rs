@@ -1602,6 +1602,7 @@ fn advanced_rows(app: &App, content: &RECT) -> Vec<paint::SettingRow> {
         ("显示状态栏", String::new(), paint::SET_STATUS, Some(app.cfg.ui.statusbar_visible)),
         ("导航窗格跟随当前文件夹展开", String::new(), paint::SET_FOLLOW, Some(app.cfg.ui.sidebar_follow_current)),
         ("「此电脑」默认展开到盘符", String::new(), paint::SET_THISPC, Some(app.cfg.ui.sidebar_thispc_expanded)),
+        ("使用 GPU 渲染", String::new(), paint::SET_GPU, Some(app.cfg.ui.gpu_render)),
         (
             "大小单位",
             app.cfg.files.view.size_unit_of().label().to_string(),

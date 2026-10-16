@@ -4906,6 +4906,12 @@ pub const SET_STATUS: u32 = 8;
 pub const SET_FOLLOW: u32 = 9;
 /// "此电脑"节点默认展开（展开后才看得见盘符）
 pub const SET_THISPC: u32 = 10;
+/// 「使用 GPU 渲染」：true = GPU(Direct2D) 路径，false = CPU 多线程 GDI 路径。
+///
+/// 与上面所有 SET_* 一样**只是个动作编号**：绘制与命中测试都只认这个数字，
+/// 谁被点、当前是什么状态都不在这层判断。渲染后端的分流在别处读
+/// `cfg.ui.gpu_render`，这里不关心。
+pub const SET_GPU: u32 = 11;
 
 /// 设置页的一行。绘制与命中测试**共用**这份几何（同一条纪律：两边各写一份常量，
 /// 改一次就错位）。`action == 0` 是分组标题，不可点。

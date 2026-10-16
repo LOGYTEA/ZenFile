@@ -4497,6 +4497,7 @@ impl App {
             Command::SortDescending => self.set_sort_direction(true),
             Command::ToggleSidebar => self.toggle_sidebar(),
             Command::ToggleStatusbar => self.toggle_statusbar(),
+            Command::ToggleGpuRender => self.toggle_gpu_render(),
             Command::ToggleFollowCurrent => self.toggle_follow_current(),
             Command::ToggleThispcExpanded => self.toggle_thispc_expanded(),
             Command::ToggleHidden => self.toggle_hidden(),
@@ -4828,6 +4829,21 @@ impl App {
         let _ = unsafe { InvalidateRect(Some(self.hwnd), None, true) };
     }
 
+    /// 「使用 GPU 渲染」开关（第79轮）。
+    ///
+    /// 本轮**只接线**：翻转字段 → 落到 `cfg.ui.gpu_render` → 写回用户层 →
+    /// 重绘。真正的渲染后端由后续任务读这个字段去分流（true 走 Direct2D，
+    /// false 走现有 CPU 多线程 GDI 路径）。
+    ///
+    /// 关键取舍：**存用户层、不碰覆盖层**，与 `persist_view_pref` 同一套纪律 ——
+    /// 设置页的写入永远是浅 patch，深合并由 `save_user_patch` 负责，
+    /// 所以在这里把字段重复列进去不会吃掉别人写的其它 `ui` 键。
+    pub fn toggle_gpu_render(&mut self) {
+        self.cfg.ui.gpu_render = !self.cfg.ui.gpu_render;
+        self.persist_ui_pref();
+        self.invalidate();
+    }
+
     /// 只把 UI 开关写回 settings.user.json，不覆盖其它字段。
     pub fn persist_ui_pref(&self) {
         if let Err(e) = zenfile_core::config::Config::save_user_patch(&serde_json::json!({
@@ -4836,6 +4852,7 @@ impl App {
                 "statusbar_visible": self.cfg.ui.statusbar_visible,
                 "sidebar_follow_current": self.cfg.ui.sidebar_follow_current,
                 "sidebar_thispc_expanded": self.cfg.ui.sidebar_thispc_expanded,
+                "gpu_render": self.cfg.ui.gpu_render,
             }
         })) {
             eprintln!("保存 UI 偏好失败: {e}");

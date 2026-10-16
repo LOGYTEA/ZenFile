@@ -122,6 +122,8 @@ pub enum Command {
     AutofitAllColumns,
     ToggleSidebar,
     ToggleStatusbar,
+    /// 「使用 GPU 渲染」：切换 GPU(Direct2D) / CPU 多线程 GDI 两条渲染路径
+    ToggleGpuRender,
     /// 导航窗格"跟随展开到当前文件夹"
     ToggleFollowCurrent,
     /// "此电脑"节点是否默认展开到盘符

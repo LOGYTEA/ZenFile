@@ -3827,7 +3827,8 @@ fn sort_key_of_col(id: &str) -> Option<zenfile_core::SortKey> {
 
 fn settings_command(action: u32) -> Option<menu::Command> {
     use paint::{
-        SET_EXT, SET_FOLLOW, SET_HIDDEN, SET_SIDEBAR, SET_STATUS, SET_SYSTEM, SET_THEME,
+        SET_EXT, SET_FOLLOW, SET_GPU, SET_HIDDEN, SET_SIDEBAR, SET_STATUS, SET_SYSTEM,
+        SET_THEME,
         SET_THISPC, SET_UNIT, SET_VIEW,
     };
     match action {
@@ -3841,6 +3842,7 @@ fn settings_command(action: u32) -> Option<menu::Command> {
         SET_FOLLOW => Some(menu::Command::ToggleFollowCurrent),
         SET_THISPC => Some(menu::Command::ToggleThispcExpanded),
         SET_STATUS => Some(menu::Command::ToggleStatusbar),
+        SET_GPU => Some(menu::Command::ToggleGpuRender),
         _ => None,
     }
 }

@@ -37,6 +37,7 @@
     "titlebar_height": 36,
     "sidebar_follow_current": false,
     "sidebar_thispc_expanded": true,
+    "gpu_render": false,
     "tabs": {
       "show_close_button": true,
       "max_tabs": 16,

@@ -60,6 +60,16 @@ pub struct UiConfig {
     pub sidebar_follow_current: bool,
     /// "此电脑"这个节点默认是否展开（展开后才看得到具体盘符）。
     pub sidebar_thispc_expanded: bool,
+    /// 「使用 GPU 渲染」：界面绘制走**哪一条渲染路径**。
+    ///
+    /// * `true`  = GPU 渲染路径（Direct2D 加速，命令/几何走 GPU 光栅化）
+    /// * `false` = CPU 多线程渲染路径（GDI，逐设备上下文绘制）
+    ///
+    /// 默认 `false`：**保持既有行为**，在 GPU 后端就绪之前一个像素都不变。
+    /// 这个字段是渲染后端的**选择器**，本身不实现任何渲染逻辑 ——
+    /// 后端落地时读它分流即可，设置项的接线（存/读/画/命中）本轮已完成。
+    #[serde(default)]
+    pub gpu_render: bool,
     pub tabs: TabsConfig,
     /// 圆角：键 = 圆角项 id（`zenfile_app::settings` 那棵三级树，如 "sidebar.hover"），
     /// 值 = DIP 半径。用 map 而不是二十来个字段 —— 这棵树还会继续长，
