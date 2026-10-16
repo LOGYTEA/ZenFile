@@ -4446,6 +4446,22 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
             .map(|id| format!("{id}\u{1}"))
             .collect::<String>()
             + if show_ext { "E" } else { "" };
+        // 每个非名称列在 `boxes` 里的下标，与 `col_texts` 的**行内下标**严格对齐。
+        //
+        // 循环外算一次就够：`boxes` 是整帧常量，逐行重查只是把 O(4) 的查找
+        // 乘上 57 行 —— 而且每次都新建一个 `Vec`，等于把改动 2 省的分配
+        // 又还回去。
+        //
+        // 为什么不按"`name` 一定在下标 0"直接减 1：`App::visible_cols` 在搜索态
+        // 会把「位置」列插到下标 1，而 `normalize_visible` 又保证 `name` 在最前
+        // —— 今天成立，但那是两个函数**各自的**约定叠出来的结果，不是
+        // `col_boxes` 的契约。哪天其中一条变了，`ci - 1` 会静默取错列
+        // （画面上某一列串了内容），这种 bug 极难从截图看出来。
+        // 按 id 查一次是 O(4)，换掉一个隐含不变量，划算。
+        let other_pos: Vec<usize> = other_cols
+            .iter()
+            .filter_map(|id| boxes.iter().position(|b| b.id == *id))
+            .collect();
         let mut col_texts: Vec<Vec<String>> = Vec::new();
         let unit = app.cfg.files.view.size_unit_of();
         // 第76轮：整窗口的列文本在**进循环之前**一次取好（命中缓存就是零成本）。
@@ -4676,27 +4692,22 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
                 // [x, x+w) 里，DT_END_ELLIPSIS 兜底 —— 少一个就会串列。
                 SetTextColor(hdc, if selected { t.selection_text } else { t.text_dim });
                 let cell = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS;
-                for (ci, b) in boxes.iter().enumerate() {
-                    if b.id == zenfile_core::columns::C_NAME {
+                // 文本从**循环外**一次算好的 `col_texts` 里按**列下标**取
+                //（下标由循环外的 `other_pos` 对齐，不依赖"名称列在第 0 位"
+                // 这个隐含前提，理由见 `other_pos` 的注释）。
+                for oi in 0..other_cols.len() {
+                    let txt = col_texts.get(k).and_then(|row| row.get(oi)).cloned().unwrap_or_default();
+                    // boxes 与 other_cols 同源构造，理论上 `other_pos[oi]` 必在界内；
+                    // 真到了也不能崩，跳过这一列即可。
+                    let Some(b) = other_pos.get(oi).and_then(|i| boxes.get(*i)) else {
                         continue;
-                    }
-                    // 第76轮：文本从**循环外**一次算好的 `col_texts` 里按下标取。
-                    // `other_cols` 是 `boxes` 去掉名称列后的顺序，两者严格对齐。
-                    // `ci` 是 `boxes` 的下标，减 1 换算成 `other_cols` 的下标。
-                    let txt = match ci.checked_sub(1).and_then(|j| col_texts.get(k))
-                    {
-                        Some(row) => row.get(ci - 1).cloned().unwrap_or_default(),
-                        // 理论上不可达（col_texts 与 boxes 同源同长度）；
-                        // 真到了也不能崩，退回空串即可。
-                        None => String::new(),
                     };
-                    let mut cx = b.x;
                     // 搜索态「位置」列靠右对齐更像资源管理器，其余左对齐
-                    let mut fl = cell;
-                    if b.id == zenfile_core::columns::C_SIZE {
-                        fl = DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS;
-                    }
-                    let _ = &mut cx;
+                    let fl = if b.id == zenfile_core::columns::C_SIZE {
+                        DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS
+                    } else {
+                        cell
+                    };
                     draw_text(
                         hdc,
                         &txt,
