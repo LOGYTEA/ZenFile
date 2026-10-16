@@ -2357,25 +2357,63 @@ impl App {
         }
 
         // —— 图标放大（大图标 / 中图标）——
+        //
+        // 第82轮：原来这里每帧 `self.icon_zoom.keys().cloned().collect::<Vec<String>>()`，
+        // 即**每帧为每个正在放大的图标分配一个新 String**（key 是完整路径的小写，
+        // 典型 60~120 字节）。悬停扫过一屏图标时这张表能有几十项，于是动画每
+        // 15ms 就要几十次 malloc + 几十次 free —— 全发生在**绘制路径中间**的
+        // 动画推进里。
+        //
+        // 换成 `retain_mut` + 只读借用遍历：
+        // * `icon_zoom` 里已收敛的项（`tgt<=0`）直接在原表上删掉，
+        // * 仍在动的项就地改值，
+        // * `icon_zoom_tgt` 里那些**还没进** `icon_zoom` 的 key 才需要新建
+        //   一个 entry —— 这是动画"起步"时的必要开销，一帧最多一次，
+        //   不再是"每帧每项都重建"。
+        //
+        // 结果逐值等价：改的都是同一张 `icon_zoom` 表、同一批 key、
+        // 同一个缓动系数，只是没有中间的临时 `Vec` 和它的克隆。
         if !self.icon_zoom.is_empty() || !self.icon_zoom_tgt.is_empty() {
-            let mut keys: Vec<String> = self.icon_zoom.keys().cloned().collect();
-            for k in self.icon_zoom_tgt.keys() {
-                if !self.icon_zoom.contains_key(k) {
-                    keys.push(k.clone());
-                }
-            }
             let f = Self::anim_ease(0.28, dt);
-            for k in keys {
-                let cur = self.icon_zoom.get(&k).copied().unwrap_or(0.0);
-                let tgt = self.icon_zoom_tgt.get(&k).copied().unwrap_or(0.0);
-                if (cur - tgt).abs() <= 0.002 {
+            // 用 `retain`（**不是** `retain_mut`）：`HashMap::retain_mut`
+            // 到本项目这个 rustc 上还没稳定，而 `retain` 的闭包签名是
+            // `FnMut(&K, &mut V) -> bool` —— 值本来就是 `&mut`，要的能力
+            // 它一样给。
+            self.icon_zoom.retain(|k, cur| {
+                let tgt = self.icon_zoom_tgt.get(k).copied().unwrap_or(0.0);
+                if (*cur - tgt).abs() <= 0.002 {
                     if tgt <= 0.0 {
-                        self.icon_zoom.remove(&k);
-                    } else {
-                        self.icon_zoom.insert(k, tgt);
+                        // 收敛到 0 = 缩回原尺寸：**删掉这条**。删掉后
+                        // `icon_draw_size` 读不到 key 就用 base，
+                        // 与原代码 `self.icon_zoom.remove(&k)` 同一条路径。
+                        return false;
                     }
-                } else {
-                    self.icon_zoom.insert(k, cur + (tgt - cur) * f);
+                    *cur = tgt;
+                    return true;
+                }
+                *cur += (tgt - *cur) * f;
+                dirty = true;
+                true
+            });
+            // 起步：目标表里有、`icon_zoom` 里还没有的 key。
+            // 借不到 `&mut self.icon_zoom` 同时读 `self.icon_zoom_tgt`，
+            // 所以先把要新增的 key **借用着**收集出来（`&String` 不分配），
+            // 再逐个 insert。`Vec<&String>` 只是指针数组，仍然是一次分配，
+            // 但省掉了 N 次 String 克隆 —— 而 N 正是这里的大头。
+            //
+            // 初值必须是 `tgt * f` 而不是 `0.0`：原实现里新 key 的
+            // `cur = unwrap_or(0.0)`，同一个分支里就算出了 `0 + (tgt-0)*f`。
+            // 插 0.0 会让悬停的第一帧停在原尺寸上，比原来晚一帧才起跳 ——
+            // 那正是"图标动画慢了半拍"的观感，不能引入。
+            if !self.icon_zoom_tgt.is_empty() {
+                let fresh: Vec<(&String, f32)> = self
+                    .icon_zoom_tgt
+                    .iter()
+                    .filter(|(k, _)| !self.icon_zoom.contains_key(*k))
+                    .map(|(k, tgt)| (k, tgt * f))
+                    .collect();
+                for (k, v) in fresh {
+                    self.icon_zoom.insert(k.clone(), v);
                     dirty = true;
                 }
             }

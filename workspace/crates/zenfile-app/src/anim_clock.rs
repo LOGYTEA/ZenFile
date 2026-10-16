@@ -177,11 +177,28 @@ impl AnimClock {
             None => return,
         };
         slot.running.store(false, Ordering::SeqCst);
-        slot.thread.store(0, Ordering::SeqCst);
-        // 不强制 `WaitForSingleObject`：窗口正在销毁时等一个还在
-        // `PostMessage` 的线程反而可能死锁（它 post 到已销毁的 hwnd，
-        // 消息进黑洞，线程再睡一拍才醒）。线程下一拍看到 `running`
-        // 为 false 就退出并自行 `from_raw`。
+        // **必须把线程句柄 CloseHandle 掉**（第82轮修的泄漏）。
+        //
+        // 动画时钟是"按需起停"的：一路悬停过去 → `sync_anim_timer` 反复
+        // start/stop，每一段动画建一个线程。而 `CreateThread` 返回的
+        // `HANDLE` 在**本进程里不作废、也不随线程退出自动释放** —— 线程
+        // 结束后它只是一块没人引用的内核对象，直到进程退出才回收。
+        // 原实现 `thread.store(0)` 只是把数字抹掉，句柄照样每段动画漏一个。
+        // 悬停扫过几百个文件 = 几百个泄漏句柄，而 GDI/USER 句柄是有
+        // 进程上限的，泄漏到顶会让 `CreateThread` 直接失败、动画彻底不动。
+        //
+        // `CloseHandle` **不会**杀掉线程（那得 `TerminateThread`，更不能
+        // 用），只是丢掉我们这一份引用；线程自己下一拍看到 `running` 为
+        // false 就退出。
+        //
+        // 这里刻意**不** `WaitForSingleObject`：`stop()` 会在动画自然结束
+        // 时被主线程调用（`sync_anim_timer` → paint 路径中间），等一个最
+        // 多睡 100ms 的线程等于在绘制过程中插进一个可见的停顿。等线程
+        // 收尾交给它自己（下面 `anim_thread` 退出时关自己的 timer）。
+        let tid = slot.thread.swap(0, Ordering::SeqCst);
+        if tid != 0 {
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(HANDLE(tid as *mut std::ffi::c_void)) };
+        }
         slot.inflight.store(0, Ordering::SeqCst);
         drop(slot);
     }
@@ -296,6 +313,32 @@ unsafe extern "system" fn anim_thread(param: *mut std::ffi::c_void) -> u32 {
             let _ = WaitForSingleObject(HANDLE(std::ptr::null_mut()), FRAME_MS);
         }
     }
+
+    // 线程要退出了（第82轮补的两处清理）：
+    //
+    // 1. `stop()` 只把 `running` 置 false 就撒手，线程最多还要活 100ms
+    //    （它在 `WaitForSingleObject` 上睡着）。窗口销毁那一刻 `App` 已经
+    //    没了，这个线程仍会醒来一次、把 `Box<SlotParam>` 析构掉 —— 那是
+    //    正常路径。**但**如果 `stop()` 因为 `CreateThread` 之后的某个原因
+    //    没跑到（比如未来某条路径忘了调），这个线程就会永远每 15ms post
+    //    一个没人收的消息。这里不重复判断 `running`：线程函数体本身就是
+    //    `while running`，退出到这里说明已经退出了，再判一次是冗余的。
+    //
+    // 2. **timer 句柄必须关**。`CreateWaitableTimerExW` 是真实内核对象，
+    //    每段动画建一个 → `stop()` 又从不碰它。悬停扫过几百个文件就是
+    //    几百个泄漏的 waitable timer，和上面线程句柄是同一类泄漏。
+    //    这是本函数**唯一**能拿到 `timer` 的地方，所以只能在这里关。
+    if let Some(t) = timer {
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(t) };
+    }
+    // 顺手把自己的线程句柄也释放掉：`CreateThread` 给的 HANDLE 不随
+    // 线程退出自动释放。这里是**唯一**知道句柄的地方（`stop()` 若先跑，
+    // 已经 swap 走过 0，那这个 swap 就返回 0，正好不重复关）。
+    let tid = slot.thread.swap(0, Ordering::SeqCst);
+    if tid != 0 {
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(HANDLE(tid as *mut std::ffi::c_void)) };
+    }
+
     // `p` 是普通 `Box<SlotParam>`，离开作用域自动释放 —— 线程结束时
     // 顺带把这个 `Box` 和它里面的 `Arc` 引用一起还掉，不多不少一次。
     0
@@ -333,10 +376,16 @@ pub fn bench_self() -> (usize, u64, u64, u64) {
             None,
         )
     };
-    if tid.is_err() {
-        return (0, 0, 0, 0);
-    }
-    std::thread::sleep(std::time::Duration::from_millis(600));
+    let tid = match tid {
+        Ok(t) => t,
+        Err(_) => return (0, 0, 0, 0),
+    };
+    // 测量线程只跑 500ms，这里等它自己收尾（第82轮）：原来直接 sleep 600ms
+    // 就走人，`tid` 这个 HANDLE 从此再没人关 —— 自检工具自己也在漏句柄。
+    // 等它结束是安全的：它不 post 任何消息、不碰任何 `ClockSlot`。
+    // 线程 500ms 后自己退出，所以这里**替代**了原来的 `sleep(600)`。
+    let _ = unsafe { windows::Win32::System::Threading::WaitForSingleObject(tid, 2000) };
+    let _ = unsafe { windows::Win32::Foundation::CloseHandle(tid) };
     let v = MEASURE_POSTS.lock().unwrap().clone();
     MEASURE_POSTS.lock().unwrap().clear();
     let mut d: Vec<u64> = v.windows(2).map(|w| w[1] - w[0]).filter(|x| *x > 0).collect();
