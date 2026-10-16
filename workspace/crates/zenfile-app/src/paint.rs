@@ -6,8 +6,9 @@
 use windows::core::HSTRING;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CombineRgn, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
-    CreateRectRgn, CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse,
+    BitBlt, CombineRgn, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, CreateFontW,
+    CreatePen, CreateRectRgn, CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject,
+    DrawTextW, Ellipse,
     FillRect, FillRgn, GetDC,
     GetTextExtentPoint32W, GetTextMetricsW, IntersectClipRect, InvalidateRect, LineTo, MoveToEx,
     PS_SOLID, Rectangle,
@@ -18,7 +19,7 @@ use windows::Win32::Graphics::Gdi::{
     FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FONT_QUALITY, GetStockObject, HBITMAP,
     HDC, HGDIOBJ, HFONT, NULL_BRUSH, NULL_PEN, Polygon, SetBkColor, SRCCOPY, OPAQUE, TRANSPARENT,
     RGN_AND,
-    BLACK_PEN, SYSTEM_FONT, WHITE_BRUSH,
+    BLACK_PEN, SYSTEM_FONT, WHITE_BRUSH, BITMAPINFO, BI_RGB, DIB_RGB_COLORS,
 };
 use windows::Win32::Foundation::POINT;
 use windows::Win32::System::SystemInformation::GetTickCount64;
@@ -693,7 +694,9 @@ pub fn grid_content_h(g: &IconGrid, count: usize) -> i32 {
 ///
 /// * `dc` —— 内存 DC，**整个窗口生命周期内一直存在**，每帧 `SelectObject`
 ///   换一张位图进去，画完换回 `old_bmp`。
-/// * `bmp` —— 当前这张全窗口 DDB；`w` / `h` 记着它是按什么尺寸建的。
+/// * `bmp` —— 当前这张全窗口位图；`w` / `h` 记着它是按什么尺寸建的。
+///   第80轮起它是**DIB section**（`CreateDIBSection`，32bpp BGRA、top-down），
+///   不再是设备相关的 DDB —— 见下面 `bits` 字段的说明。
 /// * `old_bmp` —— `dc` 上"换走 `bmp` 之前选中的那个 GDI 对象"（建 DC 时系统
 ///   给的 1x1 单色库存位图）。画完一帧把它换回去，好让 `bmp` 处于"未被选中"
 ///   的状态 —— 删一个正被选中的 GDI 对象是不允许的，而销毁走的正是这条路。
@@ -704,7 +707,7 @@ pub fn grid_content_h(g: &IconGrid, count: usize) -> i32 {
 pub struct BackSurface {
     /// 内存 DC。空 = 还没建。
     pub dc: HDC,
-    /// 当前选在这张 DC 上的离屏位图。
+    /// 当前选在这张 DC 上的离屏位图（DIB section）。
     pub bmp: HBITMAP,
     /// 换走 `bmp` 之前 DC 上选中的对象（建 DC 时是库存 1x1 单色位图）。
     pub old_bmp: HGDIOBJ,
@@ -712,6 +715,14 @@ pub struct BackSurface {
     pub w: i32,
     /// `bmp` 的高度（像素）。
     pub h: i32,
+    /// 第80轮：`CreateDIBSection` 交回来的**像素首地址**（DIB 的位图数据就在
+    /// 这里，不在 GDI 内部）。空 = 这不是一张 DIB section，或者还没建。
+    ///
+    /// **本轮没有任何代码读它** —— 它是给后续把重采样/合成搬去 GPU 时留的
+    /// 地基（D2D 的 `ID2D1Bitmap` 可以直接包这块内存，或用
+    /// `ID2D1DeviceContext::CreateBitmap` 从这块像素初始化）。留着这个字段
+    /// 意味着换位图类型这件事**只做一次**，后续接 D2D 不必再回头换地基。
+    pub bits: *mut core::ffi::c_void,
 }
 
 impl Default for BackSurface {
@@ -722,6 +733,7 @@ impl Default for BackSurface {
             old_bmp: HGDIOBJ(std::ptr::null_mut()),
             w: 0,
             h: 0,
+            bits: core::ptr::null_mut(),
         }
     }
 }
@@ -752,6 +764,10 @@ impl BackSurface {
             }
             let _ = DeleteDC(self.dc);
         }
+        // 第80轮：`bits` 是 DIB section 的**像素内存**，不是独立的分配 ——
+        // `DeleteObject` 释放 `bmp` 时连带把它一起回收了，这里**不需要**
+        // （也不能）单独 `free`。`bits` 字段本身由下面这行 `Default::default()`
+        // 清成空指针，于是销毁后不留野指针。
         *self = Self::default();
     }
 }
@@ -781,7 +797,8 @@ fn surf_debug() -> bool {
 /// * 尺寸变了 → 先把旧图按"先销毁再建"处理，再按新尺寸建；
 /// * 宽或高为 0（最小化时 `GetClientRect` 就是 0x0）→ **建都不建**，返回
 ///   `None` 让 `paint()` 整帧跳过。`CreateCompatibleBitmap(0, h)` 会失败，
-///   拿到的 `HBITMAP` 是空句柄，往 DC 里一选整窗就再也没法画东西了。
+///   拿到的 `HBITMAP` 是空句柄，往 DC 里一选整窗就再也没法画东西了
+///   （第80轮换成 DIB section 后同样是空句柄，处理不变）。
 ///
 /// 副作用：`app.back_surface` 被就地改成这一帧该用的那一张（新建或复用）。
 fn acquire_back_surface(
@@ -805,15 +822,23 @@ fn acquire_back_surface(
         unsafe {
             let dc = CreateCompatibleDC(Some(hdc));
             if !dc.is_invalid() {
-                let bmp = CreateCompatibleBitmap(hdc, width, height);
-                if bmp.is_invalid() {
-                    // 位图没建出来就把 DC 一起收掉，绝不留下"有 DC 没位图"的
-                    // 半截状态（否则这里就漏一个 DC）。
-                    let _ = DeleteDC(dc);
-                } else {
-                    let old_bmp = SelectObject(dc, bmp.into());
-                    app.back_surface =
-                        BackSurface { dc, bmp, old_bmp, w: width, h: height };
+                match create_back_bitmap(dc, width, height) {
+                    Some((bmp, bits)) => {
+                        let old_bmp = SelectObject(dc, bmp.into());
+                        app.back_surface = BackSurface {
+                            dc,
+                            bmp,
+                            old_bmp,
+                            w: width,
+                            h: height,
+                            bits,
+                        };
+                    }
+                    None => {
+                        // 位图没建出来就把 DC 一起收掉，绝不留下"有 DC 没位图"的
+                        // 半截状态（否则这里就漏一个 DC）。
+                        let _ = DeleteDC(dc);
+                    }
                 }
             }
         }
@@ -847,6 +872,67 @@ fn acquire_back_surface(
         reset_surface_dc(dc);
     }
     Some(dc)
+}
+
+/// 第80轮：建一张**DIB section** 当作全窗口离屏位图的像素后备。
+///
+/// 取代 `CreateCompatibleBitmap`（设备相关位图，DDB）。换掉的理由有两条，
+/// 都是为了后续接 Direct2D 打地基，本轮**不使用**任何一条来改渲染行为：
+///
+/// 1. **能拿到像素指针。** DDB 的像素在 GDI 内部，外部拿不到；DIB section
+///    的像素是一块普通的内存，`CreateDIBSection` 直接把首地址交给我们。
+///    后续 CPU 侧的重采样（上采样预览框、缩略图解码后的缩放）就能改成
+///    "读这块内存 → 上传 GPU"，而不是像现在这样让 GDI 逐像素搬。
+/// 2. **格式固定。** DDB 的实际格式由 DC 所属设备的调色板/位深决定，
+///    同一份绘制代码换台机器可能落在 1/4/8/16/24/32 bpp 上；DIB section
+///    由我们自己指定，这里锁死 **32bpp BGRA**，与 D2D 常用的
+///    `DXGI_FORMAT_B8G8R8A8_UNORM` 一一对应，不用来回转换。
+///
+/// ### 为什么 `biHeight` 取负
+///
+/// `biHeight = -height` 表示 **top-down**：内存里第一行就是画面最上面一行。
+/// DDB 的扫描方向由驱动决定，GDI 的 `SetPixel`/文本绘制都是"按逻辑方向"
+/// 做的，调用方察觉不到差别；但后续要**按像素直接读这块内存**（重采样、
+/// 交给 D2D 包装成 `ID2D1Bitmap`），top-down 才是内存布局与视觉顺序一致的
+/// 那一种 —— 否则每读一行都要做一次纵向翻转。负值在 `BITMAPINFOHEADER`
+/// 里是合法且被 GDI 全面支持的写法。
+///
+/// 返回 `(HBITMAP, 像素首地址)`；建失败返回 `None`（`HBITMAP` 为空句柄时
+/// 往 DC 里一选，整窗就再也没法画东西了 —— 调用方必须像对待
+/// `CreateCompatibleBitmap` 失败一样把 DC 一起收掉）。
+///
+/// `unsafe`：内部调 GDI，且返回的像素指针在对应 `HBITMAP` 被
+/// `DeleteObject` 之前一直有效。
+fn create_back_bitmap(dc: HDC, width: i32, height: i32) -> Option<(HBITMAP, *mut core::ffi::c_void)> {
+    let mut bits: *mut core::ffi::c_void = core::ptr::null_mut();
+    let bmi = BITMAPINFO {
+        bmiHeader: windows::Win32::Graphics::Gdi::BITMAPINFOHEADER {
+            biSize: core::mem::size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height, // 负值 = top-down，见函数文档
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            biSizeImage: 0, // 让 GDI 自己算（BI_RGB 下本来就填 0）
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
+        },
+        // 32bpp 无调色板；留一个全 0 的占位槽只是为了满足结构体本身。
+        bmiColors: [windows::Win32::Graphics::Gdi::RGBQUAD {
+            rgbBlue: 0,
+            rgbGreen: 0,
+            rgbRed: 0,
+            rgbReserved: 0,
+        }],
+    };
+    // `DIB_RGB_COLORS` + `hsection = None` + `offset = 0`：不挂文件映射节，
+    // 由 GDI 在进程堆上分配位图数据（`DeleteObject` 时一并释放）。
+    match unsafe { CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) } {
+        Ok(bmp) if !bmp.is_invalid() => Some((bmp, bits)),
+        _ => None,
+    }
 }
 
 /// 第74轮：把这一帧留在缓存 DC 上的位图摘下来（画完、`BitBlt` 之后调用）。
