@@ -1544,6 +1544,47 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 let ctrl_now = (wparam.0 & 0x0008) != 0 || GetKeyState(0x11) < 0;
                 let was_active = app.drag.as_ref().map(|d| d.active).unwrap_or(false);
                 app.update_drag(x, y, ctrl_now);
+                // 第78轮：光标真的移出了客户区 —— 这次要的是"把文件拖给别的
+                // 程序"，不是"在窗口内换个文件夹"。
+                //
+                // 判据必须是"移出客户区"，不能是"drag.active 一置位就拖出"：
+                // 用户把文件拖到窗口内另一个文件夹/标签/侧栏，那一路必须继续
+                // 走原来 `finish_drag` 的落地逻辑。只有光标真的离开了这个窗口，
+                // 才轮到 OLE 出场。
+                let kick_out = match app.drag.as_ref() {
+                    Some(d) => d.kind == app::DragKind::Items && d.active && outside_client(hwnd, x, y),
+                    None => false,
+                };
+                if kick_out {
+                    let Some(d) = app.drag.as_ref() else {
+                        return LRESULT(0);
+                    };
+                    let items = d.items.clone();
+                    let copy = d.copy;
+                    // 父目录按**第一个被拖项**算，而不是当前标签的路径：
+                    // `SHCreateDataObject` 要求整批子项同父，而回收站、
+                    // 搜索结果这类标签里"当前目录"未必是它们的父目录。
+                    let parent = items
+                        .first()
+                        .and_then(|p| p.parent())
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| app.tab().path.clone());
+                    // 状态必须在 `drag_out` **之前**清干净：`DoDragDrop`
+                    // 是模态的，它自己泵消息 —— 期间本函数会被重入，
+                    // 那时若 `app.drag` 还在，就会递归着再拖一次出去。
+                    // 高亮残影（dock / drop_target / 标签悬停计时）同理。
+                    app.drag.take();
+                    app.drag_dock = None;
+                    app.drop_target = None;
+                    app.tab_hover_since = None;
+                    // 捕获也要放：窗口还握着鼠标捕获的话，拖影与按键状态
+                    // 全落在我们这里，OLE 拿不到干净的鼠标流。
+                    let _ = ReleaseCapture();
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                    // 模态：这一行要等拖拽结束（投放 / Esc 取消 / 出错）才返回。
+                    dnd::drag_out(hwnd, &parent, &items, copy);
+                    return LRESULT(0);
+                }
                 // 框选要**边拖边更新选中集**：不更新用户拖到哪条都没反应，
                 // 松开才一次性全亮（资源管理器是每帧都更新）。只对 Marquee
                 // 调 select_marquee（Items 拖的是条目，不该改选中）。
@@ -3130,6 +3171,20 @@ fn end_tab_drag(app: &mut App, hwnd: HWND) {
     unsafe {
         let _ = InvalidateRect(Some(hwnd), None, true);
     }
+}
+
+/// 客户区坐标 `(x, y)` 是否已经在客户区**外面**。
+///
+/// 第78轮：这是"内部拖拽" 与 "拖出去给别的程序" 的分界线。客户区的宽高必须
+/// 现场 `GetClientRect` 拿 —— 窗口是可以随便改尺寸的，拿 `App::last_size`
+/// 那种缓存会在改完尺寸的那一刻算错（把"拖出去"判成"窗口内落地"，
+/// 或者反过来，一拖就莫名其妙地弹进 OLE 的模态循环）。
+fn outside_client(hwnd: HWND, x: i32, y: i32) -> bool {
+    let mut r = RECT::default();
+    if unsafe { GetClientRect(hwnd, &mut r) }.is_err() {
+        return false;
+    }
+    x < r.left || x >= r.right || y < r.top || y >= r.bottom
 }
 
 fn drop_target_at(app: &mut App, l: &paint::Layout, x: i32, y: i32) -> Option<app::DropTarget> {
