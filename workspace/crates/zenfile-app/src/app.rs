@@ -6002,10 +6002,30 @@ fn parse_sort(s: &str) -> SortKey {
 }
 
 /// COM 守卫在 App 创建前调用，保证 STA 语义（§2 / §7.1）。
+///
+/// 这里用 `OleInitialize` 而不是 `ComGuard::init()`（`CoInitializeEx` STA）：
+/// **OLE 拖放要求 OLE 自己那一份初始化**。`OleInitialize` 内部会先做
+/// `CoInitializeEx(COINIT_APARTMENTTHREADED)`，再初始化 OLE —— 其中包括拖放
+/// 要用到的那个隐藏窗口。只 `CoInitializeEx` 的话，`DoDragDrop` 会返回
+/// `E_INVALIDARG`/`E_OUTOFMEMORY` 之类，拖出去时松手什么都不会发生。
+///
+/// `ComGuard` 本身不改：它给 worker 线程用（后台复制/移动只做文件操作，
+/// 不需要 OLE，多初始化一份反而拖慢线程启动）。
 pub fn init_com() {
-    let _guard = ComGuard::init();
-    // 刻意泄漏：COM 必须保持初始化到进程结束。
-    std::mem::forget(_guard);
+    // windows-rs 的 `OleInitialize` 已经把 HRESULT 折成了 `Result`：`S_FALSE`
+    // （"本线程已经初始化过了"）在这里是 `Ok`，不用再单独判。
+    //
+    // 刻意泄漏：COM/OLE 必须保持初始化到进程结束，不调 `OleUninitialize`。
+    let r = unsafe { windows::Win32::System::Ole::OleInitialize(None) };
+    if let Err(e) = r {
+        // `RPC_E_CHANGED_MODE` (0x80010106) = 本线程已经以别的模式初始化过
+        // COM。那也是"COM 可用"，只是 OLE 那一层没起来，同样不算致命。
+        if e.code() != windows::core::HRESULT(0x80010106u32 as i32) {
+            // 真正的失败（内存不足等）也**不能**让程序起不来：OLE 起不来只是
+            // Shell 上下文菜单/拖放不可用，文件列表照样要能看。
+            eprintln!("[zenfile] OleInitialize 失败: {e}（Shell 集成与拖放将不可用）");
+        }
+    }
 }
 
 // --------------------------------------------------------------------
