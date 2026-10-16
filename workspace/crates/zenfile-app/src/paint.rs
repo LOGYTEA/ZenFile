@@ -3723,6 +3723,130 @@ fn cur_path_cached(path: &std::path::Path) -> std::path::PathBuf {
     resolved
 }
 
+// ================================================ 第76轮：Details 非名称列文本缓存
+
+/// 列文本缓存的 key。**每一个影响文本的输入都必须在这里**，漏一个就是
+/// "改了设置但画面不变"。
+///
+/// - `dir`：文本来自 `entry`，换目录必然换 key。
+/// - `from..to`：可见窗口。滚动一格就变。
+/// - `cols_sig`：可见列定义（`other_cols` 拼的串 + `show_ext` 标记）。
+///   增删列 / 开关扩展名都会改它。
+/// - `data_fp`：**可见条目自身的数据指纹**（见 [`data_fingerprint`]）。
+///   这是最关键的一项：改排序 / 改筛选 / 重新枚举之后，`visible` 里的
+///   下标会重排、条目内容会换，而这些**未必**改变 `dir` 与窗口。
+#[derive(PartialEq, Eq, Hash, Clone)]
+struct ColTextKey {
+    dir: String,
+    from: usize,
+    to: usize,
+    cols_sig: String,
+    data_fp: u64,
+}
+
+/// 可见窗口内**条目数据本身**的指纹（FNV-1a 64 滚动）。
+///
+/// 拌进去的量 = 下标 + `kind` + 路径 + `size` —— 恰好是四类列文本的**全部**
+/// 输入：`type_label` 看 `kind` 与 `extension`（都在路径里）、`C_PATH` 看
+/// `path.parent()`、大小列看 `size`、其余列走 `cell()` 而它内部本来也按
+/// `(列, 路径)` 自己缓存。
+///
+/// 为什么不用"版本号/世代号"而要真的算指纹：
+///   * 用 `Tab::generation` 只能覆盖"重新枚举"，**覆盖不了改排序/改筛选**
+///     （那两者只重排 `visible`，不重新枚举）—— 画面上就是"排序点了没反应"。
+///   * 而指纹是直接判"喂进去的数据变没变"，漏判面最小。
+///
+/// 代价：57 行 × 几次整数/指针运算，约 1~2µs，与它省掉的 171 次 `format!`
+/// 分配相比可以忽略。
+fn data_fingerprint(visible: &[usize], entries: &[zenfile_core::FileEntry], from: usize, to: usize) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |v: u64| {
+        h ^= v;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    };
+    mix((to.saturating_sub(from)) as u64);
+    for &i in visible.iter().take(to).skip(from) {
+        mix(i as u64);
+        let Some(e) = entries.get(i) else {
+            mix(u64::MAX);
+            continue;
+        };
+        // `kind` 的判别值（Directory/File/ReparsePoint）。
+        mix(match e.kind {
+            zenfile_core::FileKind::Directory => 0,
+            zenfile_core::FileKind::File => 1,
+            zenfile_core::FileKind::ReparsePoint => 2,
+        });
+        for b in e.path.as_os_str().to_string_lossy().as_bytes() {
+            mix(*b as u64);
+        }
+        mix(0xff);
+        mix(e.size);
+    }
+    h
+}
+
+/// 列文本缓存本体。
+///
+/// **TTL 5 秒 + 容量 4096 组**：一组 = 一次 `(窗口, 列定义)` 下所有可见行的
+/// 全部非名称列文本。滚动时窗口每帧都在动，理论上不该有跨帧命中 —— 但
+/// "静止不动时反复重绘"（hover、动画尾巴、窗口微调）才是常态，那才是收益来源。
+/// TTL 是**兜底**：正常路径靠 key 精确失效，TTL 只防止极端情况下堆积。
+static COL_TEXT_CACHE: crate::paint_cache::LazyCache<ColTextKey, Vec<Vec<String>>> =
+    crate::paint_cache::LazyCache::new(std::time::Duration::from_secs(5), 4096);
+
+/// 取这一窗口的列文本；命中不了就现算一遍并写入。
+///
+/// `epoch` 由调用方给（`app` 里维护的自增计数器：重新枚举 / 读配置后 +1）。
+fn col_texts_for(
+    app: &App,
+    key: ColTextKey,
+    boxes: &[ColBox],
+    other_cols: &[&'static str],
+    visible: &[usize],
+    from: usize,
+    to: usize,
+) -> Vec<Vec<String>> {
+    if let Some(hit) = COL_TEXT_CACHE.get(&key) {
+        return hit;
+    }
+    let show_ext = app.cfg.files.view.show_extensions;
+    let unit = app.cfg.files.view.size_unit_of();
+    let entries = &app.tab().entries;
+    let mut out: Vec<Vec<String>> = Vec::with_capacity(to.saturating_sub(from));
+    for i in from..to {
+        let Some(entry) = visible.get(i).and_then(|&ix| entries.get(ix)) else {
+            out.push(other_cols.iter().map(|_| String::new()).collect());
+            continue;
+        };
+        let row: Vec<String> = other_cols
+            .iter()
+            .map(|id| match *id {
+                zenfile_core::columns::C_TYPE => entry.type_label(),
+                zenfile_core::columns::C_PATH => entry
+                    .path
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                // 大小列：目录恒画 `—`，文件用格式化后的值（与原口径一致）。
+                zenfile_core::columns::C_SIZE => {
+                    if entry.is_dir() {
+                        "—".to_string()
+                    } else {
+                        crate::app::human_unit(entry.size, unit)
+                    }
+                }
+                _ => match zenfile_core::columns::cell(id, entry, show_ext) {
+                    Some(s) => s,
+                    None => "—".to_string(),
+                },
+            })
+            .collect();
+        out.push(row);
+    }
+    COL_TEXT_CACHE.insert(key, out.clone());
+    out
+}
 
 // ---------------------------------------------------------------- 首页平铺布局
 
@@ -4294,8 +4418,55 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
         // 看上去只是"图标旧了"而不是"这个目录是临时的"。
         let mut dim_text: Vec<bool> = Vec::with_capacity(n);
         let mut size_texts: Vec<String> = Vec::with_capacity(n);
+        // 第76轮：其余可见列（类型/位置/所有者/版本…）的**纯文本**。
+        //
+        // 原来这些文本是在**行循环里**（paint 另一处 `match b.id`）现算的：
+        // Details 模式 57 行 × 3 个非名列 = **每帧 171 次 `format!` 分配**，
+        // 全是与帧无关的纯格式化。搬到这里一次算完，行循环里只按下标取。
+        //
+        // 为什么这里安全（借用不冲突）：本循环体已经"独占借用 app"去做
+        // icons / display_name，所以**在同一个循环里**顺手多算几列纯文本
+        // 不增加任何借用负担。取 `tab.entries` 的只读引用在这个位置也合法
+        // （紧随其后的 `app.icons.*` 调用同样已经是这个模式）。
+        //
+        // key 用 `col_boxes` 已产出的可见列定义（`boxes`），所以
+        // "增删列 / 改列可见性"会自动换 key；`show_ext`（影响 `cell()` 的输出）
+        // 也进了判断。
+        let details_mode = mode == zenfile_core::ViewMode::Details;
         let show_ext = app.cfg.files.view.show_extensions;
+        // 非名称列的 id 清单（`boxes` 去掉名称列，与取值时的下标严格对齐）。
+        let other_cols: Vec<&'static str> = boxes
+            .iter()
+            .filter(|b| b.id != zenfile_core::columns::C_NAME)
+            .map(|b| b.id)
+            .collect();
+        // 列定义变了就得重算：把 (id, show_ext) 拼成一个可比对的串。
+        let cols_sig = other_cols
+            .iter()
+            .map(|id| format!("{id}\u{1}"))
+            .collect::<String>()
+            + if show_ext { "E" } else { "" };
+        let mut col_texts: Vec<Vec<String>> = Vec::new();
         let unit = app.cfg.files.view.size_unit_of();
+        // 第76轮：整窗口的列文本在**进循环之前**一次取好（命中缓存就是零成本）。
+        // key 覆盖了全部影响文本的输入，见 `ColTextKey` 的注释。
+        if details_mode {
+            col_texts = col_texts_for(
+                app,
+                ColTextKey {
+                    dir: app.tab().path.as_os_str().to_string_lossy().into_owned(),
+                    from,
+                    to,
+                    cols_sig: cols_sig.clone(),
+                    data_fp: data_fingerprint(&visible, &app.tab().entries, from, to),
+                },
+                &boxes,
+                &other_cols,
+                &visible,
+                from,
+                to,
+            );
+        }
         for i in from..to {
             let index = visible[i];
             // 先把这一项拷成自有数据：下面 icons / display_name 都要独占借用 app，
@@ -4505,30 +4676,19 @@ fn paint_view(app: &mut App, hdc: HDC, l: &Layout) {
                 // [x, x+w) 里，DT_END_ELLIPSIS 兜底 —— 少一个就会串列。
                 SetTextColor(hdc, if selected { t.selection_text } else { t.text_dim });
                 let cell = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS;
-                let show_ext = app.cfg.files.view.show_extensions;
-                for b in &boxes {
+                for (ci, b) in boxes.iter().enumerate() {
                     if b.id == zenfile_core::columns::C_NAME {
                         continue;
                     }
-                    let txt = match b.id {
-                        // 大小列：目录恒空（画 `—`），文件用格式化后的值
-                        zenfile_core::columns::C_SIZE => {
-                            if entry.is_dir() {
-                                "—".to_string()
-                            } else {
-                                size_texts.get(k).cloned().unwrap_or_default()
-                            }
-                        }
-                        zenfile_core::columns::C_TYPE => entry.type_label(),
-                        zenfile_core::columns::C_PATH => entry
-                            .path
-                            .parent()
-                            .map(|p| p.to_string_lossy().to_string())
-                            .unwrap_or_default(),
-                        _ => match zenfile_core::columns::cell(b.id, entry, show_ext) {
-                            Some(s) => s,
-                            None => "—".to_string(),
-                        },
+                    // 第76轮：文本从**循环外**一次算好的 `col_texts` 里按下标取。
+                    // `other_cols` 是 `boxes` 去掉名称列后的顺序，两者严格对齐。
+                    // `ci` 是 `boxes` 的下标，减 1 换算成 `other_cols` 的下标。
+                    let txt = match ci.checked_sub(1).and_then(|j| col_texts.get(k))
+                    {
+                        Some(row) => row.get(ci - 1).cloned().unwrap_or_default(),
+                        // 理论上不可达（col_texts 与 boxes 同源同长度）；
+                        // 真到了也不能崩，退回空串即可。
+                        None => String::new(),
                     };
                     let mut cx = b.x;
                     // 搜索态「位置」列靠右对齐更像资源管理器，其余左对齐
