@@ -12,6 +12,7 @@
 mod app;
 mod appfind;
 mod coldlg;
+mod dnd;
 mod fmtprev;
 mod icon_theme;
 mod anim_clock;

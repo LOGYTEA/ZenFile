@@ -15,10 +15,19 @@ zenfile-core = { path = "crates/zenfile-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# 第78轮 OLE 拖放：`#[windows_core::implement(IDropSource / IDropTarget)]` 这个
+# 属性宏展开出来的代码里写的是 `windows_core::` 绝对路径，所以 `windows-core`
+# 必须是一个**直接**依赖，光靠 `windows::core` 这个再导出不够。
+# 版本与上面的 `windows` 保持一致（cargo 会把它们并成同一个实例）。
+windows-core = "0.62"
+
 # 全部 Windows 能力集中在此声明，避免各 crate 重复 feature。
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Com",
+    # 第78轮 OLE 拖放：`CF_HDROP` 的 `STGMEDIUM` 与 `ReleaseStgMedium` 都在这
+    # 个子 feature 后面（windows-rs 把它们和 StructuredStorage 绑在一起）。
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_Ole",
     "Win32_System_DataExchange",
     "Win32_System_Threading",
@@ -32,6 +41,9 @@ windows = { version = "0.62", features = [
     "Win32_System_Console",
     "Win32_System_TaskScheduler",
     "Win32_System_SystemInformation",
+    # 第78轮 OLE 拖放：`IDropSource` / `IDropTarget` 两个 COM 接口的回调签名里
+    # 按键状态是 `MODIFIERKEYS_FLAGS`，它就在 SystemServices 里。
+    "Win32_System_SystemServices",
     # 第69轮帧链路埋点：QueryPerformanceCounter / QueryPerformanceFrequency。
     # 必须单独开这个 feature —— QPC **不在** SystemInformation 里（那是
     # GetTickCount64 等），没有它整个 Performance 模块编译不出来。
