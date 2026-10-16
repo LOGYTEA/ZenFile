@@ -13,7 +13,10 @@ pub const fn rgb(hex: u32) -> COLORREF {
     COLORREF((b << 16) | (g << 8) | r)
 }
 
-#[derive(Clone, Copy)]
+// 第75轮：加 `PartialEq`，让 `App::child_edit_key` 能把"整份配色"当成一个
+// 可比较的快照（子 EDIT 的底色/文字色都从这里来，配色一变就必须重画它们）。
+// 只加派生、不改任何字段与取值。
+#[derive(Clone, Copy, PartialEq)]
 pub struct Theme {
     pub window_bg: COLORREF,
     pub chrome_bg: COLORREF,

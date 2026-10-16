@@ -16,7 +16,7 @@ use zenfile_core::paths;
 use zenfile_core::process::ProcessTree;
 use zenfile_core::types::{filter_entries, FileEntry, FileKind, SortKey, SortSpec, ViewMode};
 use zenfile_core::watch::{DirWatcher, WatchMsg};
-use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Foundation::{COLORREF, HWND, RECT};
 use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, IsWindow};
 
@@ -473,6 +473,66 @@ fn split_rect(r: RectF, zone: DockZone) -> (RectF, RectF) {
     }
 }
 
+/// 子 EDIT"当前画在它自己身上的内容"的快照（第75轮）。
+///
+/// 这两个子窗口是**真窗口控件**，父窗口带 `WS_CLIPCHILDREN`，父窗重绘永远
+/// 不碰它们那两块。想让它们跟着变，只能显式失效。问题在于：以前每帧都失效
+/// （于是每帧 3 次重绘），而它们真正需要重画的原因很少。
+///
+/// 判据取"决定它们像素的那几项状态的合集"：
+///
+/// * `hint` —— 空态提示词（放大镜右边那句"搜索 X"）。**跟着当前标签变**：
+///   "搜索 此电脑" / "搜索 回收站" / "搜索设置" / "搜索 桌面"…。标签切换
+///   只重绘父窗口，不显式让子 EDIT 重画，提示词就停在旧标签的文字上。
+///   这是第74轮之前那句无条件失效的**唯一真实理由**。
+/// * `text_dim` —— 提示词与放大镜的墨色（`WM_CTLCOLOREDIT` 的文字色、
+///   `paint_search_decor` 的 `SetTextColor` 都走它）。切明暗主题会变。
+/// * `scale_bits` —— 字号、放大镜半径、左右边距都随它变（`ui_font` /
+///   `search_left_margin` / `icon_spec::size_of`）。改缩放会变。
+/// * `icon_theme` —— 主题接管时放大镜走主题字形（`draw_ui_icon`）。换图标
+///   主题、或明暗翻转（优化套按明暗重烘）都会变。
+/// * `visible` —— 只有地址框用得上：它平时 `SW_HIDE`，`InvalidateRect`
+///   对隐藏窗口不产生任何重绘（实测全程 0 次 paint），所以"不可见"这一态
+///   要显式记进快照，否则从隐藏切到显示那一帧会被判成"没变"而漏画。
+///
+/// **为什么不用"只比提示词"**：只比 `hint` 会漏掉切主题 / 改缩放 / 换图标
+/// 主题这三种 —— 它们各自都要求子 EDIT 重画，而提示词一个字都没变。
+/// 多比这三项的代价是每帧一次 `String` 分配 + 一次 `PartialEq`
+/// （几十字节、亚微秒级），换来的是"判据与真实依赖一一对应、既不漏也不多"。
+#[derive(Clone, PartialEq, Eq, Default, Debug)]
+pub struct ChildEditKey {
+    pub hint: String,
+    pub text_dim: COLORREF,
+    pub scale_bits: u32,
+    pub icon_theme: String,
+    pub visible: bool,
+}
+
+/// 地址框当前**应该显示**的文本（第75轮：从 `sync_address` 里原样提出来）。
+///
+/// **纯函数**，只吃一个标签 —— 这样"写进 EDIT 的文本"与"失效判据用的文本"
+/// 必然同源（两者都调它），也让本轮新增的不变式可以直接被单测钉住。
+///
+/// 主页那一页（常用文件夹 + 本机驱动器）在资源管理器里地址栏写的就是"主页"，
+/// 侧栏虽然把首页并到了"此电脑"这一格，但**地址栏要标的是"这是哪一页"**，
+/// 不是"从哪点进来的"，所以这里写"主页"。
+pub fn address_display_text_for(tab: &Tab) -> String {
+    if tab.home {
+        return "主页".to_string();
+    }
+    if tab.recycle {
+        return "回收站".to_string();
+    }
+    if tab.settings {
+        return "设置".to_string();
+    }
+    // 路径进过 canonicalize 之后会带上 `\\?\` 前缀（Win32 长路径约定）。
+    // 它是给 API 看的，不是给人看的 —— 直接显示在地址栏会很怪。
+    zenfile_core::paths::strip_verbatim(&tab.path)
+        .to_string_lossy()
+        .to_string()
+}
+
 pub struct App {
     pub hwnd: HWND,
     pub hwnd_address: HWND,
@@ -801,6 +861,23 @@ pub struct App {
     /// Win11 的地址栏平时是**面包屑**（一节一节可点的路径），只有点空白处或
     /// 按 Ctrl+L/F4 才变成可输入的文本框。平时把 EDIT 藏着，编辑时再显示出来。
     pub addr_editing: bool,
+    // ---- 第75轮：子 EDIT 条件失效的快照缓存 ----------------------------
+    //
+    // `paint()` 每帧都要决定"要不要让两个子 EDIT 跟着重画"。第74轮之前这个
+    // 决定是**无条件**的（每帧各一次 `InvalidateRect(..., erase=true)`），
+    // 于是每帧其实是 3 次重绘而不是 1 次。现在改成"内容真的变了才失效"，
+    // 判据全部落在这两个快照上。
+    //
+    // 为什么判据要覆盖得比"提示词"更宽：`paint_search_decor` 画在子 EDIT
+    // 自己身上，它读的是 `theme.text_dim`（提示词与放大镜的墨色）、
+    // `metrics.scale`（字号/放大镜半径）和 `icon_theme`（放大镜字形）。
+    // 早先只按提示词判据做的话，切明暗主题 / 改缩放 / 换图标主题这三件事
+    // 会留下旧像素 —— 这正是"每帧无条件失效"一直在顺手掩盖的。
+    // 所以判据取这四项的合集：**变了才失效，一个都不会漏**。
+    /// 搜索框当前画在它自己身上的那套内容的快照（提示词 + 墨色 + 缩放 + 图标主题）。
+    pub child_search_key: ChildEditKey,
+    /// 地址框的同类快照；另外带了"当时是否可见"。
+    pub child_address_key: ChildEditKey,
     /// 鼠标悬停的面包屑下标（hover 反馈）。
     pub addr_hover: Option<usize>,
     /// 左键拖拽（拖条目 / 空白处框选）。松手或取消后置回 None。
@@ -1358,6 +1435,11 @@ impl App {
             pressed_caption: 0,
             mouse_tracked: false,
             addr_editing: false,
+            // 第75轮：初值取 `Default::default()`（空串 / 全零 / `visible=false`）。
+            // 它与真实状态几乎必然不相等，所以窗口刚建出来、`hwnd_search` 刚拿到
+            // 句柄的第一帧就会把两个子 EDIT 各失效一次 —— 正是我们要的"先画上"。
+            child_search_key: Default::default(),
+            child_address_key: Default::default(),
             addr_hover: None,
             index: None,
             index_root: None,
@@ -4857,6 +4939,54 @@ impl App {
         format!("搜索 {name}")
     }
 
+    /// 地址框当前**应该显示**的文本（第75轮：从 `sync_address` 里原样提出来）。
+    ///
+    /// 主页那一页（常用文件夹 + 本机驱动器）在资源管理器里地址栏写的就是"主页"，
+    /// 侧栏虽然把首页并到了"此电脑"这一格，但**地址栏要标的是"这是哪一页"**，
+    /// 不是"从哪点进来的"，所以这里写"主页"。
+    pub fn address_display_text(&self) -> String {
+        address_display_text_for(self.tab())
+    }
+
+    /// 算出"搜索框当前画在它自己身上的内容"的快照（第75轮）。
+    ///
+    /// `search_hint()` 的依赖只有**当前标签**：home / recycle / settings 三个
+    /// 标志先短路，剩下取 `tab().path` 的末段（盘符根退回 "C:"）。也就是说
+    /// 提示词既跟着标签变，也跟着**当前目录名**变 —— 快照判据天然同时覆盖
+    /// 这两者，不需要额外区分"切标签"和"导航"。
+    ///
+    /// 另三项（墨色 / 缩放 / 图标主题）是 `paint_search_decor` 里另外读到的
+    /// 状态，不在这句提示词里，但同样决定这块像素 —— 一并列进来才是完整的
+    /// 依赖集。详见 `ChildEditKey` 的注释。
+    pub fn search_child_key(&self) -> ChildEditKey {
+        ChildEditKey {
+            hint: self.search_hint(),
+            text_dim: self.theme.text_dim,
+            // f32 不能直接进 Eq，用位模式：scale 每次都从 dpi/96 重算，
+            // 位模式相同就等价于数值相同。
+            scale_bits: self.metrics.scale.to_bits(),
+            icon_theme: self.cfg.ui.icon_theme.clone(),
+            visible: true, // 搜索框常驻可见（创建时带 WS_VISIBLE 且从不隐藏）
+        }
+    }
+
+    /// 地址框的同类快照（第75轮）。`hint` 是它显示的文本 —— 即
+    /// `sync_address` 算出来的"主页 / 回收站 / 设置 / 去掉 \?\ 前缀的路径"。
+    ///
+    /// `visible` 取 `app.addr_editing` 而不是 `IsWindowVisible(hwnd)`：它是
+    /// 同一件事的纯状态侧记，`begin_address_edit` / `end_address_edit` 会成对
+    /// 维护它，判据不必去问系统。地址框平时 `SW_HIDE`（`create_children`），
+    /// 只有进编辑态才 `SW_SHOW`（`begin_address_edit`）。
+    pub fn address_child_key(&self) -> ChildEditKey {
+        ChildEditKey {
+            hint: self.address_display_text(),
+            text_dim: self.theme.text,
+            scale_bits: self.metrics.scale.to_bits(),
+            icon_theme: self.cfg.ui.icon_theme.clone(),
+            visible: self.addr_editing,
+        }
+    }
+
     /// 现在是不是"有事在跑"：正在列目录、正在搜索、正在建索引。
     /// 目录栏下沿的进度条只看这一个开关。
     pub fn busy(&self) -> bool {
@@ -5803,4 +5933,183 @@ pub fn init_com() {
     let _guard = ComGuard::init();
     // 刻意泄漏：COM 必须保持初始化到进程结束。
     std::mem::forget(_guard);
+}
+
+// --------------------------------------------------------------------
+// 第75轮：`ChildEditKey` 判据的不变式
+// --------------------------------------------------------------------
+//
+// 本轮把"每帧无条件让两个子 EDIT 重画"换成"内容真变了才重画"。这唯一的
+// 功能风险是：**任何没被快照覆盖的外观依赖，都会留下旧像素**。
+//
+// 像素级验证（`%TEMP%\qa74\verify_hint75.py`）证明了提示词这一条在真窗口上
+// 成立；这里把其余几条用纯逻辑钉死，防止以后有人往 `paint_search_decor` /
+// `sync_address` 里再加一个依赖却忘了进快照 —— 那种改动在 review 里看不出问题，
+// 只会在用户切主题/改缩放时看到一块旧像素。
+
+#[cfg(test)]
+mod child_key_tests {
+    use super::*;
+
+    fn tab_at(path: &str) -> Tab {
+        Tab::new(PathBuf::from(path))
+    }
+
+    /// 搜索提示词与地址文本都只依赖 `Tab`，所以用真实 `Tab::new` 就够验，
+    /// 不需要整个 `App`（那需要真实 HWND）。
+    fn search_hint_of(tab: &Tab) -> String {
+        if tab.home {
+            return "搜索 此电脑".to_string();
+        }
+        if tab.recycle {
+            return "搜索 回收站".to_string();
+        }
+        if tab.settings {
+            return "搜索设置".to_string();
+        }
+        let name = tab
+            .path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                tab.path
+                    .to_string_lossy()
+                    .trim_end_matches('\\')
+                    .to_string()
+            });
+        format!("搜索 {name}")
+    }
+
+    #[test]
+    fn address_display_text_special_pages() {
+        // 三个虚拟页各有各的字，且**必须**与写入 EDIT 的是同一份 —— 因为
+        // `sync_address` 与地址框失效判据都调 `address_display_text_for`。
+        let mut t = tab_at(r"C:\Users\Administrator\Desktop");
+        assert_eq!(address_display_text_for(&t), r"C:\Users\Administrator\Desktop");
+
+        t.home = true;
+        assert_eq!(address_display_text_for(&t), "主页");
+
+        t.home = false;
+        t.recycle = true;
+        assert_eq!(address_display_text_for(&t), "回收站");
+
+        t.recycle = false;
+        t.settings = true;
+        assert_eq!(address_display_text_for(&t), "设置");
+    }
+
+    #[test]
+    fn address_display_text_strips_verbatim_prefix() {
+        // canonicalize 会加 `\\?\` 前缀；那是给 API 看的，不该显示给人。
+        let t = tab_at("\\\\?\\C:\\Users\\Administrator\\Desktop");
+        assert_eq!(
+            address_display_text_for(&t),
+            r"C:\Users\Administrator\Desktop",
+            "地址栏不该显示 Win32 长路径前缀"
+        );
+
+        // UNC 的那一种前缀也要还原成普通的 UNC 路径。
+        let u = tab_at("\\\\?\\UNC\\server\\share");
+        assert_eq!(address_display_text_for(&u), r"\\server\share");
+    }
+
+    #[test]
+    fn address_display_text_is_stable_and_distinguishing() {
+        // 判据不能有单向漂移：状态回到原样，文本必须回到原值；
+        // 不同目录又必须给出不同文本（否则切目录后地址框会漏画）。
+        let a = tab_at(r"C:\Users\Administrator\Desktop");
+        let b = tab_at(r"C:\Users\Administrator\Documents");
+        assert_ne!(address_display_text_for(&a), address_display_text_for(&b));
+        assert_eq!(address_display_text_for(&a), address_display_text_for(&a));
+    }
+
+    #[test]
+    fn search_hint_follows_tab_flags_and_directory_name() {
+        // 提示词跟着三个虚拟标志短路；
+        let mut t = tab_at(r"C:\Users\Administrator\Desktop");
+        let base = search_hint_of(&t);
+        assert!(base.contains("Desktop"), "应含当前目录名，实得 {base}");
+
+        t.settings = true;
+        assert_eq!(search_hint_of(&t), "搜索设置");
+        t.settings = false;
+
+        t.recycle = true;
+        assert_eq!(search_hint_of(&t), "搜索 回收站");
+        t.recycle = false;
+
+        t.home = true;
+        assert_eq!(search_hint_of(&t), "搜索 此电脑");
+        t.home = false;
+
+        // 也跟着当前目录的末段名走 —— 快照判据天然同时覆盖"切标签"与"导航"。
+        let p = tab_at(r"C:\Users\Administrator\Pictures");
+        assert!(search_hint_of(&p).contains("Pictures"));
+        assert_ne!(search_hint_of(&p), base);
+    }
+
+    #[test]
+    fn search_hint_at_drive_root_falls_back_to_drive_letter() {
+        // 盘符根 `C:\` 没有 file_name，必须退回 "C:" 而不是显示空名字。
+        let t = tab_at("C:\\");
+        assert_eq!(search_hint_of(&t), "搜索 C:");
+    }
+
+    #[test]
+    fn child_edit_key_compares_all_appearance_inputs() {
+        // 判据 = 真实依赖的合集。逐项确认"这一项变了，判据就变"：
+        //
+        //   hint        提示词（跟标签 + 当前目录名）
+        //   text_dim    提示词与放大镜的墨色（切明暗主题会变）
+        //   scale_bits  字号 / 放大镜半径 / 左右边距（改缩放会变）
+        //   icon_theme  放大镜字形（换图标主题会变）
+        //
+        // 后三项**不体现在 hint 里**，所以它们是"只按提示词判据"会漏掉的部分。
+        let a = ChildEditKey {
+            hint: "搜索 桌面".to_string(),
+            text_dim: theme::dark().text_dim,
+            scale_bits: 1.0f32.to_bits(),
+            icon_theme: "default".to_string(),
+            visible: true,
+        };
+        let mut b = a.clone();
+        assert_eq!(a, b, "完全相同的两份快照必须判等（否则每帧都会重画）");
+
+        b.hint = "搜索 图片".to_string();
+        assert_ne!(a, b, "提示词变了必须判不等");
+
+        let mut c = a.clone();
+        c.text_dim = theme::light().text_dim;
+        assert_ne!(a, c, "墨色变了必须判不等（切明暗主题要能触发重画）");
+
+        let mut d = a.clone();
+        d.scale_bits = 1.5f32.to_bits();
+        assert_ne!(a, d, "缩放变了必须判不等（字号/放大镜半径要能触发重画）");
+
+        let mut e = a.clone();
+        e.icon_theme = "optimized".to_string();
+        assert_ne!(a, e, "图标主题变了必须判不等（放大镜字形要能触发重画）");
+
+        let mut f = a.clone();
+        f.visible = false;
+        assert_ne!(a, f, "可见性变了必须判不等（地址框隐藏<->显示那一帧不能漏）");
+    }
+
+    #[test]
+    fn dark_and_light_text_dim_actually_differ() {
+        // 上一条测试的前提：`text_dim` 在两个主题里确实不同。哪天两个主题
+        // 的次要文字色被调成一样，这条断言会提醒我们判据里那一项失效了。
+        assert_ne!(
+            theme::dark().text_dim,
+            theme::light().text_dim,
+            "两个主题的 text_dim 必须不同，否则 ChildEditKey::text_dim 这一项形同虚设"
+        );
+        assert_ne!(
+            theme::dark().text,
+            theme::light().text,
+            "两个主题的正文色必须不同，否则地址框的 text 判据项形同虚设"
+        );
+    }
 }

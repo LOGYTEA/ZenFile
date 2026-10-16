@@ -885,6 +885,79 @@ fn reset_surface_dc(dc: HDC) {
     }
 }
 
+/// 让两个子 EDIT **按需**重画：内容真变了才 `InvalidateRect`（第75轮）。
+///
+/// 取代第74轮之前 `paint()` 里那两句无条件
+/// `InvalidateRect(hwnd, None, true)` —— 那两句让每帧多出两次子窗口
+/// `WM_ERASEBKGND` + `WM_PAINT`，而它们真正要解决的只有一件事：让空态提示词
+/// 跟着当前标签/目录变。判据见 `App::search_child_key` /
+/// `address_child_key` 与 `ChildEditKey`。
+///
+/// 失效条件就一条：
+///
+/// ```text
+/// 该画 ⟺ 快照变了 ∨ 焦点在这个 EDIT 上 ∨ （仅地址框）它现在可见
+/// ```
+///
+/// * **快照变了** —— 常态下唯一会成立的项，也是第74轮之前那句无条件失效的
+///   唯一真实理由。
+/// * **焦点在这个 EDIT 上** —— 编辑态**一律放行**。正在打字时框里那个插入符、
+///   选区高亮都由 EDIT 自己管，我们插队既不会让输入更跟手，只会在同一帧里多
+///   一次子窗口重绘；但快照判据在编辑态期间常常是"没变"（提示词一个字不动），
+///   于是输入过程中一帧都不失效。把焦点这一档显式放行，等于承认"编辑态的像素
+///   由焦点驱动"这件事，代价只有编辑态那几帧 —— 换来的是绝不会有"正在输入
+///   时框里只剩半截装饰"这种坑。
+/// * **地址框可见** —— 见下。
+///
+/// # 地址框不是"永远隐藏"（原判断有误）
+///
+/// `create_children` 里它是 `SW_HIDE`，`begin_address_edit` 会
+/// `ShowWindow(SW_SHOW)`（点地址栏空白处 / 按 Ctrl+L / F4 就进编辑态）。所以
+/// 判据是"**可见 ∧ 显示文本（或墨色/缩放）变了**"，不能无条件删掉那句失效。
+/// 隐藏态则**什么都不做**：原来那句每帧都对隐藏窗口调一次 `InvalidateRect`，
+/// 全程不产生任何重绘（实测 `addr` 行 `paint_cnt`/`erase_cnt` 恒为 0），纯属
+/// 白花约 2.5µs/帧。
+///
+/// `erase=true` 保持不变：装饰（放大镜 + 提示词）是画在 EDIT 整块背景**之上**
+/// 的，不连背景一起擦就会留下残影（`search_proc_inner` 里
+/// `WM_SETFOCUS` / `WM_SETTEXT` 那两处无条件失效用的也是 `true`，同一道理）。
+fn invalidate_child_edits(app: &mut App) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+    unsafe {
+        // 只问一次焦点：两个 EDIT 互斥，同一帧里最多命中一个。
+        let focus = GetFocus();
+
+        // ---- 搜索框（常驻可见）----
+        if !app.hwnd_search.0.is_null() {
+            let key = app.search_child_key();
+            let changed = key != app.child_search_key;
+            if changed {
+                app.child_search_key = key;
+            }
+            if changed || focus == app.hwnd_search {
+                crate::anim_clock::trace_invalidate(0);
+                let _ = InvalidateRect(Some(app.hwnd_search), None, true);
+            }
+        }
+
+        // ---- 地址框（编辑态才可见）----
+        if !app.hwnd_address.0.is_null() {
+            let key = app.address_child_key();
+            let changed = key != app.child_address_key;
+            // `visible` 要在把 `key` 移进缓存**之前**读出来 —— 移走之后
+            // 就不能再看它了（`ChildEditKey` 不做 `Copy`，String 字段是唯一的）。
+            let visible = key.visible;
+            if changed {
+                app.child_address_key = key;
+            }
+            if visible && (changed || focus == app.hwnd_address) {
+                crate::anim_clock::trace_invalidate(1);
+                let _ = InvalidateRect(Some(app.hwnd_address), None, true);
+            }
+        }
+    }
+}
+
 pub fn paint(app: &mut App, hdc: HDC, width: i32, height: i32) {
     use crate::anim_clock as ac;
     // 第70轮埋点：`begin_anim_frame` 前打点。
@@ -978,23 +1051,28 @@ pub fn paint(app: &mut App, hdc: HDC, width: i32, height: i32) {
         ac::trace_sub_end(ac::SUB_CLEANUP);
 
         ac::trace_sub_begin(ac::SUB_INVALIDATE);
-        // 地址框 / 搜索框的空态提示（放大镜 + "搜索 X"）画在**子 EDIT 自己身上**，
-        // 而主窗口带 WS_CLIPCHILDREN，父窗口重绘永远不碰它们那两块。提示词跟着
-        // 当前标签变（"搜索设置" / "搜索 Windows"），标签切换却只重绘父窗口 ——
-        // 不在这里显式让子 EDIT 跟着重画，提示词就停在旧标签的文字上（实测：
-        // 把搜索框从排布里摘掉再装回，提示一直是"搜索设置"）。
-        // 子 EDIT 重画不会再失效父窗口，这里不会成环。
+        // 第75轮：两个子 EDIT 从"每帧无条件失效"改成"内容真变了才失效"。
         //
-        // 第69轮埋点：**这两句一个字都没改**，只在旁边各加一句观测 ——
-        // 记录"本帧确实执行了"。它们是后续优化的头号嫌疑：每帧无条件
-        // `erase=true` 地擦两个子 EDIT，意味着**每帧其实是 3 次重绘**
-        // （父窗口 1 次 + 两个子控件各 1 次），而不是 1 次。CSV 里
-        // `inv_search` / `inv_address` 与 `orphan_paints` 一起就能判断
-        // 这次重绘到底有没有发生、发生了几次。
-        crate::anim_clock::trace_invalidate(0);
-        let _ = InvalidateRect(Some(app.hwnd_search), None, true);
-        crate::anim_clock::trace_invalidate(1);
-        let _ = InvalidateRect(Some(app.hwnd_address), None, true);
+        // 背景（也是这件事唯一的真实理由）：地址框 / 搜索框的空态提示（放大镜
+        // + "搜索 X"）画在**子 EDIT 自己身上**，而主窗口带 `WS_CLIPCHILDREN`，
+        // 父窗口重绘永远不碰它们那两块。提示词跟着当前标签变
+        // （"搜索设置" / "搜索 回收站" / "搜索 桌面"），标签切换却只重绘父
+        // 窗口 —— 不在这里显式让子 EDIT 跟着重画，提示词就停在旧标签的文字上
+        // （实测：把搜索框从排布里摘掉再装回，提示一直是"搜索设置"）。
+        //
+        // 但"每帧都失效"是**为了上面那一个理由付出的每帧代价**：实测每帧多出
+        // 两次子窗口 `WM_ERASEBKGND` + 两次 `WM_PAINT`（搜索框单次 paint 中位
+        // 0.123ms），整轮 723 帧约 89ms；地址框因为平时 `SW_HIDE`，这两次调用
+        // 全程 0 次重绘，纯浪费。于是每帧其实是 3 次重绘而不是 1 次。
+        //
+        // 现在的判据是"**决定那块像素的那几项状态的合集**变了才失效"
+        // （`ChildEditKey`：提示词 / 墨色 / 缩放 / 图标主题 / 可见性）——
+        // 与真实依赖一一对应，既不会漏（该画时一定画）也不会多（不变时一帧都
+        // 不画）。子 EDIT 重画不会再失效父窗口，这里不会成环。
+        //
+        // `paint()` 拿的是 `&mut App`，所以快照就在这里就地更新 —— 不需要额外
+        // 的一层可变状态，也不怕"判据读到的是上一帧的值"。
+        invalidate_child_edits(app);
         ac::trace_sub_end(ac::SUB_INVALIDATE);
     }
     ac::trace_sub_begin(ac::SUB_SYNC_TIMER);
@@ -5948,20 +6026,11 @@ pub fn sync_address(app: &App) {
     // 主页那一页（常用文件夹 + 本机驱动器）在资源管理器里地址栏写的就是"主页"，
     // 侧栏虽然把首页并到了"此电脑"这一格，但**地址栏要标的是"这是哪一页"**，
     // 不是"从哪点进来的"，所以这里写"主页"。
-    let text = if app.tab().home {
-        "主页".to_string()
-    } else if app.tab().recycle {
-        "回收站".to_string()
-    } else if app.tab().settings {
-        "设置".to_string()
-    } else {
-        // 路径进过 canonicalize 之后会带上 `\\?\` 前缀（Win32 长路径约定）。
-        // 它是给 API 看的，不是给人看的 —— 直接显示在地址栏会很怪。
-        zenfile_core::paths::strip_verbatim(&app.tab().path)
-            .to_string_lossy()
-            .to_string()
-    };
-    set_window_text_utf16(app.hwnd_address, &text);
+    //
+    // 第75轮：这段计算已原样提进 `App::address_display_text()`，让"写进 EDIT
+    // 的文本"与"地址框失效判据用的文本"共用同一个函数 —— 否则两者将来必然
+    // 会各自漂移，漂移的那一边就会漏画或白画。
+    set_window_text_utf16(app.hwnd_address, &app.address_display_text());
 }
 
 pub fn focus_edit(hwnd: HWND) {
