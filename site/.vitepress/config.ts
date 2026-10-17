@@ -4,9 +4,11 @@ export default defineConfig({
   lang: 'zh-CN',
   title: 'ZenFile',
   description: '原生 Win32 文件管理器',
-  // 部署到项目页 https://logytea.github.io/ZenFile/ ，不是用户页 logytea.github.io/
-  // 本地 preview 也在根路径 serve，所以这个错误本地测不出来 —— 部署后才发现全站 404
-  base: '/ZenFile/',
+  // 站点实际部署在用户主页仓库的 zenfile/ 子目录：https://logytea.github.io/zenfile/
+  // 不是 ZenFile 仓库的项目页（base 不能写 /ZenFile/）。
+  // 注意：vitepress preview 在根路径 serve，base 写错本地测不出来，
+  // 部署后才会全站 404。改 base 后务必在子路径下用静态服务器实测。
+  base: '/zenfile/',
   appearance: 'dark',
   cleanUrls: false,
   lastUpdated: true,
