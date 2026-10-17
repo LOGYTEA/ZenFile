@@ -1397,8 +1397,17 @@ pub fn pane_div_at(app: &App, l: &Layout, x: i32, y: i32) -> Option<(bool, usize
 /// 内容区里的"8 向贴"判定：四边各占 30% 的带，两带相交处是四角，
 /// 正中间那块是 Center（合并进目标窗格，不分栏）。
 pub fn dock_zone_at(l: &Layout, x: i32, y: i32) -> crate::app::DockZone {
+    dock_zone_in(l.view, x, y)
+}
+
+/// `dock_zone_at` 的自由函数版：只吃内容区矩形。
+///
+/// 第83轮跨窗口投放要用它 —— 目标窗口收到的屏幕坐标先转成**它自己**的
+/// 客户区坐标，判据必须和本窗口内拖拽用的是同一份阈值，否则"预览在这、
+/// 落在那"。两边各写一份 30% 就会各错各的。
+pub fn dock_zone_in(view: RECT, x: i32, y: i32) -> crate::app::DockZone {
     use crate::app::DockZone::*;
-    let r = l.view;
+    let r = view;
     let w = r.right - r.left;
     let h = r.bottom - r.top;
     if w <= 0 || h <= 0 {

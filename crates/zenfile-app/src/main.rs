@@ -31,6 +31,7 @@ mod shellnew;
 mod progress;
 mod settings;
 mod sysview;
+mod tabdrag;
 mod theme;
 
 use std::path::PathBuf;
@@ -48,7 +49,8 @@ use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Shell::Shell_NotifyIconW;
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, NOTIFY_ICON_DATA_FLAGS,
+    DragFinish, HDROP, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+    NOTIFY_ICON_DATA_FLAGS,
 };
 use windows::Win32::Graphics::Gdi::{ClientToScreen, HBRUSH, HDC, ScreenToClient};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -677,6 +679,8 @@ fn spawn_window(
     let app = unsafe { &mut *app };
     paint::create_children(app, instance);
     paint::sync_address(app);
+    // 第83轮：接收外部文件拖入（资源管理器 → ZenFile）。
+    tabdrag::accept_files_from(hwnd);
 
     // 全局热键 §8：默认 Ctrl+Alt+*，Win 组合保留给用户自行配置。
     // 只能注册一次 —— 同一个线程里对同一个 ID 注册第二次会失败。
@@ -1247,6 +1251,51 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             LRESULT(1)
         }
         WM_CTLCOLOREDIT => handle_ctl_color(app_ptr, wparam),
+        // 第83轮：另一个 ZenFile 窗口把一个标签递过来了。
+        // 落点判据由**本窗口**做（屏幕坐标 → 自己的客户区坐标），协议里不带几何。
+        WM_COPYDATA => {
+            let Some(((sx, sy), path)) = tabdrag::decode_copydata(lparam) else {
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
+            };
+            let app = &mut *app_ptr;
+            let mut pt = POINT { x: sx, y: sy };
+            let _ = ScreenToClient(hwnd, &mut pt);
+            let l = paint::layout_for(app);
+            let pl = if app.split() { paint::pane_layout(app, &l, app.focus_pane) } else { l };
+            match tabdrag::classify(&pl.tabs, pl.view, pt.x, pt.y) {
+                tabdrag::DropAction::None => {}
+                tabdrag::DropAction::NewTab => {
+                    app.open_tab(path);
+                    app.reload();
+                    paint::sync_address(app);
+                }
+                tabdrag::DropAction::Split { zone } => {
+                    app.open_split(path, zone);
+                    paint::sync_address(app);
+                    paint::reposition(app);
+                }
+            }
+            let _ = InvalidateRect(Some(hwnd), None, true);
+            LRESULT(1)
+        }
+        // 第83轮：外部程序（资源管理器）把文件/文件夹拖进来了。开成新标签。
+        WM_DROPFILES => {
+            let hd = HDROP(wparam.0 as *mut core::ffi::c_void);
+            let paths = tabdrag::read_wmdropfiles(hd);
+            // 必须在读完之后 DragFinish：拖放句柄归发送方所有，不交还就一直占着。
+            unsafe { DragFinish(hd) };
+            let Some(paths) = paths else {
+                return LRESULT(0);
+            };
+            let app = &mut *app_ptr;
+            if tabdrag::accept_external(app, paths) {
+                app.reload();
+                paint::sync_address(app);
+                paint::reposition(app);
+                let _ = InvalidateRect(Some(hwnd), None, true);
+            }
+            LRESULT(0)
+        }
         // 后台复制/移动干完了：收错误、重列目录。**只在这条消息里 reload** ——
         // 在 worker 线程里碰 UI 状态会跨线程改 App，在松手那条消息里做又会
         // 阻塞输入（IFileOperation 是模态的）。
@@ -1534,10 +1583,34 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 let _ = InvalidateRect(Some(hwnd), None, false);
                 return LRESULT(0);
             }
-            // 正在拖**标签**：算去处（换顺序 / 8 向贴 / 拖出窗口）并重画。
+            // 正在拖**标签**：算去处（换顺序 / 8 向贴 / 拖到别的窗口）并重画。
             // 也要排在别的命中之前：拖标签期间不该去动选中集。
             if app.tab_drag.is_some() {
                 update_tab_drag(app, hwnd, &l, x, y);
+                // 第83轮：光标已经移到**本窗口之外**、且底下**不是**另一个
+                // ZenFile 窗口时，把这个标签作为文件拖给外部程序（资源管理器）。
+                //
+                // 必须在这里（按键还按着）发起，不能等 `WM_LBUTTONUP` ——
+                // `DoDragDrop` 是模态的，第一次 `QueryContinueDrag` 就会问
+                // "左键还在吗"，那时已经松开 = 立刻投放，用户根本没机会瞄。
+                // 文件拖拽那条路（`kick_out`）就是这个位置。
+                if let Some((pane, index, path)) = tab_kick_out(app, hwnd, x, y) {
+                    // 状态必须在 `drag_out` **之前**清干净：模态循环里本函数
+                    // 会被重入，`tab_drag` 还在就会再拖一次出去。
+                    app.tab_drag = None;
+                    app.drag_dock = None;
+                    app.tab_hover_since = None;
+                    let _ = ReleaseCapture();
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                    let parent = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+                    dnd::drag_out(hwnd, &parent, std::slice::from_ref(&path), false);
+                    // 拖出去了就把本窗口这个标签收掉（只收这一个）。
+                    app.focus_pane = pane.min(app.panes.len().saturating_sub(1));
+                    let idx = index.min(app.pane().tabs.len().saturating_sub(1));
+                    app.close_tab(idx);
+                    paint::sync_address(app);
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                }
                 return LRESULT(0);
             }
             // 正在拖条目 / 拉框选：更新当前点、重算投放目标并重画。
@@ -3168,6 +3241,29 @@ fn update_tab_drag(app: &mut App, hwnd: HWND, l: &paint::Layout, x: i32, y: i32)
     }
 }
 
+/// 这次移动要不要把标签**作为文件拖给外部程序**。
+///
+/// 三个条件都要满足，缺一个都不行：
+///   1. 已经在真的拖（越过 4px 阈值），否则点一下标签也算拖
+///   2. 光标已经离开本窗口客户区
+///   3. 光标底下**不是**另一个 ZenFile 窗口 —— 那是"移交给隔壁窗口"，
+///      由 `end_tab_drag` 处理，两条路互斥
+///
+/// 返回 `(窗格下标, 标签下标, 路径)`。
+fn tab_kick_out(app: &App, hwnd: HWND, x: i32, y: i32) -> Option<(usize, usize, PathBuf)> {
+    let d = app.tab_drag.as_ref()?;
+    if !d.active || !outside_client(hwnd, x, y) {
+        return None;
+    }
+    if tabdrag::window_under_cursor().is_some_and(|h| tabdrag::other_zenfile_window(h, hwnd)) {
+        return None;
+    }
+    let p = d.pane;
+    let i = d.index;
+    let path = app.panes.get(p)?.tabs.get(i)?.path.clone();
+    Some((p, i, path))
+}
+
 /// 拖标签松手：把 `finish_tab_drag` 算出来的结果真的执行掉。
 fn end_tab_drag(app: &mut App, hwnd: HWND) {
     match app.finish_tab_drag() {
@@ -3185,8 +3281,39 @@ fn end_tab_drag(app: &mut App, hwnd: HWND) {
             paint::reposition(app);
         }
         app::TabDrop::TearOff { pane, index, path } => {
-            // 拆成新进程：先起新的，再关本窗口这个 —— 顺序反了的话
-            // （只剩一个标签时会先补一个主页标签）新窗口拿不到原路径。
+            // 第83轮：光标底下压着**另一个 ZenFile 窗口**时，不是拆出新窗口，
+            // 而是把标签交给那个窗口（落点由对方自己判：标签条→追加，内容区→分屏）。
+            //
+            // 判据用 `window_under_cursor` 现场取，不信 `TabDrag.outside`：那个
+            // 标志只说"离开了本窗口客户区"，此时光标可能在另一个 ZenFile 窗口上、
+            // 也可能在资源管理器上、也可能在桌面空白处。
+            let target = tabdrag::window_under_cursor()
+                .filter(|h| tabdrag::other_zenfile_window(*h, hwnd));
+            if let Some(t) = target {
+                let mut pt = POINT::default();
+                unsafe {
+                    let _ = GetCursorPos(&mut pt);
+                }
+                tabdrag::send_tab(t, (pt.x, pt.y), &path);
+                // 交给对方了就从本窗口删掉。顺序与下面新建窗口那条同源：
+                // 先递出去再关本窗口这个，只剩一个标签时也不会被补主页标签顶掉。
+                app.focus_pane = pane.min(app.panes.len() - 1);
+                app.close_tab(index);
+                paint::sync_address(app);
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                }
+                return;
+            }
+            // 拖出到外部程序（资源管理器等）那条路在 `WM_MOUSEMOVE` 里就发起了
+            // （见 `tab_kick_out`）：`DoDragDrop` 是模态的，必须在按键还按着的
+            // 时候进场，等走到 `WM_LBUTTONUP` 时左键已松开，第一次
+            // `QueryContinueDrag` 就会立刻投放，用户没机会瞄。所以能落到这里
+            // 的，只剩"底下既不是自家窗口、也不是别的 ZenFile 窗口"这种桌面空白，
+            // 按拆成新窗口处理（原行为不变）。
+            //
+            // 先起新的，再关本窗口这个 —— 顺序反了的话（只剩一个标签时会先补一个
+            // 主页标签）新窗口拿不到原路径。
             crate::new_window(path);
             app.focus_pane = pane.min(app.panes.len() - 1);
             app.close_tab(index);
