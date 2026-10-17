@@ -22,6 +22,7 @@ mod icon_spec;
 mod menu;
 mod openwith;
 mod plugin_host;
+mod plugin_server;
 mod rename;
 mod paint;
 mod paint_cache;
@@ -89,6 +90,10 @@ const WM_TRAY: u32 = WM_APP + 1;
 pub const WM_APP_IO_DONE: u32 = WM_APP + 2;
 /// 后台枚举回收站完成。WPARAM = 世代号，对不上说明结果已过期。
 pub const WM_APP_RECYCLE: u32 = WM_APP + 3;
+/// 后台枚举网络位置完成。`WNetEnumResourceW` 会真去联系网络上的主机，耗时不可控，
+/// 绝不能在主线程同步调用；结果由这条消息收口。
+pub const WM_APP_NET: u32 = WM_APP + 4;
+
 const TIMER_DRAIN: usize = 1;
 /// 对外显示的产品名。托盘提示、窗口标题、标题栏落款共用这一份，改一处就够。
 pub const APP_TITLE: &str = "ZenFile";
@@ -98,7 +103,7 @@ pub const APP_TITLE: &str = "ZenFile";
 /// semver，写了 cargo 直接报错），所以"人看的那一版号"单独放这里：
 /// `ZenFile.exe --version`、窗口标题、「关于」对话框三处共用。
 /// 发新版时改这一行（0.3 → 下一段号）并把日期换成当天即可。
-pub const APP_VERSION: &str = "0.3 Beta Weekly26-10-14";
+pub const APP_VERSION: &str = "0.3 Beta Weekly26-10-17";
 /// 目录栏下沿进度条的动画节拍。一直挂着，但只有 busy() 时才真的重画。
 const TIMER_BUSY: usize = 2;
 /// 界面过渡动画的节拍（16ms ≈ 60Hz，第57轮）。
@@ -1260,6 +1265,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         crate::WM_APP_RECYCLE => {
             let app = &mut *app_ptr;
             app.drain_recycle(wparam.0 as u64, lparam.0 != 0);
+            let _ = InvalidateRect(Some(hwnd), None, true);
+            LRESULT(0)
+        }
+        crate::WM_APP_NET => {
+            let app = &mut *app_ptr;
+            app.drain_network();
             let _ = InvalidateRect(Some(hwnd), None, true);
             LRESULT(0)
         }
@@ -3838,8 +3849,7 @@ fn sort_key_of_col(id: &str) -> Option<zenfile_core::SortKey> {
 
 fn settings_command(action: u32) -> Option<menu::Command> {
     use paint::{
-        SET_EXT, SET_FOLLOW, SET_GPU, SET_HIDDEN, SET_SIDEBAR, SET_STATUS, SET_SYSTEM,
-        SET_THEME,
+        SET_EXT, SET_FOLLOW, SET_GPU, SET_HIDDEN, SET_SIDEBAR, SET_STATUS, SET_SYSTEM, SET_THEME,
         SET_THISPC, SET_UNIT, SET_VIEW,
     };
     match action {
@@ -4151,8 +4161,16 @@ fn sidebar_click(app: &mut App, x: i32, y: i32) -> bool {
     }
     // 单击**只导航，不展开**。之前这里顺手把节点展开了，结果想换个目录就
     // 被迫把树撑开一大片，滚都滚不回来；树的展开/收起交给箭头和双击。
+    //
+    // 例外：纯分组节点（"网络"）根本没有可导航的目标，点它只能是展开 ——
+    // 否则单击会掉进 `target.is_empty()` 那条分支，把用户带到主页去。
     if row.target.is_empty() {
-        app.navigate(PathBuf::from(app::HOME_PATH));
+        if row.expandable {
+            app.toggle_sidebar_node(&row.key);
+            app.clamp_sidebar_scroll(&l);
+        } else {
+            app.navigate(PathBuf::from(app::HOME_PATH));
+        }
     } else {
         app.navigate(PathBuf::from(&row.target));
     }

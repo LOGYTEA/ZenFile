@@ -48,8 +48,15 @@ windows = { version = "0.62", features = [
     # 必须单独开这个 feature —— QPC **不在** SystemInformation 里（那是
     # GetTickCount64 等），没有它整个 Performance 模块编译不出来。
     "Win32_System_Performance",
+    # 基准工具要量"扫描期间的内存占用"：GetProcessMemoryInfo /
+    # PROCESS_MEMORY_COUNTERS.PeakWorkingSetSize 在 ProcessStatus 里。
+    # 缺这个 feature 的话整个模块编译不出来（不是符号找不到，是模块不存在）。
+    "Win32_System_ProcessStatus",
     "Win32_System_Search_Common",
     "Win32_System_Time",
+    # 侧栏"网络"节点：MPR 的 WNet* 系列（网络驱动器/共享枚举）。
+    # Windows_Root 不用，但 NETRESOURCEW 等类型挂在 WNet 模块下。
+    "Win32_NetworkManagement_WNet",
     "Win32_Storage_FileSystem",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dwm",

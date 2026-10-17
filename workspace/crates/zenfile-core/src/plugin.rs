@@ -173,10 +173,27 @@ pub struct PluginHost {
     /// 进程树（Job Object）。插件崩溃不影响它，宿主退了它带走全部插件。
     tree: crate::process::ProcessTree,
     slots: BTreeMap<String, PluginSlot>,
-    /// 下一个请求 id。
+    /// 下一次请求 id。
     next_req_id: u64,
     /// 读插件管道的线程都归这一个 JoinHandle。
-    readers: Vec<std::thread::JoinHandle<()>>,
+    ///
+    /// **当前没有写入方**：管道 server 端（`CreateNamedPipe`）与后台读线程
+    /// 在 app crate 的 `plugin_server.rs` 里，由 `App` 持有。心跳通过
+    /// `note_heartbeat` 喂进来（见该函数注释），不经过这个字段。
+    pub readers: Vec<std::thread::JoinHandle<()>>,
+}
+
+/// 管道名。**宿主与插件两侧必须调这一个函数**，否则连不上。
+///
+/// 管道名规则不允许 `\ / : * ? " < > |` 与空格，所以 id 要先过滤成安全字符集。
+/// 这件事**必须两侧同一份实现**：早期宿主侧直接用原始 id 拼、插件侧过滤过，
+/// 于是凡 id 带非安全字符的插件，两边算出的名字不一样，插件永远连不上。
+pub fn pipe_name(pid: u32, id: &str) -> String {
+    let safe: String = id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    format!(r"\\.\pipe\ZenFile.{pid}.{safe}")
 }
 
 impl PluginHost {
@@ -253,6 +270,27 @@ impl PluginHost {
         self.slots.get_mut(id)
     }
 
+    /// 管道 server 收到某插件的心跳后调用：刷新时刻。
+    ///
+    /// **心跳只能从这条路进**。读线程在 app crate，它绝不能直接碰
+    /// `PluginSlot`（那是宿主主线程的 UI 状态）—— 那正是"worker 碰 UI 状态"
+    /// 那条纪律要禁的事。所以读线程把时刻攒在自己的 `AtomicU64` 里，
+    /// 主循环 tick 时再搬进来。
+    pub fn note_heartbeat(&mut self, id: &str, at: u64) {
+        if let Some(s) = self.slots.get_mut(id) {
+            s.last_heartbeat = at;
+        }
+    }
+
+    /// 管道 server 读到 hello 后调用：握手完成，Starting → Running。
+    pub fn note_greeted(&mut self, id: &str) {
+        if let Some(s) = self.slots.get_mut(id) {
+            if s.state == PluginState::Starting {
+                s.state = PluginState::Running;
+            }
+        }
+    }
+
     /// 用户在面板上启 / 停一个插件。
     pub fn set_enabled(&mut self, id: &str, on: bool) -> Result<()> {
         let exe = self.host_exe.clone();
@@ -271,6 +309,22 @@ impl PluginHost {
             stop_slot(slot);
         }
         Ok(())
+    }
+
+    /// 把管道 server 观察到的 (id, 最近心跳, 已握手) 搬进槽位。
+    ///
+    /// 必须在 `tick` **之前**调：心跳判定读的就是 `last_heartbeat`。
+    /// 反复调无害 —— 值是单调递增的幂等写入。
+    pub fn ingest_pipe_observations(
+        &mut self,
+        obs: impl Iterator<Item = (String, u64, bool)>,
+    ) {
+        for (id, at, greeted) in obs {
+            self.note_heartbeat(&id, at);
+            if greeted {
+                self.note_greeted(&id);
+            }
+        }
     }
 
     /// 每帧调一次：检查心跳、该重启的重启、该回收的回收。
@@ -376,7 +430,8 @@ fn start_slot(exe: &Path, tree: &mut crate::process::ProcessTree, slot: &mut Plu
     match tree.spawn(exe, &args) {
         Ok(pid) => {
             slot.pid = pid;
-            slot.pipe = format!(r"\\.\pipe\ZenFile.{}.{}", pid, slot.manifest.id);
+            // 管道名必须与插件侧算出的完全一致（同一个函数）。
+            slot.pipe = pipe_name(pid, &slot.manifest.id);
             slot.state = PluginState::Starting;
             slot.last_heartbeat = crate::now_ms();
             slot.error = None;

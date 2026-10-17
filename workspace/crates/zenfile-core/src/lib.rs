@@ -26,6 +26,7 @@ pub mod hotkey;
 pub mod index;
 pub mod ipc;
 pub mod natural;
+pub mod network;
 pub mod ops;
 pub mod paths;
 pub mod plugin;

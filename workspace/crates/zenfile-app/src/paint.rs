@@ -3550,11 +3550,21 @@ pub fn paint_sidebar(app: &mut App, hdc: HDC, l: &Layout) {
                 }
                 None => {
                     if let Some(glyph) = glyphs[i] {
-                        let g = sidebar_glyph_font(scale);
-                        let old2 = SelectObject(hdc, g.into());
-                        let mut gbuf: Vec<u16> = glyph.encode_utf16().collect();
-                        DrawTextW(hdc, &mut gbuf, &mut icon_r.clone(), DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-                        SelectObject(hdc, old2);
+                        // **空字形必须跳过**：无子项的行（网络展开后的空状态提示）
+                        // 走 `SidebarRow::leaf`，那里没有图标可取，于是留一个
+                        // `Glyph("")`。空切片喂给 `DrawTextW` 会让 windows-rs
+                        // 对 `&mut []` 解引用 —— 直接崩，而且崩点落在**渲染**，
+                        // 离"我点了一下网络"很远，排查成本极高。
+                        //
+                        // 之前只有 `draw_text` 有这个守卫，字形这条路径漏了；
+                        // 同一个坑两个地方各踩一次就该抽成同一个函数。
+                        if !glyph.is_empty() {
+                            let g = sidebar_glyph_font(scale);
+                            let old2 = SelectObject(hdc, g.into());
+                            let mut gbuf: Vec<u16> = glyph.encode_utf16().collect();
+                            DrawTextW(hdc, &mut gbuf, &mut icon_r.clone(), DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                            SelectObject(hdc, old2);
+                        }
                     }
                 }
             }

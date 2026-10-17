@@ -49,7 +49,10 @@ pub fn run_plugin_process(id: &str, args: &[String]) -> i32 {
 
     // 管道名由 pid + id 决定：宿主拉起进程后就知道该连哪一个。
     // 用 pid 是为了让"重启同一个插件"天然换一条管道，不会撞上上一条残留的。
-    let pipe = format!(r"\\.\pipe\ZenFile.{}.{}", std::process::id(), safe_id);
+    //
+    // **必须调 core 里那同一个函数**：早期这里自己过滤了一遍、宿主侧没过滤，
+    // 于是 id 带非安全字符时两侧算出两个名字，插件永远连不上。
+    let pipe = zenfile_core::plugin::pipe_name(std::process::id(), id);
 
     let mut pipe = match PipeClient::connect(&pipe) {
         Some(p) => p,

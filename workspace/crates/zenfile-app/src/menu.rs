@@ -16,11 +16,13 @@ use windows::core::{HSTRING, PCWSTR};
 use windows::core::Interface as _;
 use windows::Win32::Foundation::{LPARAM, LRESULT, RECT, WPARAM, HWND};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateCompatibleBitmap, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint,
-    FillRect, GetMonitorInfoW, GetPixel,
-    IntersectClipRect, MonitorFromWindow, SelectObject, SetBkMode, SetTextColor, SetWindowOrgEx,
+    BeginPaint, CombineRgn, CreateCompatibleBitmap, CreateRectRgn, CreateRoundRectRgn,
+    CreateSolidBrush, DeleteObject, DrawTextW,
+    EndPaint, FillRect, GetDC, GetMonitorInfoW, GetPixel, IntersectClipRect, MonitorFromWindow,
+    ReleaseDC, RestoreDC, SaveDC, SelectClipRgn, SelectObject, SetBkMode, SetTextColor,
+    SetWindowOrgEx,
     DT_CALCRECT, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, RGN_AND, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::Graphics::Gdi::{BitBlt, CreateCompatibleDC, DeleteDC};
 use windows::Win32::Foundation::POINT;
@@ -65,6 +67,26 @@ const WM_MENU_CLOSE_CHAIN: u32 = 0x0403;
 /// 第53轮之前这里直接 activated=true 自爆，把整条链带走了 —— 表现为
 /// "点『排序方式』菜单整个消失"，子菜单永远点不开。
 const WM_MENU_FORWARD_CLICK: u32 = 0x0404;
+
+/// 悬停到带子菜单的条目后**等一会儿**再展开。wparam = 要展开的条目下标。
+///
+/// 为什么要这个延迟（用户反馈"右键菜单悬停展开的那些会卡展开"）：
+/// 展开一个子菜单 = `CreateWindowExW` + 首次 `ShowWindow`，QPC 埋点实测两者
+/// 合计约 2.8ms（`ShowWindow` 的首次合成就占 2.4ms），再加销毁上一个子菜单
+/// 约 2.7ms —— 一次悬停切换接近 5.5ms 全卡在一条 WM_MOUSEMOVE 里。
+/// 原来**一移到那一行就立刻**展开，于是鼠标扫过一列带子菜单的条目
+/// （打开方式 / 排序方式 / 查看 / 新建 …）时，每划一行就完整走一遍
+/// 建窗 + 首帧 + 建缓存，串起来就是肉眼可见的一顿。
+///
+/// 资源管理器本身也是延迟展开（`MenuShowDelay`）。这里取 220ms：
+/// 足够滤掉"扫过去"，又不至于让"停在某项上想看内容"变得难等。
+/// 展开后仍走第53轮的"单击固定"语义（再点一次该条目 / 点空白才收起）。
+const WM_MENU_EXPAND_DELAYED: u32 = 0x0405;
+
+/// 悬停展开的延迟时长（毫秒）。
+const HOVER_EXPAND_DELAY_MS: u32 = 220;
+/// 延迟展开用的单次计时器 id。
+const TIMER_EXPAND: usize = 0xE7;
 
 /// 宿主侧自有的命令（自绘菜单的顶部图标行与常规项）。
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -851,6 +873,115 @@ struct MenuWindow {
     /// 关掉，于是必须**按住不放**才能看见它（"批量重命名按钮要按住才展开"）。
     /// 这里把那一次抬起吞掉（只吞一次，之后的抬起照常算点击）。
     swallow_up: bool,
+    /// 整块菜单的离屏位图缓存（见 `MenuBitmap`）。设置页预览不用它（None）。
+    cache: Option<MenuBitmap>,
+    /// 已经为第几项**排了**延迟展开（`HOVER_EXPAND_DELAY_MS` 之后才真的建窗）。
+    ///
+    /// 不是"要不要展开"而是"已经排上了没有"：鼠标在同一行上连续抖动时会
+    /// 重排计时器，真正展开的时机也就跟着往后推 —— 这正是想要的（抖动不展开）。
+    pending_expand: Option<usize>,
+    /// 本次 WM_MOUSEMOVE 里悬停行**变了**（见 WM_MOUSEMOVE 里那处赋值）。
+    hover_moved: bool,
+}
+
+/// 撤掉还没到期的延迟展开。
+///
+/// 必须**连着杀计时器**：只清 `pending_expand` 而留着计时器，到期时 `wparam`
+/// 里那个下标仍会被展开 —— 鼠标早就划走了，菜单却自己弹出来。
+fn cancel_pending_expand(state: &mut MenuWindow, hwnd: HWND) {
+    if state.pending_expand.take().is_some() {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), TIMER_EXPAND);
+        }
+    }
+}
+
+/// 菜单窗口的离屏位图缓存。
+///
+/// 悬停在条目之间移动时，**唯一变的是「哪一行高亮」**。而整块菜单重画一次
+/// 实测 1.1ms（24 行，每行一次 `DrawTextW` + 一次 `TransparentBlt`）。展开一个
+/// 子菜单的路径上会**连着画好几次**：父菜单换高亮 → 子菜单首帧 → 收起旧子菜单
+/// 后父菜单再换一次高亮。几次叠起来接近 5ms，鼠标要顿一下子菜单才出现 ——
+/// 这就是"悬停展开会卡"。
+///
+/// 所以整块菜单**只在首次**（以及尺寸/滚动变了时）画进缓存；之后换高亮只
+/// 重画脏掉的那一两行，最后把缓存整块 `BitBlt` 贴上去（贴一次 ~120us，
+/// 比重画便宜一个数量级）。
+///
+/// 缓存高度取 `view_h`（可见高度）而不是内容总高：第三方 Shell 扩展能把菜单
+/// 堆到几百行，按内容高度分配位图就是十几 MB，纯浪费。代价是滚动时整块重画
+/// —— 滚动是用户主动动作，一次 1.1ms 无感。
+struct MenuBitmap {
+    dc: HDC,
+    bmp: windows::Win32::Graphics::Gdi::HBITMAP,
+    /// `SelectObject` 换上去之前的那个位图，销毁时必须选回去再删
+    old_bmp: windows::Win32::Graphics::Gdi::HGDIOBJ,
+    w: i32,
+    h: i32,
+    /// 缓存里当前画着的高亮行。与 `state.hover` 不同才需要补画那两行。
+    hover: Option<usize>,
+    /// 缓存对应的滚动偏移。变了必须整块重画（缓存只覆盖可见区）。
+    scroll: i32,
+}
+
+impl MenuBitmap {
+    unsafe fn free(&mut self) {
+        if !self.dc.is_invalid() {
+            let _ = SelectObject(self.dc, self.old_bmp);
+            let _ = DeleteDC(self.dc);
+        }
+        if !self.bmp.is_invalid() {
+            let _ = DeleteObject(self.bmp.into());
+        }
+        *self = MenuBitmap {
+            dc: HDC(std::ptr::null_mut()),
+            bmp: windows::Win32::Graphics::Gdi::HBITMAP(std::ptr::null_mut()),
+            old_bmp: windows::Win32::Graphics::Gdi::HGDIOBJ(std::ptr::null_mut()),
+            w: 0,
+            h: 0,
+            hover: None,
+            scroll: 0,
+        };
+    }
+}
+
+/// 缓存缺失/尺寸对不上时重建一块。
+///
+/// 尺寸对不上的两种来源：窗口尺寸被改（缩放/DPI 变化），或缓存当初建失败了。
+/// 两种都必须整块重画 —— 所以把 `hover`/`scroll` 一起清成"需要全画"的状态。
+/// `scroll = -1` 表示"缓存里画的不是当前内容"，`paint_menu_cached` 会走全量路径。
+unsafe fn ensure_cache(state: &mut MenuWindow, hwnd: HWND) {
+    let w = state.width.max(1);
+    let h = state.view_h.max(1);
+    let need = match &state.cache {
+        Some(c) => c.w != w || c.h != h,
+        None => true,
+    };
+    if !need {
+        return;
+    }
+    if let Some(mut old) = state.cache.take() {
+        old.free();
+    }
+    // 参考 DC 用窗口自己的：位图的设备格式要和贴上去的窗口一致
+    //（颜色深度/像素格式跟着 DC 走，用主屏 DC 建的位图贴到别的显示器会偏色）。
+    let src = windows::Win32::Graphics::Gdi::GetDC(Some(hwnd));
+    if src.is_invalid() {
+        return;
+    }
+    let dc = CreateCompatibleDC(Some(src));
+    if dc.is_invalid() {
+        let _ = windows::Win32::Graphics::Gdi::ReleaseDC(Some(hwnd), src);
+        return;
+    }
+    let bmp = CreateCompatibleBitmap(src, w, h);
+    let _ = windows::Win32::Graphics::Gdi::ReleaseDC(Some(hwnd), src);
+    if bmp.is_invalid() {
+        let _ = DeleteDC(dc);
+        return;
+    }
+    let old = SelectObject(dc, bmp.into());
+    state.cache = Some(MenuBitmap { dc, bmp, old_bmp: old, w, h, hover: None, scroll: -1 });
 }
 
 pub fn register_menu_class() {
@@ -940,6 +1071,9 @@ pub fn open_menu(
         open_pos: None,
         activated: false,
         swallow_up: from_left_down,
+        cache: None,
+        pending_expand: None,
+        hover_moved: false,
     }));
 
     let hwnd = unsafe {
@@ -1086,7 +1220,26 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
     match msg {
         WM_MOUSEACTIVATE => return LRESULT(3), // MA_NOACTIVATE：不抢宿主焦点
         WM_ERASEBKGND => return LRESULT(1),
-        // 菜单窗口的类光标是 NULL，走 DefWindowProc 的结果就是"光标维持打开菜单
+        // 悬停停留够了 → 现在才真的建子菜单。
+        // 判定必须用**当下**的 hover，而不是计时器 wparam 里那个下标：
+        // 计时器排队期间鼠标可能已经移走（虽然 WM_MOUSEMOVE 会 KillTimer，
+        // 但"排队 → 移走 → 又移回同一行"这种序列下 wparam 仍可能过期）。
+        WM_TIMER if wparam.0 == TIMER_EXPAND => {
+            let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), TIMER_EXPAND);
+            let Some(i) = state.pending_expand.take() else {
+                return LRESULT(0);
+            };
+            if state.hover != Some(i) || state.open_submenu_for == Some(i) {
+                return LRESULT(0);
+            }
+            // 停在这一项上这么久但**中途进过别的行**：那就重新按当前行排队，
+            // 不要在这里补展开（否则"划过去"最后停在某项上时会展开错的那一项）。
+            if !state.entries.get(i).map(|e| e.has_submenu && !e.submenu.is_empty()).unwrap_or(false) {
+                return LRESULT(0);
+            }
+            open_submenu_at(state, hwnd, i);
+            LRESULT(0)
+        }        // 菜单窗口的类光标是 NULL，走 DefWindowProc 的结果就是"光标维持打开菜单
         // 那一刻的形状"（从分隔线上右键，整个菜单里都是 ↔）。一律自己给箭头。
         WM_SETCURSOR => {
             if let Ok(c) = LoadCursorW(None, IDC_ARROW) {
@@ -1097,28 +1250,11 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut ps);
-            // 双缓冲：整块先画进内存 DC，最后一次 BitBlt 贴上去。
-            // 直接对着窗口 DC 逐行画时，鼠标在条目之间快速移动能看到画到一半的
-            // 那一帧 —— 尤其是带 Shell 位图的那些行（每行的位图都要做一次透明
-            // 混合）。合成完再贴，中间帧就不会被用户看见。
-            let mem = CreateCompatibleDC(Some(hdc));
-            let bmp = CreateCompatibleBitmap(hdc, state.width.max(1), state.view_h.max(1));
-            if !mem.is_invalid() && !bmp.is_invalid() {
-                let old = SelectObject(mem, bmp.into());
-                paint_menu(mem, state);
-                let _ = BitBlt(hdc, 0, 0, state.width, state.view_h, Some(mem), 0, 0, SRCCOPY);
-                SelectObject(mem, old);
-                let _ = DeleteObject(bmp.into());
-                let _ = DeleteDC(mem);
-            } else {
-                paint_menu(hdc, state);
-                if !mem.is_invalid() {
-                    let _ = DeleteDC(mem);
-                }
-                if !bmp.is_invalid() {
-                    let _ = DeleteObject(bmp.into());
-                }
-            }
+            // 走离屏位图缓存：整块菜单只在首次/尺寸变/滚动变时重画，
+            // 换高亮只补那一两行。展开子菜单这条路径上要连着换好几次高亮，
+            // 原来每次都整块重画（实测 ~1.1ms/次），叠起来接近 5ms —— 肉眼就是
+            // "鼠标悬停过去，子菜单顿一下才出来"。
+            paint_menu_window(hdc, state, hwnd);
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
@@ -1182,7 +1318,13 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             };
             if idx != state.hover {
                 state.hover = idx;
+                // `hover_moved`：这一次 WM_MOUSEMOVE 是"移到了新的一行"，而不是
+                // "在原来那一行里轻微抖动"。只有前者才配触发延迟展开 —— 否则鼠标
+                // 在带子菜单的那行上哪怕只是颤 1px，计时器就被反复推后永远展不开。
+                state.hover_moved = true;
                 let _ = InvalidateRect(Some(hwnd), None, false);
+            } else {
+                state.hover_moved = false;
             }
             // 第54轮：悬停到带子菜单的项 → 照资源管理器**自动展开**（用户：
             // "右键那些悬停展示怎么没了"）。第53轮把悬停展开整段删掉后，
@@ -1194,13 +1336,28 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             //
             // 这里只管"展开"，**不负责因为鼠标移开而收起** —— 收起仍走第53轮的
             // "单击固定"语义（再点一次该条目 / 点空白），所以移开时子菜单保持钉住。
+            //
+            // **延迟展开**（见 `WM_MENU_EXPAND_DELAYED` 的说明）：这里只**排**计时器，
+            // 真正建窗放到计时器到期后。原来是同一处直接建窗，而建窗+首帧+建缓存
+            // 一次要 2.8ms，扫过一列带子菜单的条目就是连续几次这种顿挫。
+            cancel_pending_expand(state, hwnd);
             if let Some(i) = idx {
                 let has_sub = {
                     let e = &state.entries[i];
                     e.has_submenu && !e.submenu.is_empty()
                 };
-                if has_sub && state.open_submenu_for != Some(i) {
-                    open_submenu_at(state, hwnd, i);
+                // 只有**从别处移进来**才排计时器：已经展开的这一项不再排，
+                // 否则鼠标在这行里轻微移动会不断把计时器推后，永远展不开。
+                if has_sub && state.open_submenu_for != Some(i) && state.hover_moved {
+                    state.pending_expand = Some(i);
+                    unsafe {
+                        let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
+                            Some(hwnd),
+                            TIMER_EXPAND,
+                            HOVER_EXPAND_DELAY_MS,
+                            None,
+                        );
+                    }
                 }
             }
             // 第53轮「单击固定展开」：光标本窗口不当把移开当成"要收起"——
@@ -1318,6 +1475,9 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         WM_LBUTTONUP => {
             let y = (lparam.0 >> 16) as i16 as i32;
             let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            // 任何一次真实点击都作废还没到期的悬停展开：点了就是"我要这一项"，
+            // 不该再被计时器补一个子菜单出来。
+            cancel_pending_expand(state, hwnd);
             // 弹出本窗口的那一次"按下"的抬起：只吞掉这一次。
             // 不吞的话菜单刚弹出就被自己关掉 —— 用户必须一直按住才看得见它。
             if state.swallow_up {
@@ -1406,8 +1566,15 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             LRESULT(0)
         }
         WM_DESTROY => {
+            cancel_pending_expand(state, hwnd);
             if let Some(sub) = state.submenu {
                 let _ = DestroyWindow(sub);
+            }
+            // 离屏位图是本窗口 GDI 对象的持有者：DestroyWindow 不会替我们
+            // DeleteDC/DeleteObject（选在里面的位图还会挡住删除）。漏了这一步
+            // 就是每次开一次菜单泄漏一块 DC + 一块位图。
+            if let Some(mut c) = state.cache.take() {
+                c.free();
             }
             let _ = ReleaseCapture();
             let app = state.app;
@@ -1616,6 +1783,9 @@ pub unsafe fn paint_menu_into(
         open_pos: None,
         activated: false,
         swallow_up: false,
+        cache: None,
+        pending_expand: None,
+        hover_moved: false,
     };
     paint_menu(hdc, &st);
 }
@@ -1634,130 +1804,265 @@ unsafe fn menu_fill_radius(hdc: HDC, id: &str, r: &RECT, fill: windows::Win32::F
     crate::paint::fill_radius(&*app, hdc, id, r, fill, None);
 }
 
-unsafe fn paint_menu(hdc: HDC, state: &MenuWindow) {
+/// 菜单的板底 + 裁剪 + 字体，在内容坐标系下画好，返回旧字体句柄。
+///
+/// `hdc` 的窗口原点已经由 `SetWindowOrgEx(-ox, scroll-oy)` 设成内容坐标系，
+/// 所以下面所有 y 都是**内容 y**，行高/位置和命中判定用的是同一套。
+unsafe fn begin_menu_paint(hdc: HDC, state: &MenuWindow) -> windows::Win32::Graphics::Gdi::HGDIOBJ {
     let t = &state.theme;
-    let mut r = RECT::default();
-    unsafe {
-        // 客户区高度就是可见高度；内容更长时由滚动偏移决定画哪一段。
-        //
-        // 这块底板**必须自己带上 ox/oy**：此时窗口原点还没设（下一行才
-        // SetWindowOrgEx），画的是设备坐标。真菜单窗口 ox=oy=0 看不出差别，
-        // 设置页「右键菜单」里 ox/oy 是面板左上角，少了这个偏移整块底板会
-        // 糊到窗口 (0,0) 上，把侧栏和标题栏一起盖掉。
-        r.left = state.ox;
-        r.top = state.oy;
-        r.right = state.ox + state.width;
-        r.bottom = state.oy + state.view_h;
-        menu_fill_radius(hdc, "menu.panel", &r, t.surface);
+    // 客户区高度就是可见高度；内容更长时由滚动偏移决定画哪一段。
+    //
+    // 这块底板**必须自己带上 ox/oy**：此时窗口原点还没设（下一行才
+    // SetWindowOrgEx），画的是设备坐标。真菜单窗口 ox=oy=0 看不出差别，
+    // 设置页「右键菜单」里 ox/oy 是面板左上角，少了这个偏移整块底板会
+    // 糊到窗口 (0,0) 上，把侧栏和标题栏一起盖掉。
+    let r = RECT {
+        left: state.ox,
+        top: state.oy,
+        right: state.ox + state.width,
+        bottom: state.oy + state.view_h,
+    };
+    menu_fill_radius(hdc, "menu.panel", &r, t.surface);
 
-        // 裁剪到可见区，避免超长内容画到窗口外（也会溢出到屏幕上）
-        let clip = RECT {
-            left: state.ox,
-            top: state.oy,
-            right: state.ox + state.width,
-            bottom: state.oy + state.view_h,
-        };
-        let _ = IntersectClipRect(hdc, clip.left, clip.top, clip.right, clip.bottom);
-        SetWindowOrgEx(hdc, -state.ox, state.scroll - state.oy, None);
+    // 裁剪到可见区，避免超长内容画到窗口外（也会溢出到屏幕上）
+    let _ = IntersectClipRect(hdc, r.left, r.top, r.right, r.bottom);
+    SetWindowOrgEx(hdc, -state.ox, state.scroll - state.oy, None);
 
-        let font = crate::paint::menu_font(state.scale);
-        let old_font = SelectObject(hdc, font.into());
-        SetBkMode(hdc, TRANSPARENT);
+    let font = crate::paint::menu_font(state.scale);
+    let old_font = SelectObject(hdc, font.into());
+    SetBkMode(hdc, TRANSPARENT);
+    old_font
+}
 
-        let mut top = 4;
-        for (i, e) in state.entries.iter().enumerate() {
-            if e.separator {
-                let line = CreateSolidBrush(t.border);
-                let lr = RECT { left: (10.0 * state.scale) as i32, top: top + 3, right: state.width - (10.0 * state.scale) as i32, bottom: top + 4 };
-                let _ = FillRect(hdc, &lr, line);
-                DeleteObject(line.into());
-                top += 6;
-                continue;
-            }
-            let rect = RECT { left: 0, top, right: state.width, bottom: top + state.row_h };
-            let hovered = state.hover == Some(i) && !e.disabled;
-            if hovered {
-                menu_fill_radius(hdc, "menu.hover", &rect, t.hover_bg);
-                // 左侧再压一条强调竖线：光靠底色在暗色主题下对比仍然偏弱，
-                // 加一条 3px 的重色边，鼠标在哪一行一眼就能看出来。
-                let ab = CreateSolidBrush(t.accent);
-                let ar = RECT { left: 0, top, right: (3.0 * state.scale) as i32, bottom: top + state.row_h };
-                let _ = FillRect(hdc, &ar, ab);
-                DeleteObject(ab.into());
-            }
-            // 「当前生效的那一项」：和悬停同构（行首竖线），但换橙色。
-            // 悬停时优先画蓝色（鼠标位置是更即时、更需要看清的信息），
-            // 没悬停才显示橙色的选中标记。
-            if e.selected && !hovered {
-                let ob = CreateSolidBrush(t.orange);
-                let or_ = RECT { left: 0, top, right: (3.0 * state.scale) as i32, bottom: top + state.row_h };
-                let _ = FillRect(hdc, &or_, ob);
-                DeleteObject(ob.into());
-            }
-            // 禁用态要和 Windows 一致：字淡到"读得出但明显不可用"，并且**不参与
-            // 悬停高亮**（上面 hovered 已经排除了）。只改颜色不改布局，
-            // 免得菜单宽度随状态跳来跳去。
-            SetTextColor(hdc, if e.disabled { t.text_dim } else { t.text });
-            let icon_pad = (10.0 * state.scale) as i32;
-            if let Some(glyph) = e.glyph {
-                let gfont = crate::paint::glyph_font(state.scale);
-                let old2 = SelectObject(hdc, gfont.into());
-                let mut g: Vec<u16> = glyph.encode_utf16().collect();
-                let gr = RECT { left: icon_pad, top, right: icon_pad + (28.0 * state.scale) as i32, bottom: top + state.row_h };
-                DrawTextW(hdc, &mut g, &mut gr.clone(), DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-                SelectObject(hdc, old2);
-            }
-            if let Some(hbmp) = e.bmp {
-                draw_bmp(hdc, hbmp, icon_pad, top + (state.row_h - 16) / 2, 16);
-            }
-            let icon_left = icon_pad + (28.0 * state.scale) as i32;
-            let mut text: Vec<u16> = e.text.encode_utf16().collect();
-            let tr = RECT {
-                left: icon_left,
-                top,
-                right: state.width - (26.0 * state.scale) as i32,
-                bottom: top + state.row_h,
-            };
-            DrawTextW(hdc, &mut text, &mut tr.clone(), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-            if e.has_submenu {
-                // 与侧栏**同一个**实心三角，只是方向朝右（`down = false`）。
-                // 之前是拿 ASCII 的 ">" 当箭头：字号小、笔画细、位置还随字体漂，
-                // 和侧栏那套树形箭头完全不是一个东西。
-                let ar = RECT {
-                    left: state.width - (22.0 * state.scale) as i32,
-                    top,
-                    right: state.width - 6,
-                    bottom: top + state.row_h,
-                };
-                crate::paint::draw_tree_chevron(hdc, &ar, t.text_dim, false);
-            }
-            top += state.row_h;
-        }
+/// 第 `index` 项的**内容坐标**顶边。
+fn entry_top(state: &MenuWindow, index: usize) -> i32 {
+    let mut top = 4;
+    for e in state.entries.iter().take(index) {
+        top += if e.separator { 6 } else { state.row_h };
+    }
+    top
+}
 
-        // 滚动指示：内容未显示完时，在顶/底画一条提示三角（画完要还原原点）
-        SetWindowOrgEx(hdc, -state.ox, -state.oy, None);
-        let more_up = state.scroll > 0;
-        let more_down = state.scroll < max_scroll(state);
-        if more_up || more_down {
-            let c = CreateSolidBrush(t.text_dim);
+/// 画第 `index` 项。`hovered` 由调用方给 —— 局部重画时必须能单独指定
+/// "这一行现在算不算悬停"，不能读全局 `state.hover`。
+unsafe fn paint_entry(hdc: HDC, state: &MenuWindow, index: usize, top: i32, hovered: bool) {
+    let t = &state.theme;
+    let e = &state.entries[index];
+    if e.separator {
+        let line = CreateSolidBrush(t.border);
+        let lr = RECT { left: (10.0 * state.scale) as i32, top: top + 3, right: state.width - (10.0 * state.scale) as i32, bottom: top + 4 };
+        let _ = FillRect(hdc, &lr, line);
+        DeleteObject(line.into());
+        return;
+    }
+    let rect = RECT { left: 0, top, right: state.width, bottom: top + state.row_h };
+    if hovered && !e.disabled {
+        menu_fill_radius(hdc, "menu.hover", &rect, t.hover_bg);
+        // 左侧再压一条强调竖线：光靠底色在暗色主题下对比仍然偏弱，
+        // 加一条 3px 的重色边，鼠标在哪一行一眼就能看出来。
+        let ab = CreateSolidBrush(t.accent);
+        let ar = RECT { left: 0, top, right: (3.0 * state.scale) as i32, bottom: top + state.row_h };
+        let _ = FillRect(hdc, &ar, ab);
+        DeleteObject(ab.into());
+    }
+    // 「当前生效的那一项」：和悬停同构（行首竖线），但换橙色。
+    // 悬停时优先画蓝色（鼠标位置是更即时、更需要看清的信息），
+    // 没悬停才显示橙色的选中标记。
+    if e.selected && !hovered {
+        let ob = CreateSolidBrush(t.orange);
+        let or_ = RECT { left: 0, top, right: (3.0 * state.scale) as i32, bottom: top + state.row_h };
+        let _ = FillRect(hdc, &or_, ob);
+        DeleteObject(ob.into());
+    }
+    // 禁用态要和 Windows 一致：字淡到"读得出但明显不可用"，并且**不参与
+    // 悬停高亮**（上面 hovered 已经排除了）。只改颜色不改布局，
+    // 免得菜单宽度随状态跳来跳去。
+    SetTextColor(hdc, if e.disabled { t.text_dim } else { t.text });
+    let icon_pad = (10.0 * state.scale) as i32;
+    if let Some(glyph) = e.glyph {
+        // 空字形喂给 DrawTextW 会崩（windows-rs 对空切片解引用）。
+        // 自有命令都带 glyph，但设置页预览能造出空串条目，守卫必须留在这里。
+        if !glyph.is_empty() {
             let gfont = crate::paint::glyph_font(state.scale);
             let old2 = SelectObject(hdc, gfont.into());
-            SetTextColor(hdc, t.text);
-            if more_up {
-                let mut a: Vec<u16> = "\u{E70E}".encode_utf16().collect(); // ChevronUp
-                let ar = RECT { left: state.width - 22, top: 0, right: state.width - 4, bottom: 14 };
-                DrawTextW(hdc, &mut a, &mut ar.clone(), DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-            }
-            if more_down {
-                let mut a: Vec<u16> = "\u{E70D}".encode_utf16().collect(); // ChevronDown
-                let ar = RECT { left: state.width - 22, top: state.view_h - 14, right: state.width - 4, bottom: state.view_h };
-                DrawTextW(hdc, &mut a, &mut ar.clone(), DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-            }
+            let mut g: Vec<u16> = glyph.encode_utf16().collect();
+            let gr = RECT { left: icon_pad, top, right: icon_pad + (28.0 * state.scale) as i32, bottom: top + state.row_h };
+            DrawTextW(hdc, &mut g, &mut gr.clone(), DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
             SelectObject(hdc, old2);
-            DeleteObject(c.into());
         }
+    }
+    if let Some(hbmp) = e.bmp {
+        draw_bmp(hdc, hbmp, icon_pad, top + (state.row_h - 16) / 2, 16);
+    }
+    let icon_left = icon_pad + (28.0 * state.scale) as i32;
+    let mut text: Vec<u16> = e.text.encode_utf16().collect();
+    let tr = RECT {
+        left: icon_left,
+        top,
+        right: state.width - (26.0 * state.scale) as i32,
+        bottom: top + state.row_h,
+    };
+    DrawTextW(hdc, &mut text, &mut tr.clone(), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    if e.has_submenu {
+        // 与侧栏**同一个**实心三角，只是方向朝右（`down = false`）。
+        // 之前是拿 ASCII 的 ">" 当箭头：字号小、笔画细、位置还随字体漂，
+        // 和侧栏那套树形箭头完全不是一个东西。
+        let ar = RECT {
+            left: state.width - (22.0 * state.scale) as i32,
+            top,
+            right: state.width - 6,
+            bottom: top + state.row_h,
+        };
+        crate::paint::draw_tree_chevron(hdc, &ar, t.text_dim, false);
+    }
+}
 
+/// 顶/底的滚动提示三角（画在设备坐标上，不吃滚动偏移）。
+unsafe fn paint_scroll_hint(hdc: HDC, state: &MenuWindow) {
+    let t = &state.theme;
+    let more_up = state.scroll > 0;
+    let more_down = state.scroll < max_scroll(state);
+    if !more_up && !more_down {
+        return;
+    }
+    let c = CreateSolidBrush(t.text_dim);
+    let gfont = crate::paint::glyph_font(state.scale);
+    let old2 = SelectObject(hdc, gfont.into());
+    SetTextColor(hdc, t.text);
+    if more_up {
+        let mut a: Vec<u16> = "\u{E70E}".encode_utf16().collect(); // ChevronUp
+        let ar = RECT { left: state.width - 22, top: 0, right: state.width - 4, bottom: 14 };
+        DrawTextW(hdc, &mut a, &mut ar.clone(), DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    }
+    if more_down {
+        let mut a: Vec<u16> = "\u{E70D}".encode_utf16().collect(); // ChevronDown
+        let ar = RECT { left: state.width - 22, top: state.view_h - 14, right: state.width - 4, bottom: state.view_h };
+        DrawTextW(hdc, &mut a, &mut ar.clone(), DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    }
+    SelectObject(hdc, old2);
+    DeleteObject(c.into());
+}
+
+unsafe fn paint_menu(hdc: HDC, state: &MenuWindow) {
+    unsafe {
+        let old_font = begin_menu_paint(hdc, state);
+        for i in 0..state.entries.len() {
+            paint_entry(hdc, state, i, entry_top(state, i), state.hover == Some(i));
+        }
+        SetWindowOrgEx(hdc, -state.ox, -state.oy, None);
+        paint_scroll_hint(hdc, state);
         SelectObject(hdc, old_font);
     }
+}
+
+/// 菜单窗口的 `WM_PAINT`：走离屏位图缓存，换高亮只重画脏掉的那一两行。
+///
+/// 判据是缓存里记录的 `hover`/`scroll` 与当前值是否一致：
+///   * 尺寸变了（缩放/DPI）→ 缓存重建 → 整块画
+///   * 滚动位置变了 → 缓存只覆盖旧的那一屏 → 整块画
+///   * 只有高亮变了 → **只重画旧高亮行和新高亮行**，其余行一个 GDI 调用都不发
+unsafe fn paint_menu_window(hdc: HDC, state: &mut MenuWindow, hwnd: HWND) {
+    unsafe {
+        ensure_cache(state, hwnd);
+        let Some((w, h)) = state.cache.as_ref().map(|c| (c.w, c.h)) else {
+            // 缓存建不起来（极端情况下 GDI 会失败）：退回一次性直绘。
+            paint_menu(hdc, state);
+            return;
+        };
+        let scroll = state.scroll;
+        let hover = state.hover;
+        let full = match state.cache.as_ref() {
+            Some(c) => c.scroll != scroll,
+            None => true,
+        };
+        if full {
+            let dc = state.cache.as_ref().unwrap().dc;
+            let old_font = begin_menu_paint(dc, state);
+            for i in 0..state.entries.len() {
+                paint_entry(dc, state, i, entry_top(state, i), hover == Some(i));
+            }
+            SetWindowOrgEx(dc, -state.ox, -state.oy, None);
+            paint_scroll_hint(dc, state);
+            SelectObject(dc, old_font);
+            let c = state.cache.as_mut().unwrap();
+            c.scroll = scroll;
+            c.hover = hover;
+        } else {
+            // 只补画"高亮从 A 变到 B"涉及的至多两行。
+            //
+            // 必须**先擦掉该行的底色再重画**：上一帧这行画过高亮圆角底，
+            // 直接画上去会和旧底色叠在一起（圆角处露出上一帧的弧边）。
+            let dc = state.cache.as_ref().unwrap().dc;
+            let prev = state.cache.as_ref().unwrap().hover;
+            state.cache.as_mut().unwrap().hover = hover;
+            if prev != hover {
+                for idx in [prev, hover].into_iter().flatten() {
+                    if idx >= state.entries.len() {
+                        continue;
+                    }
+                    let ctop = entry_top(state, idx);
+                    let row_h = if state.entries[idx].separator { 6 } else { state.row_h };
+                    // 这一行在**设备坐标**里的纵向范围（缓存位图是设备坐标）。
+                    // 滚出可见区的行本来就不在缓存里，跳过。
+                    let y0 = (ctop - scroll).max(0);
+                    let y1 = (ctop + row_h - scroll).min(state.view_h);
+                    if y1 <= y0 {
+                        continue;
+                    }
+                    let saved = SaveDC(dc);
+                    // 擦底区域必须**与面板的圆角求交**：第一行/最后一行擦的是
+                    // 整条宽度，直接铺方块会把面板的圆角抹平成直角。
+                    let panel = CreateRoundRectRgn(
+                        state.ox,
+                        state.oy,
+                        state.ox + state.width,
+                        state.oy + state.view_h,
+                        panel_d(state),
+                        panel_d(state),
+                    );
+                    let band = CreateRectRgn(state.ox, state.oy + y0, state.ox + state.width, state.oy + y1);
+                    let _ = CombineRgn(Some(panel), Some(panel), Some(band), RGN_AND);
+                    let _ = DeleteObject(band.into());
+                    let _ = SelectClipRgn(dc, Some(panel));
+                    let br = CreateSolidBrush(state.theme.surface);
+                    let er = RECT { left: state.ox, top: state.oy + y0, right: state.ox + state.width, bottom: state.oy + y1 };
+                    let _ = FillRect(dc, &er, br);
+                    DeleteObject(br.into());
+                    // 擦干净了，把裁剪恢复到整块面板再画这一行
+                    // （paint_entry 里那些圆角高亮底自己也要被裁在面板内）。
+                    let full = CreateRoundRectRgn(
+                        state.ox,
+                        state.oy,
+                        state.ox + state.width,
+                        state.oy + state.view_h,
+                        panel_d(state),
+                        panel_d(state),
+                    );
+                    let _ = SelectClipRgn(dc, Some(full));
+                    let font = crate::paint::menu_font(state.scale);
+                    let of = SelectObject(dc, font.into());
+                    SetBkMode(dc, TRANSPARENT);
+                    // 这里画的是**设备坐标**（不设窗口原点），所以传给
+                    // paint_entry 的 y 要自己减掉滚动偏移。
+                    paint_entry(dc, state, idx, ctop - scroll, hover == Some(idx));
+                    SelectObject(dc, of);
+                    let _ = RestoreDC(dc, saved);
+                    let _ = DeleteObject(full.into());
+                }
+            }
+        }
+        let dc = state.cache.as_ref().unwrap().dc;
+        let _ = BitBlt(hdc, 0, 0, w.min(state.width), h.min(state.view_h), Some(dc), 0, 0, SRCCOPY);
+    }
+}
+
+/// 面板圆角的椭圆直径，必须和 `fill_radius` 里那个 `d` 同口径
+/// （`d = (rad*2).min(w).min(h)`，传的是**直径**不是半径）。
+fn panel_d(state: &MenuWindow) -> i32 {
+    let rad = crate::app_ref_opt().map(|a| a.radius_of("menu.panel") as i32).unwrap_or(0);
+    if rad <= 0 {
+        return 0;
+    }
+    (rad * 2).min(state.width).min(state.view_h)
 }
 

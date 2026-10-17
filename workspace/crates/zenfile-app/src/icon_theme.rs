@@ -560,20 +560,35 @@ fn draw_ui(kind: Ui, cv: &mut Cv, col: [u8; 3]) {
         // 上下内缩 `hw*1.2`（不然竖条只剩中间三行、断成三段点）。
         // 这里保留那两个结论，只把外框尺寸对齐到统一的 4..28。
         Ui::PaneToggle => {
+            // ⚠️ 第73轮：这里原来写死 `pw = 5.0`（**绝对**宽度），
+            // 叠在 `ring_rrect` 的 `hw` 描边上，渲染出 11.76px 的粗框
+            // —— 是整套图标里最重的一个（真窗口实测，比同排的 Min 粗 7.7 倍）。
+            //
+            // 根因：`pw` 是绝对设计单位、而 `hw` 随边长缩放，两套尺度混用。
+            // 第73轮把 `stroke_hw` 改成"物理直径恒定"之后，正确做法是
+            // **让内部分隔条也是一根笔画**（`hw` 粗），而不是一个实心块。
+            //
+            // 画法：一个圆角外框 + 一根与边框**同粗**的竖条。
+            // 竖条宽度 = `2*hw`，净空靠 `row_gap` 级别的间隙保证。
             let r = d::corner(span * 0.88, hw);
-            cv.ring_rrect(min, min + span * 0.06, span, span * 0.88, hw, r, col);
-            // 左栏：**绝对宽**（百分比在 17/18px 两档表现不同，17px 档
-            // 净宽不到 3px 成了发丝）。上下内缩只有 hw*1.2，
-            // 保证竖条是**连续**的一段。
-            let pw = 5.0f32;
-            let ix = hw * 2.4;
-            let iy = hw * 1.2;
-            let (bx, by) = (min + ix, min + span * 0.06 + iy);
-            cv.fill(
-                [bx, by, bx + pw, by + span * 0.88 - iy * 2.0],
-                col,
-                move |x, y| sd_rrect(x, y, bx, by, pw, span * 0.88 - iy * 2.0, r * 0.5),
-            );
+            let fy = min + span * 0.06;
+            let fh = span * 0.88;
+            cv.ring_rrect(min, fy, span, fh, hw, r, col);
+            // 左栏：与边框**同粗**（`2*hw`），不写死绝对宽度。
+            // 竖条墨迹净空 = `2*hw`（边框墨迹内侧到竖条墨迹左侧），
+            // 正好一个直径 —— 和 hamburger 的行距同一口径，不糊。
+            let pw = 2.0 * hw;
+            let ix = 2.0 * hw + hw * 1.0;   // 离边框内缘留 `hw` 净空
+            let iy = hw * 1.0;
+            let (bx, by) = (min + ix, fy + iy);
+            let bh = fh - iy * 2.0;
+            if bh > pw {
+                cv.fill(
+                    [bx, by, bx + pw, by + bh],
+                    col,
+                    move |x, y| sd_rrect(x, y, bx, by, pw, bh, hw.min(r * 0.5)),
+                );
+            }
         }
 
         // ═══════════════════════════════════════════════════════════════

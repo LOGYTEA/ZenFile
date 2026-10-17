@@ -16,6 +16,8 @@ use zenfile_core::paths;
 use zenfile_core::process::ProcessTree;
 use zenfile_core::types::{filter_entries, FileEntry, FileKind, SortKey, SortSpec, ViewMode};
 use zenfile_core::watch::{DirWatcher, WatchMsg};
+
+use crate::plugin_server;
 use windows::Win32::Foundation::{COLORREF, HWND, RECT};
 use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, IsWindow};
@@ -669,6 +671,14 @@ pub struct App {
     /// **面板上那个"插件"页读的就是它**，不再读 `cfg.modules` 里那份
     /// 从来没人填过的空配置 —— 之前那页永远显示"没有已注册的插件模块"。
     pub plugins: zenfile_core::plugin::PluginHost,
+    /// 每个插件的管道 server（宿主这一侧）。
+    ///
+    /// 按插件 id 索引。**只在第一个窗口的 `App` 里非空**
+    /// （`discover_plugins` 有一次性门），插件是进程级共享资源，
+    /// 不该按窗口数复制。
+    pub plugin_pipes: std::collections::BTreeMap<String, plugin_server::PipeServer>,
+    /// 每个插件上次落盘心跳的时刻。用来给日志节流（见 pump_plugin_heartbeats）。
+    last_logged_beat: std::collections::BTreeMap<String, u64>,
     pub show_hidden: bool,
     /// 是否显示"受保护的操作系统文件"（带 FILE_ATTRIBUTE_SYSTEM 的项）。
     /// 与 show_hidden 相互独立 —— 资源管理器也是两道分开的开关。
@@ -690,6 +700,16 @@ pub struct App {
     pub sidebar_expanded: HashSet<String>,
     /// 已展开节点的子目录清单。`None` 表示还没取过。
     pub sidebar_children: HashMap<String, Vec<PathBuf>>,
+    /// 侧栏"网络"节点下的网络位置清单（枚举结果，后台线程送回）。
+    pub net_locations: Vec<zenfile_core::network::NetLocation>,
+    /// 上一批网络枚举的诊断（区分"确实没有"与"枚举出错"）。
+    pub net_diag: zenfile_core::network::NetScanError,
+    /// 网络枚举**正在进行**（结果还没回来）。侧栏据此显示"正在连接…"而不是空列表。
+    pub net_scanning: bool,
+    /// 网络枚举的接收端。在跑的时候是 `Some`，收到结果后置回 `None`。
+    pub net_rx: Option<Receiver<(Vec<zenfile_core::network::NetLocation>, zenfile_core::network::NetScanError)>>,
+    /// 网络枚举的代数，用于丢弃过期批次（与目录枚举同一套 generation 思路）。
+    pub net_gen: u64,
     /// 鼠标悬停的导航行下标（用于 hover 反馈）。
     pub sidebar_hover: Option<usize>,
     /// 鼠标悬停的**条目**下标（`tab.entries` 的下标，不是可见行号）。
@@ -1313,6 +1333,26 @@ pub struct SidebarRow {
 }
 
 impl SidebarRow {
+    /// 一个不可再展开的叶子行（点它就导航）。
+    ///
+    /// `guides` 是树线，`last_child` 决定连接线是否在这一行收口 —— 两者都由
+    /// 调用方按"自己是不是父节点最后一个孩子"传进来，不在函数里猜。
+    pub fn leaf(label: String, depth: usize, guides: Vec<bool>, last_child: bool) -> Self {
+        SidebarRow {
+            label,
+            target: String::new(),
+            depth,
+            expandable: false,
+            expanded: false,
+            key: String::new(),
+            icon: SidebarIcon::Glyph(""),
+            guides,
+            last_child,
+            has_parent: true,
+            spacer: false,
+        }
+    }
+
     /// 分组之间的空行。
     pub fn spacer() -> Self {
         SidebarRow {
@@ -1333,6 +1373,12 @@ impl SidebarRow {
 
 /// "此电脑"这个虚拟节点在 `sidebar_expanded` 里的 key。
 pub const SIDEBAR_THISPC: &str = "thispc";
+
+/// 侧栏"网络"节点的 key。
+///
+/// 它和 `SIDEBAR_THISPC` 一样是虚拟节点（没有对应目录），但**不导航**：
+/// 点击只是展开，展开后列出网络驱动器与共享。
+pub const SIDEBAR_NET: &str = "network";
 
 /// 一级常用文件夹。顺序照抄资源管理器左侧的上半段。
 fn user_folders() -> Vec<(&'static str, String)> {
@@ -1444,10 +1490,17 @@ impl App {
             plugins: zenfile_core::plugin::PluginHost::new(
                 std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ZenFile.exe")),
             ),
+            plugin_pipes: std::collections::BTreeMap::new(),
+            last_logged_beat: std::collections::BTreeMap::new(),
             drives: HashMap::new(),
             drives_stamp: None,
             sidebar_expanded: HashSet::new(),
             sidebar_children: HashMap::new(),
+            net_locations: Vec::new(),
+            net_diag: Default::default(),
+            net_scanning: false,
+            net_rx: None,
+            net_gen: 0,
             sidebar_hover: None,
             hover_row: None,
             hover_pane: None,
@@ -2499,6 +2552,16 @@ impl App {
         let dir = zenfile_core::plugin::plugins_dir_for(&exe);
         self.plugins.discover(&dir);
         zenfile_core::plugin::ensure_all(&mut self.plugins);
+        // ensure_all 之后才有 pid，管道必须在它之后建。
+        let ids: Vec<String> = self
+            .plugins
+            .slots()
+            .filter(|s| s.pid != 0)
+            .map(|s| s.manifest.id.clone())
+            .collect();
+        for id in ids {
+            self.open_plugin_pipe(&id);
+        }
         let _ = DONE.set(());
         self.log_plugins("discover");
     }
@@ -2548,11 +2611,84 @@ impl App {
     /// 挂在消息循环的定时器上按帧调。**不能省这一步**：省了的话插件崩溃
     /// 之后宿主根本不知道，它会在面板上永远显示"运行中"。
     pub fn tick_plugins(&mut self) -> bool {
+        self.pump_plugin_heartbeats();
         let dirty = self.plugins.tick();
         if dirty {
             zenfile_core::plugin::ensure_all(&mut self.plugins);
         }
         dirty
+    }
+
+    /// 插件被拉起后建它的管道 server（宿主侧）。
+    ///
+    /// **必须在 spawn 之后**：管道名里有插件自己的 pid，spawn 之前拿不到 pid，
+    /// 名字拼不出来。spawn 之前也没法建管道。
+    ///
+    /// 先 drop 掉旧的那根：插件重启后 pid 变了，管道名跟着变，
+    /// 留着旧实例会占着 FILE_FLAG_FIRST_PIPE_INSTANCE 的坑位。
+    pub fn open_plugin_pipe(&mut self, id: &str) {
+        let Some(slot) = self.plugins.slot(id) else { return };
+        if slot.pid == 0 {
+            return;
+        }
+        let name = zenfile_core::plugin::pipe_name(slot.pid, id);
+        let Some(mut srv) = plugin_server::PipeServer::create(&name, zenfile_core::now_ms())
+        else {
+            // 建不出管道不该让宿主失败 —— 插件照样在跑，只是心跳收不到，
+            // 5 秒后会被误判卡死。这是可接受的降级。
+            return;
+        };
+        srv.start();
+        self.plugin_pipes.insert(id.to_string(), srv);
+    }
+
+    /// 把各管道观察到的心跳搬进 `PluginHost`，然后再 tick。
+    ///
+    /// 顺序不能反：心跳判定读的就是刚搬进去的值。
+    fn pump_plugin_heartbeats(&mut self) {
+        let obs: Vec<(String, u64, bool)> = self
+            .plugin_pipes
+            .iter()
+            .map(|(id, s)| (id.clone(), s.last_heartbeat(), s.greeted()))
+            .collect();
+        // 落盘心跳观测：判断「管道到底通没通」只能看真实观测值，
+        // 不能靠"没看到失败日志"反推（那就是没测）。
+        //
+        // **每 tick（100ms）都写会把日志撑爆**，所以按心跳周期节流：
+        // 只有 last_beat 变了才记一行，插件正常时约 2.5s 一行。
+        let changed: Vec<&(String, u64, bool)> = obs
+            .iter()
+            .filter(|(id, at, _)| self.last_logged_beat.get(id).copied() != Some(*at))
+            .collect();
+        if !changed.is_empty() {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(std::env::temp_dir().join("zenfile_plugins.log"))
+            {
+                let now = zenfile_core::now_ms();
+                for (id, at, greeted) in changed.iter() {
+                    let _ = writeln!(
+                        f,
+                        "[beat] id={} now={} last_beat={} age_ms={} greeted={} pipe={}",
+                        id,
+                        now,
+                        at,
+                        now.saturating_sub(*at),
+                        greeted,
+                        self.plugin_pipes
+                            .get(id)
+                            .map(|s| s.name().to_string())
+                            .unwrap_or_default()
+                    );
+                }
+            }
+            for (id, at, _) in changed.into_iter() {
+                self.last_logged_beat.insert(id.clone(), *at);
+            }
+        }
+        self.plugins.ingest_pipe_observations(obs.into_iter());
     }
 
     /// 用户在面板上启 / 停一个插件。
@@ -2570,6 +2706,12 @@ impl App {
             }
         }).enabled = on;
         let r = self.plugins.set_enabled(id, on);
+        // 停用：关掉管道（join 读线程 + 关句柄）。启用：拉起后建新管道。
+        if on {
+            self.open_plugin_pipe(id);
+        } else {
+            self.plugin_pipes.remove(id);
+        }
         let _ = zenfile_core::config::Config::save_user_patch(&serde_json::json!({
             "modules": self.cfg.modules
         }));
@@ -3810,11 +3952,18 @@ impl App {
         )) {
             return;
         }
-        let owner = self.hwnd.0 as isize;
-        if let Err(e) = delete_items(owner, &items, !permanent) {
-            report(self.hwnd, &format!("删除失败：{e}"));
-        }
-        self.reload();
+        // 删除必须上后台线程：`IFileOperation::commit()` 是**同步阻塞**的，
+        // 删一棵大树/几万个文件时在 UI 线程上就是"点一下删除整个窗口僵住"，
+        // 连带进度动画都停。`spawn_io` 里每线程各自做 COM STA 初始化，
+        // owner 传 0 让 Shell 框是无属主的（见 spawn_io 的注释）。
+        //
+        // **刻意不在这里 reload**：立刻重列列的是操作前的快照，用户会看到
+        // 文件还在原地、过一会儿才自己消失 —— 比卡住更像出错了。真正的重列
+        // 放在 `drain_io` 里，等后台跑完（`io_pending` 归零）再列。
+        let recycle = !permanent;
+        self.spawn_io("删除", move || {
+            delete_items(0, &items, recycle)
+        });
     }
 
     /// 新建之后的收尾：重列 + 把新建那一项选中 + 进重命名。
@@ -3967,14 +4116,22 @@ impl App {
     /// 由 `WM_APP_IO_DONE` 调用。空串 = 成功。
     pub fn drain_io(&mut self) {
         let mut err: Option<String> = None;
+        let mut any = false;
         while let Ok(msg) = self.io_rx.try_recv() {
             self.io_pending = self.io_pending.saturating_sub(1);
+            any = true;
             if !msg.is_empty() && err.is_none() {
                 err = Some(msg);
             }
         }
         if let Some(e) = err {
             report(self.hwnd, &e);
+        }
+        // 操作跑在后台线程上，目录内容**必须**等它跑完再重列。
+        // 发起时就 reload 的话列的是操作前的快照，用户会看到文件还在原地，
+        // 过一会儿才自己消失 —— 比卡住更像出错了。
+        if any && self.io_pending == 0 {
+            self.reload();
         }
     }
 
@@ -5246,9 +5403,59 @@ impl App {
             return;
         }
         self.sidebar_expanded.insert(key.to_string());
+        if key == SIDEBAR_NET {
+            // 网络位置不是目录树，得走自己的枚举通道。
+            self.spawn_network_scan();
+            return;
+        }
         if key != SIDEBAR_THISPC {
             self.load_sidebar_children(key);
         }
+    }
+
+    /// 后台枚举网络位置。
+    ///
+    /// `network::scan()` 会走 `WNetEnumResourceW(GLOBALNET)`，那一步要真的和网络上的
+    /// 主机握手 —— 机器关机或丢包时会阻塞数秒起。放在主线程就是"点一下网络整个软件僵住"。
+    /// 所以这里只发一趟活就返回，结果由 `WM_APP_NET` 收口。
+    ///
+    /// 已在跑就不重复派：连续展开/刷新只会堆线程，不会更快。
+    pub fn spawn_network_scan(&mut self) {
+        if self.net_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.net_rx = Some(rx);
+        self.net_scanning = true;
+        let hwnd_raw = self.hwnd.0 as usize;
+        std::thread::spawn(move || {
+            let res = zenfile_core::network::scan();
+            let _ = tx.send(res);
+            unsafe {
+                let ok = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(windows::Win32::Foundation::HWND(hwnd_raw as *mut core::ffi::c_void)),
+                    crate::WM_APP_NET,
+                    windows::Win32::Foundation::WPARAM(0),
+                    windows::Win32::Foundation::LPARAM(0),
+                );
+            }
+        });
+    }
+
+    /// `WM_APP_NET` 的收口：把 worker 枚举到的网络位置装进状态。
+    ///
+    /// **必须在这里才允许碰 UI 状态**：worker 绝不改 App。
+    pub fn drain_network(&mut self) {
+        let Some(rx) = self.net_rx.take() else {
+            return;
+        };
+        // 只取最新一批：中途若又派过一趟，旧的直接丢（generation 语义）。
+        if let Ok((locs, diag)) = rx.try_recv() {
+            self.net_locations = locs;
+            self.net_diag = diag;
+        } else {
+        }
+        self.net_scanning = false;
     }
 
     /// 导航窗格滚动。偏移按"整棵树的内容高度 vs 窗格高度"钳制，滚到底不会留空白。
@@ -5370,8 +5577,73 @@ impl App {
                 }
             }
         }
-        // "此电脑 + 盘符"这一组和回收站之间同样留一格
+        // "此电脑 + 盘符"这一组和"网络 / 回收站"之间留一格
         rows.push(SidebarRow::spacer());
+
+        // "网络"：展开后列出网络驱动器与共享。
+        //
+        // 位置放在"此电脑"之后、回收站之前 —— 与资源管理器左侧一致（网络在
+        // 此电脑/文件夹之后、回收站垫底）。展开才发枚举，收起不取消后台任务
+        // （那趟活反正已经在网络栈里跑了，掐断线程反而可能让 MPR 状态不一致）。
+        let net_expanded = self.is_expanded(SIDEBAR_NET);
+        let net_has_kids = self.net_scanning || !self.net_locations.is_empty() || net_expanded;
+        rows.push(SidebarRow {
+            label: "网络".to_string(),
+            target: String::new(),
+            depth: 0,
+            expandable: true,
+            expanded: net_expanded,
+            key: SIDEBAR_NET.to_string(),
+            // 系统库存图标 SIID_MYNETWORK(17) —— 与资源管理器左侧"网络"同一枚，
+            // 不用自绘字形（Glyph 分支画的是 Segoe MDL2 字形，传普通字符串会出乱码）。
+            icon: SidebarIcon::Stock(windows::Win32::UI::Shell::SIID_MYNETWORK.0),
+            guides: Vec::new(),
+            last_child: false,
+            has_parent: false,
+            spacer: false,
+        });
+        if net_expanded {
+            // 正在枚举：给一行明确提示，不能空白（空白会被读成"这机器没网络"）。
+            if self.net_scanning {
+                rows.push(SidebarRow::leaf(
+                    "正在连接网络…".to_string(),
+                    1,
+                    vec![false],
+                    true,
+                ));
+            } else if self.net_locations.is_empty() {
+                // 空状态。区分"确实没有"与"枚举失败" —— 后者是故障，文案要不同。
+                let msg = if self.net_diag.is_clean() {
+                    "（没有网络位置）"
+                } else {
+                    "（无法枚举网络位置）"
+                };
+                rows.push(SidebarRow::leaf(msg.to_string(), 1, vec![false], true));
+            } else {
+                let n = self.net_locations.len();
+                for (i, loc) in self.net_locations.iter().enumerate() {
+                    // 有盘符映射的显示成 "Z: (\\srv\share)"，与资源管理器一致；
+                    // 没有映射的只显示共享名，否则一个 UNC 全路径太长会截断得很惨。
+                    let label = if loc.mapped {
+                        format!("{} ({})", loc.local_name.trim_end_matches('\\'), loc.remote_name)
+                    } else {
+                        loc.display_name.clone()
+                    };
+                    let mut r = SidebarRow::leaf(
+                        label,
+                        1,
+                        vec![false],
+                        i + 1 == n,
+                    );
+                    // 导航一律用 UNC：盘符可能被别的程序改映射，且离线盘符
+                    // 在 Explorer 里还能点开显示"不可用"，我们直接列目录会报错。
+                    r.target = loc.remote_name.clone();
+                    r.icon = SidebarIcon::Path(PathBuf::from(&loc.remote_name));
+                    rows.push(r);
+                }
+            }
+        }
+        let _ = net_has_kids;
 
         // 回收站：空 / 满用不同的系统库存图标，和资源管理器一样一眼能分辨
         let siid = if self.recycle_items.is_empty() {

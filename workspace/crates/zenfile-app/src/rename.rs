@@ -80,6 +80,13 @@ struct Bulk {
     bold: HFONT,
     w: i32,
     h: i32,
+    /// 后台批量改名还在跑。期间禁用「重命名」按钮，
+    /// 防止连点把同一批名字改两遍。
+    busy: bool,
+    /// 后台改名的结果通道。**worker 只往里 send，绝不碰 Bulk 本体**。
+    apply_rx: Option<std::sync::mpsc::Receiver<String>>,
+    /// 一次性提示文案（"正在重命名…"之类），画完即清
+    tip: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -200,6 +207,8 @@ impl Bulk {
         self.changed() > 0
             && !self.conflict.iter().any(|c| *c)
             && !self.news.iter().any(|n| n.is_empty())
+            // 上一批还在改就不让再点，否则同一批名字会被改两遍
+            && !self.busy
     }
 }
 
@@ -263,6 +272,9 @@ pub fn open(app_ptr: *mut App, items: Vec<PathBuf>, mode: usize) {
         bold,
         w,
         h,
+        busy: false,
+        apply_rx: None,
+        tip: None,
     });
     recompute(&mut st);
 
@@ -483,6 +495,34 @@ unsafe extern "system" fn br_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     let st = &mut *p;
     match msg {
         WM_ERASEBKGND => return LRESULT(1),
+        // 后台批量改名跑完：报错 + 关窗 + 重列主窗口
+        WM_APPLY_DONE => {
+            let mut msg = String::new();
+            if let Some(rx) = st.apply_rx.as_ref() {
+                if let Ok(m) = rx.try_recv() {
+                    msg = m;
+                }
+            }
+            st.apply_rx = None;
+            st.busy = false;
+            st.tip = None;
+            if msg.is_empty() {
+                unsafe {
+                    (*st.app).reload();
+                }
+            } else {
+                unsafe {
+                    crate::app::report((*st.app).hwnd, &msg);
+                    (*st.app).reload();
+                }
+            }
+            unsafe {
+                // 关窗放在最后：上面两步都要读 st.app / st，
+                // DestroyWindow 会走 WM_DESTROY 把这块内存回收掉。
+                let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
+            }
+            return LRESULT(0);
+        }
         WM_NCHITTEST => {
             let x = (lparam.0 & 0xFFFF) as i16 as i32;
             let y = (lparam.0 >> 16) as i16 as i32;
@@ -567,9 +607,11 @@ unsafe extern "system" fn br_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 Hit::Ok => {
+                    // 注意：**不能**在这里 DestroyWindow。后台 worker 结束要往这个
+                    // hwnd 发 WM_APPLY_DONE，窗口先没了就是往野句柄发消息。
+                    // 关窗由 WM_APPLY_DONE 那一条负责。
                     if st.can_apply() {
-                        apply(st);
-                        let _ = DestroyWindow(hwnd);
+                        apply(st, hwnd);
                     }
                 }
                 Hit::None => {}
@@ -602,9 +644,9 @@ unsafe extern "system" fn br_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_APP_OK => {
+            // 同 Hit::Ok：起后台线程，不在这里关窗
             if st.can_apply() {
-                apply(st);
-                let _ = DestroyWindow(hwnd);
+                apply(st, hwnd);
             }
             LRESULT(0)
         }
@@ -613,10 +655,21 @@ unsafe extern "system" fn br_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_CLOSE => {
+            // 后台改名还在跑时**不能**关窗：worker 结束要往这个 hwnd 发
+            // WM_APPLY_DONE，窗口没了就是往一个已回收的 hwnd 发消息。
+            // 只提示一下"正在改名"，等它自己跑完（WM_APPLY_DONE 会关窗）。
+            if st.busy {
+                st.tip = Some("正在重命名，请稍候…".to_string());
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                return LRESULT(0);
+            }
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
         WM_DESTROY => {
+            debug_assert!(!st.busy, "后台改名未完成就销毁 Bulk，worker 会往野 hwnd 发消息");
             let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 1);
             for e in st.edits {
                 if !e.0.is_null() {
@@ -651,8 +704,13 @@ fn visible_rows(st: &Bulk) -> i32 {
     ((r.bottom - r.top) / st.s(ROW_H)).max(1)
 }
 
-fn apply(st: &mut Bulk) {
-    let owner = unsafe { (*st.app).hwnd.0 as isize };
+/// 落盘：`IFileOperation::commit()` 是**同步阻塞**的，几千个文件就是几秒。
+/// 放在 WndProc 里直接调 = 点「重命名」之后整个对话框连同主窗口一起僵住，
+/// 连取消都按不动。丢到后台线程，主线程只负责等结果。
+///
+/// owner 传 0：Shell 的进度/确认框因此是无属主的顶级窗口，不会反过来把
+/// 我们的窗口 disable 掉（那才是真的卡死）。
+fn apply(st: &mut Bulk, popup: HWND) {
     let pairs: Vec<(PathBuf, String)> = st
         .items
         .iter()
@@ -665,23 +723,56 @@ fn apply(st: &mut Bulk) {
     if pairs.is_empty() {
         return;
     }
-    match zenfile_core::ops::rename_items(owner, &pairs) {
-        Ok(()) => {
-            unsafe {
-                (*st.app).reload();
-            }
-        }
-        Err(e) => unsafe {
-            crate::app::report((*st.app).hwnd, &format!("批量重命名失败：{e}"));
-            (*st.app).reload();
-        },
+    // 上一次还没回来就不接新活：连点「重命名」会把一批名字改两遍
+    if st.busy {
+        return;
     }
+    st.busy = true;
+    st.tip = Some("正在重命名，请稍候…".to_string());
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    // **HWND 是裸指针，不是 Send**，不能直接进线程闭包。只带它的数值位：
+    // 目标必须是**这个对话框自己**（WM_APPLY_DONE 的 handler 在 br_proc 里，
+    // 不是主窗口），且此刻窗口还活着 —— 关窗推迟到 WM_APPLY_DONE。
+    let hwnd_val = popup.0 as usize;
+    std::thread::spawn(move || {
+        // IFileOperation 要求 STA，且 COM 必须**每线程**各自初始化
+        let _ = zenfile_core::ops::ComGuard::init();
+        let msg = match zenfile_core::ops::rename_items(0, &pairs) {
+            Ok(()) => String::new(),
+            Err(e) => format!("批量重命名失败：{e}"),
+        };
+        // **worker 绝不碰 Bulk**：那块内存归 UI 线程所有，后台写它就是数据竞争。
+        // 结果只经 channel 交回，再靠 PostMessage 把 UI 线程叫醒。
+        let failed = !msg.is_empty();
+        let _ = tx.send(msg);
+        unsafe {
+            // 目标必须是**这个对话框自己**：WM_APPLY_DONE 的 handler 在 br_proc 里。
+            // 刷新主目录由 br_proc 那边直接调 `App::reload()` —— 那本来就在 UI
+            // 线程上，不必再绕一趟主窗口消息（绕过去还得防 io_pending 误减）。
+            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                Some(windows::Win32::Foundation::HWND(hwnd_val as *mut core::ffi::c_void)),
+                WM_APPLY_DONE,
+                windows::Win32::Foundation::WPARAM(if failed {
+                    APPLY_DONE_ERR as usize
+                } else {
+                    APPLY_DONE_OK as usize
+                }),
+                windows::Win32::Foundation::LPARAM(0),
+            );
+        }
+    });
+    st.apply_rx = Some(rx);
 }
+
+/// `WM_APPLY_DONE` 的 wParam 取值
+const APPLY_DONE_OK: u32 = 0;
+const APPLY_DONE_ERR: u32 = 1;
+/// 后台批量改名完成
+pub const WM_APPLY_DONE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x51;
 
 fn inside(r: &RECT, x: i32, y: i32) -> bool {
     x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
 }
-
 fn hit_test(st: &Bulk, x: i32, y: i32) -> Hit {
     if inside(&st.close_rect(), x, y) {
         return Hit::Close;
@@ -921,6 +1012,17 @@ unsafe fn paint(hdc: HDC, st: &Bulk) {
         );
     }
 
+    // 「正在重命名…」提示：后台改名期间不能关窗，用户总要点一下试试，
+    // 得让"按了没反应"变成一句解释。
+    if let Some(tip) = &st.tip {
+        let r = RECT { left: st.s(14), top: st.h - st.s(78), right: st.w - st.s(140), bottom: st.h - st.s(56) };
+        fill(hdc, &r, t.surface_alt);
+        for e in edges(&r) {
+            fill(hdc, &e, t.accent);
+        }
+        label(hdc, tip, RECT { left: r.left + st.s(8), top: r.top, right: r.right - st.s(8), bottom: r.bottom }, t.accent);
+    }
+
     SelectObject(hdc, old);
 }
 
@@ -1097,3 +1199,9 @@ pub fn menu_modes() -> &'static [&'static str; 5] {
     &MODE_LABELS
 }
 
+
+/// 取主窗口句柄。`Bulk` 只持有 `*mut App`（拿不到 `&mut self`），
+/// 后台线程需要它来 PostMessage 回主/对话框的 WndProc。
+fn window_of(app: *mut App) -> HWND {
+    unsafe { (*app).hwnd }
+}

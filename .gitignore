@@ -1,19 +1,26 @@
 workspace/target/
 *.bmp
 
+# 发布构建产物（二进制与安装包，由 dev_scripts/make_release.py 生成）
+dist/
+
 # 会话级工程数据（记忆、索引），不进版本库
 .workbuddy/
 # 本机构建环境：crates.io 直连不可达，配的是清华 sparse 索引，换机器不该带走
 workspace/.cargo/
-# 一次性排查脚本与截图产物
-probe_*.py
-dump_*.py
+# 开发脚本目录：探针 / 验收 / 基准工具，本地自用，不随仓库分发
+dev_scripts/
+
+# 截图与编译中间产物
 __pycache__/
 shot*.png
-analyze.py
-band2.py
-baseline_explorer.py
-bmp2png.py
-dump_rect.py
-inspect.py
-shot.py
+
+# 构建日志与基准素材生成物（可由脚本重新生成，不入库）
+workspace/build.log
+workspace/%TEMP%/
+probe_out*/
+matrix_results.json
+*.bin
+
+# 误放进本仓库的其它项目笔记（非 ZenFile 内容），本地留档、不随仓库分发
+docs/_README_串台备份_机器学习实验记录.md
