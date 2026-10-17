@@ -2938,7 +2938,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let _ = InvalidateRect(Some(hwnd), None, true);
             LRESULT(0)
         }
-        WM_KEYDOWN => {
+        // Alt 组合键（Alt+←/→/↑、Alt+Enter、Alt+D）系统派发的是 WM_SYSKEYDOWN，
+        // 不是 WM_KEYDOWN。原先只处理后者，导致 handle_key 里那几条 alt 分支
+        // 永远进不去 —— 逻辑早就写好了，只是消息没送到。
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
             let app = &mut *app_ptr;
             // 地址框/搜索框正在编辑时，按键属于那个 EDIT（回车、ESC 由它自己的
             // 子类过程处理）。主窗口再插一脚会把字母当快捷键、还会顺手把地址栏
@@ -4248,8 +4251,10 @@ fn handle_key(app: &mut App, key: i32) {
         _ if key == 0x2E && shift => app.delete_selected(true),
         _ if key == 0x0D => app.open_focused(),
         _ if key == 0x08 => app.go_up(),
+        // Alt+← 后退 / Alt+→ 前进；Alt+↓ 也映射到前进 —— 这是 Explorer 的习惯键位，
+        // 原先漏了它，用户按 Alt+↓ 没有任何反应。
         _ if alt && key == 0x25 => app.go_back(),
-        _ if alt && key == 0x27 => app.go_forward(),
+        _ if alt && (key == 0x27 || key == 0x28) => app.go_forward(),
         _ if alt && key == 0x26 => app.go_up(),
         _ if key == 0x28 => app.set_focus_row(app.tab().focus_row + 1),
         _ if key == 0x26 && !alt => app.set_focus_row(app.tab().focus_row.saturating_sub(1)),
