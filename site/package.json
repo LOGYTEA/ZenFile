@@ -1,0 +1,15 @@
+{
+  "name": "zenfile-site",
+  "private": true,
+  "version": "0.3.0",
+  "description": "ZenFile 官网",
+  "type": "module",
+  "scripts": {
+    "dev": "vitepress dev",
+    "build": "vitepress build",
+    "preview": "vitepress preview"
+  },
+  "devDependencies": {
+    "vitepress": "2.0.0-alpha.15"
+  }
+}

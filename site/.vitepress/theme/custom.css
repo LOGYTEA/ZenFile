@@ -1,0 +1,55 @@
+/**
+ * ZenFile 品牌色 = 应用自绘控件的 accent：RGB(206, 117, 67) / #CE7543
+ */
+:root {
+  --vp-c-brand-1: #e08a5c;
+  --vp-c-brand-2: #ce7543;
+  --vp-c-brand-3: #b3612f;
+  --vp-c-brand-soft: rgba(206, 117, 67, 0.14);
+
+  --vp-home-hero-name-color: transparent;
+  --vp-home-hero-name-background: -webkit-linear-gradient(120deg, #ce7543 30%, #f0a878);
+
+  --vp-button-brand-border: transparent;
+  --vp-button-brand-text: #fff;
+  --vp-button-brand-bg: var(--vp-c-brand-2);
+  --vp-button-brand-hover-border: transparent;
+  --vp-button-brand-hover-text: #fff;
+  --vp-button-brand-hover-bg: var(--vp-c-brand-3);
+}
+
+.dark {
+  --vp-c-brand-1: #e08a5c;
+  --vp-c-brand-2: #ce7543;
+  --vp-c-brand-3: #b3612f;
+  --vp-c-brand-soft: rgba(206, 117, 67, 0.16);
+}
+
+/* 首页截图：贴住卡片，圆角与应用内面板一致 */
+.vp-doc figure,
+.vp-doc img[src$='/home.png'],
+.vp-doc img[src$='/detail.png'] {
+  border-radius: 10px;
+}
+
+/* Hero 徽标：一枚文件夹 */
+.hero-mark {
+  display: flex;
+  justify-content: center;
+  margin-bottom: 8px;
+}
+.hero-mark svg {
+  width: 96px;
+  height: 96px;
+}
+
+/* 特性卡：数字指标 */
+.vp-feature .metric {
+  display: block;
+  font-size: 28px;
+  font-weight: 700;
+  line-height: 1.2;
+  margin-bottom: 6px;
+  color: var(--vp-c-brand-1);
+  font-variant-numeric: tabular-nums;
+}

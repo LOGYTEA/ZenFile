@@ -14,6 +14,11 @@
 # 开发脚本目录：探针 / 验收 / 基准工具，本地自用，不随仓库分发
 /dev_scripts/
 
+# 官网构建产物与依赖
+/site/node_modules/
+/site/.vitepress/dist/
+/site/.vitepress/cache/
+
 # 截图与编译中间产物
 __pycache__/
 shot*.png
