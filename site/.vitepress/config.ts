@@ -4,7 +4,9 @@ export default defineConfig({
   lang: 'zh-CN',
   title: 'ZenFile',
   description: '原生 Win32 文件管理器',
-  base: '/',
+  // 部署到项目页 https://logytea.github.io/ZenFile/ ，不是用户页 logytea.github.io/
+  // 本地 preview 也在根路径 serve，所以这个错误本地测不出来 —— 部署后才发现全站 404
+  base: '/ZenFile/',
   appearance: 'dark',
   cleanUrls: false,
   lastUpdated: true,
