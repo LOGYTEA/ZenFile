@@ -47,7 +47,6 @@ ZenFile-setup-0.3-Beta-Weekly26-10-17.exe "D:\Applications\ZenFile"
 ### 源码构建
 
 ```bash
-cd workspace
 cargo build --release          # 产出 target/release/ZenFile.exe
 cargo test -p zenfile-core     # 内核单元测试（70 项）
 ```
@@ -70,7 +69,7 @@ cargo test -p zenfile-core     # 内核单元测试（70 项）
 ## 架构
 
 ```
-workspace/
+.
 ├── crates/
 │   ├── zenfile-core/     领域层，不依赖任何 UI 框架
 │   │   ├── engine        目录枚举（FindFirstFileExW + 大目录取回优化）
@@ -252,7 +251,6 @@ IPC 采用 4 字节小端长度前缀加 JSON 载荷的帧协议，经由命名�
 ## 开发
 
 ```bash
-cd workspace
 cargo build --release      # 产出 1.48 MiB 可执行文件
 cargo test -p zenfile-core # 内核单元测试
 ```

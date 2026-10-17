@@ -317,15 +317,41 @@ mod tests {
 
     #[test]
     fn self_drawn_stroke_scales_with_size() {
-        // 自绘路径的真实笔画像素（`icon_spec_design::stroke_hw` 的直径）
-        // 必须**随边长单调递增** —— 18px 的图标不能比 10px 的还淡，
-        // 那才是"光学重量不一致"的根因。
-        let sizes = Size::ALL;
-        for w in sizes.windows(2) {
-            let a = 2.0 * crate::icon_spec_design::design::stroke_hw(w[0].px());
-            let b = 2.0 * crate::icon_spec_design::design::stroke_hw(w[1].px());
-            assert!(b >= a, "{:?} 的笔画比 {:?} 细", w[1], w[0]);
-            assert!(a > 0.0, "{:?} 的笔画直径为 0", w[0]);
+        // ⚠️ 这条断言在第73轮被**反转过一次**，这里跟着改的不是措辞，是判据本身。
+        //
+        // 原断言：`2*stroke_hw(size)` 随边长单调递增。那是第70轮"笔画随字号缩放"
+        // 那套模型的守门人 —— 而第73轮已经明确把它推翻了（见
+        // `icon_spec_design::design::HW` 注释里那段"第70轮…那是反的"）。
+        // 现在的模型是**物理直径恒定**：不管字形多大，落在屏幕上的笔画都是
+        // 同一个物理像素数（Lucide / Material / Segoe Fluent 的统一做法）。
+        //
+        // 于是两条不变式要分开守，量纲也不同：
+        //   * **物理直径**（`hw * size / GRID`，与 size 无关）必须各档一致 ——
+        //     这才是"18px 图标不能比 10px 的淡"的正解；
+        //   * **设计单位 hw**（`STROKE_PX*GRID/2/size`）随边长**递减** ——
+        //     同一条 1.5px 的线，占的比例本来就该在小图上更大（小图要相对更粗
+        //     才看得清，是物理下限，不是设计失误）。递减本身就是正确模型的
+        //     必然推论，守它是为了让"谁把公式改回按比例放大"立刻暴露。
+        //
+        // 只断言物理直径的话，hw 恒为 0 这类退化实现也能过；只断言设计单位递减
+        // 的话，GRID 被改坏也看不出来。两条都要。
+        let d = crate::icon_spec_design::design::GRID;
+        for w in Size::ALL.windows(2) {
+            let (s0, s1) = (w[0].px(), w[1].px());
+            let h0 = crate::icon_spec_design::design::stroke_hw(s0);
+            let h1 = crate::icon_spec_design::design::stroke_hw(s1);
+            assert!(h0 > 0.0 && h1 > 0.0, "{w:?} 的笔画半径退化为 0");
+            // 物理直径恒定（直径 = hw * size / GRID）
+            let p0 = 2.0 * h0 * s0 as f32 / d;
+            let p1 = 2.0 * h1 * s1 as f32 / d;
+            assert!(
+                (p1 - p0).abs() < 1e-3,
+                "{:?} 物理直径 {p1:.3}px != {:?} 的 {p0:.3}px（应恒为 STROKE_PX）",
+                w[1],
+                w[0]
+            );
+            // 设计单位半径随边长递减
+            assert!(h1 < h0, "{:?} 的设计半径没比 {:?} 小", w[1], w[0]);
         }
     }
     #[test]
