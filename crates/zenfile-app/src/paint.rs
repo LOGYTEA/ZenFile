@@ -1458,12 +1458,20 @@ pub fn dock_zone_rect(l: &Layout, z: crate::app::DockZone) -> RECT {
 /// 只高亮一块还不够 —— 用户看不见另外 7 个方向在哪，所以同时把十字分隔线
 /// 淡淡勾出来，鼠标一带就能看出分界在哪。
 pub fn paint_dock_overlay(app: &App, hdc: HDC, l: &Layout) {
-    // 两种来源：拖标签（`tab_drag`）和拖文件夹（`drag_dock`）。
+    // 三种来源：拖标签（`tab_drag`）、拖文件夹（`drag_dock`）、
+    // 以及**别的窗口拖进来的标签悬在本窗口上方**（`tab_hover_in`，第83轮）。
     // 画法完全一样，合成一处就不必担心两边长歪。
     let zone = match app.tab_drag.as_ref() {
         Some(d) if d.active => d.dock,
         Some(_) => None,
-        None => app.drag_dock,
+        None => match app.drag_dock {
+            Some(z) => Some(z),
+            // 外部悬停优先于拖文件夹：同一时刻只可能有一个拖拽在飞
+            None => match app.tab_hover_in {
+                Some(crate::tabdrag::DropAction::Split { zone }) => Some(zone),
+                _ => None,
+            },
+        },
     };
     let Some(zone) = zone else { return };
     let t = app.theme;
@@ -1512,6 +1520,31 @@ pub fn paint_dock_overlay(app: &App, hdc: HDC, l: &Layout) {
         SetTextColor(hdc, t.text);
         draw_text(hdc, label, r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         SelectObject(hdc, old);
+    }
+    paint_tab_strip_hover(app, hdc, l);
+}
+
+/// 外部标签悬停在**标签条**上方时的高亮（第83轮）。
+///
+/// 内容区那 8 种落点由 `paint_dock_overlay` 画完了，但"落在标签条 → 开新标签"
+/// 没有对应的 `DockZone`，得单独画：整条标签条压一层 accent 半透明 + 上边缘
+/// 一条实线，和落进内容区时的观感一致。
+///
+/// 判据用 `app.tab_hover_in == NewTab`：只有真的落在标签条上才画。
+fn paint_tab_strip_hover(app: &App, hdc: HDC, l: &Layout) {
+    if app.tab_hover_in != Some(crate::tabdrag::DropAction::NewTab) {
+        return;
+    }
+    let pl = pane_layout(app, l, app.focus_pane);
+    let r = pl.tabs;
+    let t = app.theme;
+    unsafe {
+        alpha_fill_rect(hdc, &r, t.accent, 52);
+        let mw = ((2.0 * app.metrics.scale).round() as i32).max(1);
+        let edge = CreateSolidBrush(t.accent);
+        let line = RECT { left: r.left, top: r.bottom - mw, right: r.right, bottom: r.bottom };
+        FillRect(hdc, &line, edge);
+        let _ = DeleteObject(edge.into());
     }
 }
 

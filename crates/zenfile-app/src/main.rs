@@ -1251,32 +1251,58 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             LRESULT(1)
         }
         WM_CTLCOLOREDIT => handle_ctl_color(app_ptr, wparam),
-        // 第83轮：另一个 ZenFile 窗口把一个标签递过来了。
+        // 第83轮：另一个 ZenFile 窗口把一个标签递过来了（落地 / 悬停预览 / 离开）。
         // 落点判据由**本窗口**做（屏幕坐标 → 自己的客户区坐标），协议里不带几何。
         WM_COPYDATA => {
-            let Some(((sx, sy), path)) = tabdrag::decode_copydata(lparam) else {
-                return DefWindowProcW(hwnd, msg, wparam, lparam);
-            };
-            let app = &mut *app_ptr;
-            let mut pt = POINT { x: sx, y: sy };
-            let _ = ScreenToClient(hwnd, &mut pt);
-            let l = paint::layout_for(app);
-            let pl = if app.split() { paint::pane_layout(app, &l, app.focus_pane) } else { l };
-            match tabdrag::classify(&pl.tabs, pl.view, pt.x, pt.y) {
-                tabdrag::DropAction::None => {}
-                tabdrag::DropAction::NewTab => {
-                    app.open_tab(path);
-                    app.reload();
-                    paint::sync_address(app);
+            let pkt = tabdrag::decode_packet(lparam);
+            match pkt {
+                tabdrag::Packet::Foreign => return DefWindowProcW(hwnd, msg, wparam, lparam),
+                tabdrag::Packet::HoverEnd => {
+                    let app = &mut *app_ptr;
+                    if app.tab_hover_in.take().is_some() {
+                        let _ = InvalidateRect(Some(hwnd), None, true);
+                    }
+                    return LRESULT(1);
                 }
-                tabdrag::DropAction::Split { zone } => {
-                    app.open_split(path, zone);
-                    paint::sync_address(app);
-                    paint::reposition(app);
+                tabdrag::Packet::Hover { screen } => {
+                    let app = &mut *app_ptr;
+                    let mut pt = POINT { x: screen.0, y: screen.1 };
+                    let _ = ScreenToClient(hwnd, &mut pt);
+                    let l = paint::layout_for(app);
+                    let pl = if app.split() { paint::pane_layout(app, &l, app.focus_pane) } else { l };
+                    let a = tabdrag::classify(&pl.tabs, pl.view, pt.x, pt.y);
+                    // 不变的就不重画：悬停期间鼠标不动也会周期性来消息，
+                    // 每次都 Invalidate 会白跑一帧完整绘制。
+                    if app.tab_hover_in != Some(a) {
+                        app.tab_hover_in = Some(a);
+                        let _ = InvalidateRect(Some(hwnd), None, true);
+                    }
+                    return LRESULT(1);
+                }
+                tabdrag::Packet::Drop { screen, path } => {
+                    let app = &mut *app_ptr;
+                    app.tab_hover_in = None;
+                    let mut pt = POINT { x: screen.0, y: screen.1 };
+                    let _ = ScreenToClient(hwnd, &mut pt);
+                    let l = paint::layout_for(app);
+                    let pl = if app.split() { paint::pane_layout(app, &l, app.focus_pane) } else { l };
+                    match tabdrag::classify(&pl.tabs, pl.view, pt.x, pt.y) {
+                        tabdrag::DropAction::None => {}
+                        tabdrag::DropAction::NewTab => {
+                            app.open_tab(path);
+                            app.reload();
+                            paint::sync_address(app);
+                        }
+                        tabdrag::DropAction::Split { zone } => {
+                            app.open_split(path, zone);
+                            paint::sync_address(app);
+                            paint::reposition(app);
+                        }
+                    }
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                    LRESULT(1)
                 }
             }
-            let _ = InvalidateRect(Some(hwnd), None, true);
-            LRESULT(1)
         }
         // 第83轮：外部程序（资源管理器）把文件/文件夹拖进来了。开成新标签。
         WM_DROPFILES => {
@@ -1587,6 +1613,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             // 也要排在别的命中之前：拖标签期间不该去动选中集。
             if app.tab_drag.is_some() {
                 update_tab_drag(app, hwnd, &l, x, y);
+                // 第83轮：悬停在**另一个 ZenFile 窗口**上时，把落点预览递过去，
+                // 让那个窗口自己画高亮（协议里不带几何，只能是它自己算）。
+                //
+                // 必须每帧都发：目标窗口不知道光标是否还在自己身上，离开时要靠
+                // 这条消息里 `HoverEnd` 擦掉。节流没有意义 —— 目标侧对"落点没变"
+                // 已经跳过了重绘。
+                tab_hover_peer(app, hwnd, x, y);
                 // 第83轮：光标已经移到**本窗口之外**、且底下**不是**另一个
                 // ZenFile 窗口时，把这个标签作为文件拖给外部程序（资源管理器）。
                 //
@@ -3264,8 +3297,55 @@ fn tab_kick_out(app: &App, hwnd: HWND, x: i32, y: i32) -> Option<(usize, usize, 
     Some((p, i, path))
 }
 
+/// 上一个收到过标签悬停预览的**别的**窗口。`tab_hover_peer` 靠它决定
+/// 要不要发 `HoverEnd`。
+///
+/// 用线程局部而不是 `static mut`：拖拽全在 UI 线程，用 `Cell` 就够，
+/// 免掉一个 `unsafe` 全局。放 `static mut` 的另一个理由是它必须活过
+/// `end_tab_drag`（松手时还要清）—— 而 `end_tab_drag` 也在同一线程上，OK。
+thread_local! {
+    static PEER_HOVER: std::cell::Cell<Option<HWND>> = const { std::cell::Cell::new(None) };
+}
+
+/// 擦掉别的窗口上的悬停高亮（松手 / 取消时调）。
+fn clear_peer_hover() {
+    let prev = PEER_HOVER.with(|c| c.replace(None));
+    if let Some(p) = prev {
+        tabdrag::clear_hover(p);
+    }
+}
+
+/// 第83轮：把"悬停在别的窗口上"的落点预览递过去。
+///
+/// 要点：
+///   - 记住**上一个**收到过悬停的窗口。换窗口时必须给旧的那个发一条
+///     `HoverEnd`，否则它的���亮会永远留在屏幕上（用户看到两个窗口都有高亮）。
+///   - 光标不在任何别的 ZenFile 窗口上时，什么都不发。
+fn tab_hover_peer(app: &App, hwnd: HWND, x: i32, y: i32) {
+    let active = app.tab_drag.as_ref().is_some_and(|d| d.active);
+    let under = if active { tabdrag::window_under_cursor() } else { None };
+    let peer = under.filter(|h| tabdrag::other_zenfile_window(*h, hwnd));
+    let prev = PEER_HOVER.with(|c| c.replace(None));
+    if prev.is_some() && prev != peer {
+        if let Some(p) = prev {
+            tabdrag::clear_hover(p);
+        }
+    }
+    if let Some(p) = peer {
+        let mut pt = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut pt);
+        }
+        tabdrag::send_hover(p, (pt.x, pt.y));
+        PEER_HOVER.with(|c| c.replace(Some(p)));
+    }
+}
+
 /// 拖标签松手：把 `finish_tab_drag` 算出来的结果真的执行掉。
 fn end_tab_drag(app: &mut App, hwnd: HWND) {
+    // 松手了：别的窗口上的高亮必须擦掉。放在最前面 —— 下面每条分支都可能
+    // 直接 `return`（走 OLE 那条还是模态的），漏掉这一次高亮就留在屏上了。
+    clear_peer_hover();
     match app.finish_tab_drag() {
         app::TabDrop::Nothing => {}
         app::TabDrop::Reorder { pane, from, to } => {
@@ -3498,6 +3578,9 @@ fn cancel_drag(app: &mut App) {
     if app.tab_drag.take().is_some() {
         had = true;
     }
+    // 取消（Esc / 抢到捕获 / 菜单弹出）时也要把别的窗口上的高亮擦掉 ——
+    // 否则松手之前高亮就留在那儿不动了。
+    clear_peer_hover();
     if had {
         let _ = unsafe { ReleaseCapture() };
     }

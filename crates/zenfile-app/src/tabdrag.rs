@@ -39,32 +39,47 @@ use crate::app::DockZone;
 
 /// `COPYDATASTRUCT.dwData` 的取值。**1 已被托盘宿主占用**（"开一个新窗口"，
 /// `main.rs` 里 `tray_proc` 那段），这里从 2 起，且只发给主窗口。
+///
+/// **2 = 松手落地**（递路径 + 落点）。
+/// **3 = 悬停预览**（只递落点，不带路径 —— 目标窗口画高亮只需要坐标）。
 const DW_TAB_XFER: usize = 2;
+const DW_TAB_HOVER: usize = 3;
+/// 悬停离开：告诉目标窗口把高亮擦掉。
+const DW_TAB_HOVER_END: usize = 4;
+/// 载荷最小时也要装得下 4 个 i32 坐标（8 字节）。
+const MIN_CB: u32 = 8;
 
-/// 载荷：`i32 屏幕x` + `i32 屏幕y` + 路径的 UTF-16（含结尾 NUL）。
+/// 载荷：`i32 屏幕x` + `i32 屏幕y` +（仅落地时）路径的 UTF-16（含结尾 NUL）。
 ///
 /// 用定长头 + 变长尾，不引序列化格式：这个协议的另一端永远是本进程自己。
+fn encode_xy(screen: (i32, i32)) -> Vec<u16> {
+    vec![screen.0 as u16, (screen.0 >> 16) as u16, screen.1 as u16, (screen.1 >> 16) as u16]
+}
+
 fn encode(screen: (i32, i32), path: &std::path::Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
-    let mut v = vec![screen.0 as u16, (screen.0 >> 16) as u16, screen.1 as u16, (screen.1 >> 16) as u16];
+    let mut v = encode_xy(screen);
     v.extend(path.as_os_str().encode_wide());
     v.push(0);
     v
 }
 
-fn decode(buf: &[u16]) -> Option<((i32, i32), PathBuf)> {
-    if buf.len() < 5 {
+fn decode_xy(buf: &[u16]) -> Option<(i32, i32)> {
+    if buf.len() < 4 {
         return None;
     }
     let g16 = |a: u16, b: u16| i32::from(a as i16) | (i32::from(b) << 16);
-    let x = g16(buf[0], buf[1]);
-    let y = g16(buf[2], buf[3]);
-    let s: String = String::from_utf16_lossy(&buf[4..]);
+    Some((g16(buf[0], buf[1]), g16(buf[2], buf[3])))
+}
+
+fn decode(buf: &[u16]) -> Option<((i32, i32), PathBuf)> {
+    let (screen, rest) = (decode_xy(buf)?, &buf[4..]);
+    let s: String = String::from_utf16_lossy(rest);
     let s = s.trim_end_matches('\0');
     if s.is_empty() {
         return None;
     }
-    Some(((x, y), PathBuf::from(s)))
+    Some((screen, PathBuf::from(s)))
 }
 
 /// 光标当前压在哪个**顶层窗口**上。标签条/内容区命中要在目标窗口里做，
@@ -112,11 +127,27 @@ pub fn accept_files_from(hwnd: HWND) {
 
 /// 把一个标签送到目标窗口的屏幕落点。**目标窗口收到后自己开标签/分屏**。
 pub fn send_tab(hwnd: HWND, screen: (i32, i32), path: &std::path::Path) {
-    let buf = encode(screen, path);
+    send_raw(hwnd, DW_TAB_XFER, &encode(screen, path));
+}
+
+/// 悬停预览：只递坐标，让目标窗口在**它自己**的坐标系里画高亮。
+///
+/// 不能带路径 —— 预览阶段还没决定要不要落，路径在源窗口手上，但高亮
+/// 只需要知道"落在哪"。
+pub fn send_hover(hwnd: HWND, screen: (i32, i32)) {
+    send_raw(hwnd, DW_TAB_HOVER, &encode_xy(screen));
+}
+
+/// 告诉目标窗口擦掉高亮（光标已经不在它身上）。
+pub fn clear_hover(hwnd: HWND) {
+    send_raw(hwnd, DW_TAB_HOVER_END, &encode_xy((0, 0)));
+}
+
+fn send_raw(hwnd: HWND, tag: usize, words: &[u16]) {
     let mut cds = COPYDATASTRUCT {
-        dwData: DW_TAB_XFER,
-        cbData: (buf.len() * 2) as u32,
-        lpData: buf.as_ptr() as *mut core::ffi::c_void,
+        dwData: tag,
+        cbData: (words.len() * 2) as u32,
+        lpData: words.as_ptr() as *mut core::ffi::c_void,
     };
     unsafe {
         let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
@@ -183,19 +214,45 @@ pub fn accept_external(app: &mut crate::app::App, paths: Vec<PathBuf>) -> bool {
     any
 }
 
-/// 解一条 `WM_COPYDATA` 载荷。返回 `None` 表示不是本协议的包（调用方继续走
-/// 自己的分发）。
-///
-/// **不碰 `App`**：落地动作由 `main.rs` 的 WndProc 在已经拿到 `&mut App` 的
-/// 那条消息里做（那里的 `app_ptr` 就是目标窗口自己的 App）。
-pub fn decode_copydata(lp: LPARAM) -> Option<((i32, i32), PathBuf)> {
+/// 一条 `WM_COPYDATA` 的解包结果。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Packet {
+    /// 松手落地：路径 + 屏幕落点。
+    Drop { screen: (i32, i32), path: PathBuf },
+    /// 悬停预览：只有屏幕落点。
+    Hover { screen: (i32, i32) },
+    /// 离开：擦掉高亮。
+    HoverEnd,
+    /// 不是本协议的包（调用方继续走自己的分发）。
+    Foreign,
+}
+
+/// 解一条 `WM_COPYDATA` 载荷。**不碰 `App`**：落地动作由 `main.rs` 的
+/// WndProc 在已经拿到 `&mut App` 的那条消息里做。
+pub fn decode_packet(lp: LPARAM) -> Packet {
     let cds = unsafe { &*(lp.0 as *const COPYDATASTRUCT) };
-    if cds.dwData != DW_TAB_XFER || cds.lpData.is_null() || cds.cbData < 10 {
-        return None;
+    if cds.dwData != DW_TAB_XFER
+        && cds.dwData != DW_TAB_HOVER
+        && cds.dwData != DW_TAB_HOVER_END
+    {
+        return Packet::Foreign;
+    }
+    if cds.lpData.is_null() || cds.cbData < MIN_CB {
+        return Packet::Foreign;
     }
     let words = (cds.cbData as usize) / 2;
     let buf = unsafe { std::slice::from_raw_parts(cds.lpData as *const u16, words) };
-    decode(buf)
+    match cds.dwData {
+        DW_TAB_HOVER_END => Packet::HoverEnd,
+        DW_TAB_HOVER => match decode_xy(buf) {
+            Some(screen) => Packet::Hover { screen },
+            None => Packet::Foreign,
+        },
+        _ => match decode(buf) {
+            Some((screen, path)) => Packet::Drop { screen, path },
+            None => Packet::Foreign,
+        },
+    }
 }
 
 /// 落点判定。**纯函数** —— 命中规则写错时（"预览在这、落在那"）能单测。
@@ -267,5 +324,24 @@ mod tests {
         assert_eq!(classify(&r(0, 40, 1180, 66), view, 100, 400), DropAction::None);
         // 窗口外
         assert_eq!(classify(&r(0, 40, 1180, 66), view, 1300, 400), DropAction::None);
+    }
+
+    #[test]
+    fn 悬停包只带坐标不带路径() {
+        let buf = encode_xy((300, 240));
+        // 只有 4 个坐标字，没有路径尾部
+        assert_eq!(buf.len(), 4);
+        assert_eq!(decode_xy(&buf), Some((300, 240)));
+        // 悬停包不能被当成落地包解（否则会拿空路径去 open_tab）
+        assert_eq!(decode(&buf), None);
+    }
+
+    #[test]
+    fn 包类型不能张冠李戴() {
+        // 三个 tag 各走各的解包分支，任一混淆都会让"预览"变成"落地"。
+        let p = std::path::Path::new("C:\\t");
+        assert_eq!(decode(&encode((1, 2), p)), Some(((1, 2), p.to_path_buf())));
+        // 落地包的坐标头能单独解出来（悬停只需要它）
+        assert_eq!(decode_xy(&encode((1, 2), p)), Some((1, 2)));
     }
 }

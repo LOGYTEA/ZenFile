@@ -972,6 +972,12 @@ pub struct App {
     /// 拖标签。与 `drag` 分开：两者可以同时挂着（拖文件的同时不会拖标签），
     /// 但状态字段混在一起会让"松手时到底在干嘛"变成猜谜。
     pub tab_drag: Option<TabDrag>,
+    /// 第83轮：**从别的窗口**拖进来的标签正在本窗口上方悬停，画一块落点高亮。
+    ///
+    /// 与 `tab_drag`（本窗口自己在拖）完全分开 —— 后者是拖拽**源**，
+    /// 前者是拖拽**目标**，一个窗口可以同时是这两个角色（窗格之间互拖）。
+    /// 为 `None` 时不画任何东西。
+    pub tab_hover_in: Option<crate::tabdrag::DropAction>,
     /// 拖着**文件**悬在标签上时：记住"从第几毫秒开始悬在这个标签上"，
     /// 满了 600ms 就自动切过去（资源管理器的行为：拖到标签上等一下会自动翻页）。
     pub tab_hover_since: Option<(usize, std::time::Instant)>,
@@ -1455,6 +1461,7 @@ impl App {
             back_surface: crate::paint::BackSurface::default(),
             drag_origin: None,
             tab_drag: None,
+            tab_hover_in: None,
             tab_hover_since: None,
             drag_dock: None,
             settings_radius_sel: "global".to_string(),
